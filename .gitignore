@@ -1,0 +1,31 @@
+# ---------------------------------------------------------------------------
+# Never commit participant-level data. HRS and ELSA prohibit redistribution.
+# ---------------------------------------------------------------------------
+data/
+*.csv
+*.dta
+*.rds
+*.sav
+*.RData
+*.rda
+
+# Generated output
+output/
+figures/
+results/
+
+# R / RStudio
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+*.Rproj
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*~
+
+# Rendered notebooks
+*.nb.html
+*.html

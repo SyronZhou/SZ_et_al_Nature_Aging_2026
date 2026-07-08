@@ -1,0 +1,4159 @@
+---
+title: "HRS — cohort construction & harmonised person-wave dataset"
+output: html_notebook
+---
+
+<!--
+  Analysis code for the manuscript on sensory impairment, frailty, and incident
+  dementia in the HRS (United States) and ELSA (England) cohorts.
+
+  DATA NOT INCLUDED. HRS and ELSA are restricted-access and cannot be
+  redistributed. Obtain the source data from the data providers and place them
+  under data/ (git-ignored) so the relative paths in this notebook resolve.
+  See README.md for setup and run order.
+-->
+
+
+```{r}
+#hrs summary data 
+hrs_2022summary <- "data/HRS/randhrs1992_2022v1_STATA/randhrs1992_2022v1.dta"
+hrs_2022summary <- read_dta(hrs_2022summary)
+
+#hrs LangaWeir data 
+hrs_LangaWeir <- "data/HRS/LangaWeir2022v1/cogfinalimp_9522wide.dta"
+hrs_LangaWeir <- read_dta(hrs_LangaWeir)
+
+#hrs Track data 
+hrs_Track <- "data/HRS/trk2022v1/trk2022tr_r.csv"
+hrs_Track <- read_csv(hrs_Track)
+
+death_track <- hrs_Track %>%
+  transmute(
+    # ID
+    hhidpn = 1000 * as.numeric(HHID) + as.numeric(PN),
+
+    # Best death date (priority: known > exit > ndi)
+    death_year = coalesce(KNOWNDECEASEDYR, EXDEATHYR, NYEAR),
+    death_month = coalesce(KNOWNDECEASEDMO, EXDEATHMO, NMONTH),
+
+    # Last observed alive
+    lastalive_year = LASTALIVEYR,
+    lastalive_month = LASTALIVEMO
+  ) %>%
+  mutate(
+    died = if_else(!is.na(death_year), 1L, 0L),
+
+    # fill missing months for stability
+    death_month = if_else(is.na(death_month) & !is.na(death_year), 6, death_month),
+    lastalive_month = if_else(is.na(lastalive_month) & !is.na(lastalive_year),
+                              6, lastalive_month)
+  )
+
+```
+
+
+
+# HRS database
+# choose 2004 as baseline start-point
+```{r}
+# hrs data 2004
+df_3 <- hrs_2022summary
+wave <- 7        # 2004
+year <- 2004L
+
+nm_3 <- setNames(names(df_3), toupper(names(df_3)))
+
+id_var_3    <- nm_3["HHIDPN"]
+byear_var_3 <- nm_3["RABYEAR"]
+bmon_var_3  <- nm_3["RABMONTH"]
+
+if (any(is.na(c(id_var_3, byear_var_3, bmon_var_3))))
+  stop("ID or birth variables missing (2004).")
+
+cov_req_2004 <- c(
+  "RAGENDER",
+  "RAEDUC",
+  "RARACEM",
+  "RAHISPAN",
+  "R7AGEY_E",     # RAND-calculated age at end of interview month
+  "R7MSTAT",
+  "R7WORK",
+  "R7SMOKEN",
+  "R7DRINKD",
+  "R7VGACTX"
+)
+
+cov_actual_2004 <- nm_3[toupper(cov_req_2004)]
+cov_actual_2004 <- cov_actual_2004[!is.na(cov_actual_2004)]
+
+hrs_cov_2004 <- df_3 %>%
+  transmute(
+    hhidpn      = .data[[id_var_3]],
+    year        = year,
+    birth_year  = .data[[byear_var_3]],
+    birth_month = .data[[bmon_var_3]],
+    across(all_of(cov_actual_2004))
+  ) %>%
+  mutate(
+    # Prefer RAND's interview-date-aware age; fall back to year - birth_year.
+    age_2004 = coalesce(as.numeric(R7AGEY_E), year - birth_year),
+
+    Gender = case_when(
+      RAGENDER %in% c(1, 2) ~ as.integer(RAGENDER),
+      TRUE ~ NA_integer_
+    ),
+
+    # 0 = Less than HS; 1 = HS or GED (RAEDUC 2 or 3); 2 = post-HS (4 or 5).
+    Education = case_when(
+      is.na(RAEDUC)       ~ NA_integer_,
+      RAEDUC == 1         ~ 0L,
+      RAEDUC %in% c(2, 3) ~ 1L,
+      RAEDUC %in% c(4, 5) ~ 2L,
+      TRUE                ~ NA_integer_
+    ),
+
+    # 1 = married / partnered / spouse-absent (codes 1, 2, 3 per RAND);
+    # 0 = separated / divorced / widowed / never married.
+    Marital_status = case_when(
+      R7MSTAT %in% c(1, 2, 3)       ~ 1L,
+      R7MSTAT %in% c(4, 5, 6, 7, 8) ~ 0L,
+      TRUE                          ~ NA_integer_
+    ),
+
+    Employment = case_when(
+      R7WORK == 1 ~ 1L,
+      R7WORK == 0 ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+
+    Smoking = case_when(
+      R7SMOKEN == 1 ~ 1L,
+      R7SMOKEN == 0 ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+
+    Alcohol = case_when(
+      R7DRINKD > 0  ~ 1L,
+      R7DRINKD == 0 ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+
+    # 0 = Non-Hispanic White; 1 = Hispanic OR Non-Hispanic (Black / Other).
+    # When RAHISPAN is missing but race is White, treat as Non-Hispanic White
+    # (recovers cases that would otherwise be dropped to NA).
+    Race = case_when(
+      (RAHISPAN == 0 | is.na(RAHISPAN)) & RARACEM == 1 ~ 0L,
+      RAHISPAN == 1 | RARACEM %in% c(2, 3)             ~ 1L,
+      TRUE                                             ~ NA_integer_
+    ),
+
+    Physical_activity = case_when(
+      R7VGACTX %in% c(1, 2, 3) ~ 1L,
+      R7VGACTX %in% c(4, 5)    ~ 0L,
+      TRUE ~ NA_integer_
+    )
+  ) %>%
+  dplyr::select(
+    hhidpn, year, birth_year, birth_month, age_2004,
+    Gender, Education, Marital_status, Employment, Smoking, Alcohol,
+    Race, Physical_activity
+  )
+
+# dementia (Langa-Weir 2004)
+lw_2004 <- hrs_LangaWeir %>%
+  filter(interview2004 == 1) %>%
+  mutate(hhidpn = 1000 * as.numeric(hhid) + as.numeric(pn)) %>%
+  transmute(
+    hhidpn,
+    year = 2004L,
+    cogfunction = cogfunction2004,
+    cogtot27    = cogtot27_imp2004
+  )
+
+
+```
+
+
+
+# FAT 2004 file (UPDATE PATH to your 2004 file)
+```{r}
+# FAT 2004 file
+fat_path_04 <- "data/HRS/h04f1c_STATA/h04f1c.dta"
+
+fat04 <- read_dta(
+  fat_path_04,
+  col_select = c(hhidpn,
+                 jc104, jc087,                              # pain, incontinence
+                 jc095, jc096, jc097, jc098, jc101, jc102, jc103,  # sensory 
+                 jg086, jb082, jg198))                      # social activity
+
+## Pain & incontinence
+fat_pain_incont_2004 <- fat04 %>%
+  transmute(
+    hhidpn = as.character(hhidpn),
+    pain_2004 = case_when(
+      jc104 == 1 ~ 1,
+      jc104 == 5 ~ 0,
+      TRUE ~ NA_real_
+    ),
+    incont_2004 = case_when(
+      jc087 == 1 ~ 1,
+      jc087 == 5 ~ 0,
+      TRUE ~ NA_real_
+    )
+  )
+
+## Sensory (FAT) — hearing_aid removed; skip-patterns handled
+sensory_2004 <- fat04 %>%
+  transmute(
+    hhidpn = as.character(hhidpn),
+    hearing_loss = case_when(
+      jc103 %in% c(1, 2, 3) ~ 0L,
+      jc103 %in% c(4, 5)    ~ 1L,
+      TRUE ~ NA_integer_
+    ),
+    hearing_aid = case_when(
+      jc102 == 1         ~ 1L,
+      jc102 == 5         ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    vision_overall = case_when(
+      jc095 %in% c(1, 2, 3) ~ 0L,
+      jc095 %in% c(4, 5, 6) ~ 1L,    # 6 = Legally Blind → impaired
+      TRUE ~ NA_integer_
+    ),
+    # Legally blind (jc095==6) → impaired for far/near (not asked)
+    vision_far = case_when(
+      jc095 == 6            ~ 1L,
+      jc096 %in% c(1, 2, 3) ~ 0L,
+      jc096 %in% c(4, 5)    ~ 1L,
+      TRUE ~ NA_integer_
+    ),
+    vision_near = case_when(
+      jc095 == 6            ~ 1L,
+      jc097 %in% c(1, 2, 3) ~ 0L,
+      jc097 %in% c(4, 5)    ~ 1L,
+      TRUE ~ NA_integer_
+    ),
+    # Skip-pattern: NaN means condition not diagnosed → 0
+    cataract_surgery = case_when(
+      jc098 == 1         ~ 1L,
+      jc098 == 5         ~ 0L,
+      jc098 %in% c(8, 9) ~ NA_integer_,
+      is.na(jc098)       ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    glaucoma_treatment = case_when(
+      jc101 == 1         ~ 1L,
+      jc101 == 5         ~ 0L,
+      jc101 %in% c(8, 9) ~ NA_integer_,
+      is.na(jc101)       ~ 0L,
+      TRUE ~ NA_integer_
+    )
+  )
+
+## Social activity (FAT)
+social_2004 <- fat04 %>%
+  transmute(
+    hhidpn = as.character(hhidpn),
+    volunteer = case_when(
+      jg086 == 1 ~ 1L,
+      jg086 == 5 ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    religious_freq = case_when(
+      jb082 %in% c(1, 2, 3) ~ 1L,    # >= monthly attendance
+      jb082 %in% c(4, 5)    ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    helping = case_when(
+      jg198 == 1 ~ 1L,
+      jg198 == 5 ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    Social_activity = case_when(
+      volunteer == 1 | religious_freq == 1 | helping == 1 ~ 1L,
+      is.na(volunteer) & is.na(religious_freq) & is.na(helping) ~ NA_integer_,
+      TRUE ~ 0L
+    )
+  ) %>%
+  dplyr::select(hhidpn, Social_activity)
+
+## Frailty Index
+fi_stems <- c(
+  "DRESS","BATH","EAT","BED","TOILT","WALKR",
+  "WALK1","WALKS","CLIM1","LIFT","CHAIR","STOOP","DIME","ARMS",
+  "PHONE","MONEY","MEALS","SHOP","MEDS",
+  "HIBP","DIAB","CANCR","ARTHR","LUNG","HEART","STROK",
+  "SHLT",
+  "SLEEPR","DEPRES","EFFORT","FLONE","FSAD","GOING",
+  "ENLIFE",
+  "BMI"
+)
+
+# Strict (I)ADL items removed in the sensitivity FI
+iadl_stems <- c(
+  "DRESS","BATH","EAT","BED","TOILT","WALKR",   # ADL
+  "PHONE","MONEY","MEALS","SHOP","MEDS"         # IADL
+)
+
+prefix <- paste0("R", wave)
+
+fi_vars_req_2004    <- paste0("R", wave, fi_stems)
+fi_vars_actual_2004 <- nm_3[fi_vars_req_2004]
+fi_vars_actual_2004 <- fi_vars_actual_2004[!is.na(fi_vars_actual_2004)]
+
+hrs_fi_2004 <- df_3 %>%
+  transmute(
+    hhidpn = .data[[id_var_3]],
+    across(all_of(fi_vars_actual_2004))     # named vector → renames to uppercase keys
+  )
+
+hrs_fi_04 <- hrs_fi_2004 %>%
+  mutate(
+    # ADL/IADL/Mobility: 0=no, 1=yes (deficit), 2=can't do (deficit), 7=don't do (treat as deficit)
+    across(any_of(paste0(prefix, c(
+      "DRESS","BATH","EAT","BED","TOILT","WALKR",
+      "WALK1","WALKS","CLIM1","LIFT","CHAIR","STOOP","DIME","ARMS",
+      "PHONE","MONEY","MEALS","SHOP","MEDS"
+    ))),
+    ~ case_when(.x == 0           ~ 0,
+                .x %in% c(1, 2, 7) ~ 1,
+                TRUE ~ NA_real_)),
+
+    across(any_of(paste0(prefix, c("HIBP","DIAB","CANCR","ARTHR","LUNG","HEART"))),
+           ~ case_when(.x %in% c(0, 4) ~ 0,
+                       .x %in% c(1, 3) ~ 1,
+                       TRUE ~ NA_real_)),
+
+    across(any_of(paste0(prefix, "STROK")),
+           ~ case_when(.x %in% c(0, 4) ~ 0,
+                       .x %in% c(1, 2, 3) ~ 1,
+                       TRUE ~ NA_real_)),
+
+    across(any_of(paste0(prefix, "SHLT")),
+           ~ case_when(.x == 1 ~ 0,
+                       .x == 2 ~ 0.25,
+                       .x == 3 ~ 0.50,
+                       .x == 4 ~ 0.75,
+                       .x == 5 ~ 1,
+                       TRUE ~ NA_real_)),
+
+    across(any_of(paste0(prefix, c("SLEEPR","DEPRES","EFFORT","FLONE","FSAD","GOING"))),
+           ~ case_when(.x == 0 ~ 0,
+                       .x == 1 ~ 1,
+                       TRUE ~ NA_real_)),
+
+    across(any_of(paste0(prefix, "ENLIFE")),
+           ~ case_when(.x == 1 ~ 0,
+                       .x == 0 ~ 1,
+                       TRUE ~ NA_real_)),
+
+    underweight_2004 = if (paste0(prefix, "BMI") %in% names(.)) {
+      case_when(.data[[paste0(prefix, "BMI")]] < 18.5  ~ 1,
+                .data[[paste0(prefix, "BMI")]] >= 18.5 ~ 0,
+                TRUE ~ NA_real_)
+    } else NA_real_
+  ) %>%
+  dplyr::select(-any_of(paste0(prefix, "BMI")))
+
+hrs_fi_04 <- hrs_fi_04 %>%
+  mutate(hhidpn = as.character(hhidpn)) %>%
+  left_join(fat_pain_incont_2004, by = "hhidpn")
+
+# ------------------------------------------------------------------
+# (a) ORIGINAL frailty index (all items)
+# ------------------------------------------------------------------
+fi_items_2004 <- setdiff(names(hrs_fi_04), c("hhidpn", paste0(prefix, "BMI")))
+
+n_items_2004 <- length(fi_items_2004)
+cutoff_2004  <- ceiling(0.80 * n_items_2004)
+
+hrs_fi_04_valid <- hrs_fi_04 %>%
+  mutate(fi_n_items = rowSums(!is.na(across(all_of(fi_items_2004))))) %>%
+  filter(fi_n_items >= cutoff_2004) %>%
+  mutate(
+    fi_n_deficits = rowSums(across(all_of(fi_items_2004)), na.rm = TRUE),
+    FI_score      = fi_n_deficits / fi_n_items
+  )
+
+hrs_fi_2004_orig <- hrs_fi_04_valid %>%
+  mutate(Frailty_status = if_else(FI_score >= 0.25, 1L, 0L)) %>%
+  dplyr::select(hhidpn, FI_score, Frailty_status)
+
+# ------------------------------------------------------------------
+# (b) MODIFIED frailty index — (I)ADL items removed (sensitivity)
+#     Addresses possible mediation by (I)ADL deficits on the
+#     sensory-impairment → dementia pathway. Same ≥0.25 threshold,
+#     same ≥80% completeness rule applied to the reduced item set.
+# ------------------------------------------------------------------
+iadl_vars_2004 <- paste0(prefix, iadl_stems)
+
+fi_items_2004_noIADL <- setdiff(fi_items_2004, iadl_vars_2004)
+
+n_items_2004_noIADL <- length(fi_items_2004_noIADL)
+cutoff_2004_noIADL  <- ceiling(0.80 * n_items_2004_noIADL)
+
+hrs_fi_04_valid_noIADL <- hrs_fi_04 %>%
+  mutate(fi_n_items_noIADL =
+           rowSums(!is.na(across(all_of(fi_items_2004_noIADL))))) %>%
+  filter(fi_n_items_noIADL >= cutoff_2004_noIADL) %>%
+  mutate(
+    fi_n_deficits_noIADL = rowSums(across(all_of(fi_items_2004_noIADL)),
+                                   na.rm = TRUE),
+    FI_score_noIADL      = fi_n_deficits_noIADL / fi_n_items_noIADL
+  )
+
+hrs_fi_2004_noIADL <- hrs_fi_04_valid_noIADL %>%
+  mutate(Frailty_status_noIADL = if_else(FI_score_noIADL >= 0.25, 1L, 0L)) %>%
+  dplyr::select(hhidpn, FI_score_noIADL, Frailty_status_noIADL)
+
+# ------------------------------------------------------------------
+# Combine both FI versions into a single per-person table
+# ------------------------------------------------------------------
+hrs_fi_2004_final <- hrs_fi_2004_orig %>%
+  full_join(hrs_fi_2004_noIADL, by = "hhidpn")
+    
+```
+
+
+
+
+```{r}
+# 6. Merge 2004 data
+hrs_2004 <- hrs_cov_2004 %>%
+  mutate(hhidpn = as.character(hhidpn)) %>%
+  left_join(
+    sensory_2004,
+    by = "hhidpn"
+  ) %>%
+  left_join(
+    social_2004,
+    by = "hhidpn"
+  ) %>%
+  left_join(
+    lw_2004 %>% mutate(hhidpn = as.character(hhidpn)),
+    by = c("hhidpn", "year")
+  ) %>%
+  left_join(
+    hrs_fi_2004_final %>% mutate(hhidpn = as.character(hhidpn)),
+    by = "hhidpn"
+  ) %>%
+  left_join(
+    fat_pain_incont_2004,
+    by = "hhidpn"
+  ) %>%
+  mutate(dementia = if_else(cogfunction == 3, 1L, 0L, missing = NA_integer_))
+
+
+# 7. Imputation (consistent with ELSA approach)
+# ---- 1. Prepare dataset for imputation -----------------------------
+imp04 <- hrs_2004 %>%
+  mutate(hhidpn = as.character(hhidpn)) %>%
+  transmute(
+    hhidpn,
+    Gender    = factor(Gender, levels = c(1, 2)),
+    age_2004  = as.numeric(age_2004),
+    Education = ordered(Education),
+    Race      = factor(Race, levels = c(0, 1)),
+    across(c(Marital_status, Employment, Smoking, Alcohol,
+             Physical_activity, Social_activity),
+           ~ factor(.x, levels = c(0, 1))),
+    # auxiliary predictors -- inform imputation but are not imputed
+    FI_score,
+    Frailty_status = factor(Frailty_status, levels = c(0, 1)),
+    dementia       = factor(dementia,       levels = c(0, 1))
+  )
+
+# ---- 2. Quantify missingness (for methods text) --------------------
+miss_pct <- sapply(imp04, function(x) mean(is.na(x)) * 100)
+miss_cov <- miss_pct[miss_pct > 0 &
+                     !names(miss_pct) %in% c("FI_score",
+                                             "Frailty_status",
+                                             "dementia")]
+cat("Percentage missing per variable:\n"); print(round(miss_pct, 2))
+cat(sprintf("\nMean missing across covariates: %.2f%%\n", mean(miss_cov)))
+cat(sprintf("Maximum missing: %.2f%% (%s)\n",
+            max(miss_cov), names(which.max(miss_cov))))
+
+# ---- 3. Imputation method per variable -----------------------------
+meth <- make.method(imp04)
+meth[c("hhidpn", "Gender", "Race",
+       "FI_score", "Frailty_status", "dementia")] <- ""   # not imputed
+meth["age_2004"]  <- "pmm"
+meth["Education"] <- "polr"
+meth[c("Marital_status", "Employment", "Smoking", "Alcohol",
+       "Physical_activity", "Social_activity")] <- "logreg"
+
+# ---- 4. Predictor matrix: all other covariates as predictors -------
+pred <- make.predictorMatrix(imp04)
+pred[, "hhidpn"] <- 0   # ID is never a predictor
+pred["hhidpn", ] <- 0   # ID is never imputed
+
+# ---- 5. Run MICE: 20 imputed datasets, 10 iterations ---------------
+set.seed(3)
+imp_mice04 <- mice(
+  imp04,
+  m               = 20,
+  maxit           = 10,
+  method          = meth,
+  predictorMatrix = pred,
+  printFlag       = TRUE
+)
+
+# ---- 6. Convergence diagnostics ----
+plot(imp_mice04)   # trace plot is safe — only includes imputed vars
+
+# helper: does mice have enough imputed values to plot?
+has_imps <- function(mids_obj, v) {
+  !is.null(mids_obj$imp[[v]]) && nrow(mids_obj$imp[[v]]) >= 2
+}
+
+# ---- 7. Compare imputed vs observed (continuous) ----
+if (has_imps(imp_mice04, "age_2004")) {
+  print(densityplot(imp_mice04, ~ age_2004))
+  print(stripplot(imp_mice04, age_2004 ~ .imp, pch = 20, cex = 1.2))
+} else {
+  message(sprintf("age_2004: only %d missing value(s) — density/strip plots skipped.",
+                  sum(is.na(imp_mice04$data$age_2004))))
+}
+
+# Numerical summaries: observed vs imputed for each variable
+compare_summaries <- function(mids_obj, var) {
+  orig <- mids_obj$data[[var]]
+  imps <- lapply(seq_len(mids_obj$m),
+                 function(i) complete(mids_obj, i)[[var]])
+  if (is.numeric(orig)) {
+    obs_mean  <- mean(orig, na.rm = TRUE)
+    imp_means <- sapply(imps, mean)
+    data.frame(variable = var,
+               observed_mean    = round(obs_mean, 3),
+               imputed_mean_min = round(min(imp_means), 3),
+               imputed_mean_max = round(max(imp_means), 3))
+  } else {
+    obs_tab <- prop.table(table(as.character(orig)))
+    imp_tab <- prop.table(table(unlist(lapply(imps, as.character))))
+    data.frame(variable = var,
+               observed = paste(names(obs_tab), round(obs_tab, 3),
+                                sep = "=", collapse = " | "),
+               imputed  = paste(names(imp_tab), round(imp_tab, 3),
+                                sep = "=", collapse = " | "))
+  }
+}
+
+vars_imputed <- c("age_2004", "Education", "Marital_status", "Employment",
+                  "Smoking", "Alcohol", "Physical_activity", "Social_activity")
+diag_tables  <- lapply(vars_imputed, compare_summaries, mids_obj = imp_mice04)
+print(diag_tables)
+
+# ---- 8. Long-format completed data, preserving all 20 imputations --
+imp_long <- complete(imp_mice04, action = "long", include = FALSE) %>%
+  mutate(hhidpn = as.character(hhidpn))
+
+# Carry .imp and .id through the join so each of the 20 imputations
+# remains separable for pooling at the analysis stage.
+hrs04_clean <- imp_long %>%
+  dplyr::select(.imp, .id, hhidpn, all_of(vars_imputed)) %>%
+  left_join(
+    hrs_2004 %>%
+      mutate(hhidpn = as.character(hhidpn)) %>%
+      dplyr::select(-any_of(vars_imputed)),
+    by = "hhidpn"
+  )
+
+
+# 8. Compute impaired_vision (no filtering — all NAs preserved)
+HRS_2004 <- hrs04_clean %>%
+  mutate(
+    impaired_vision = pmax(
+      coalesce(cataract_surgery, 0L),
+      coalesce(glaucoma_treatment, 0L)
+    )
+  )
+
+```
+
+
+
+```{r}
+# hrs data 2006
+df_4 <- hrs_2022summary
+wave <- 8      # 2006
+year <- 2006L
+
+nm_4 <- setNames(names(df_4), toupper(names(df_4)))
+
+id_var_4    <- nm_4["HHIDPN"]
+byear_var_4 <- nm_4["RABYEAR"]
+bmon_var_4  <- nm_4["RABMONTH"]
+
+if (any(is.na(c(id_var_4, byear_var_4, bmon_var_4))))
+  stop("ID or birth variables missing (2006).")
+
+cov_req_2006 <- c(
+  "RAGENDER",
+  "RAEDUC",
+  "RARACEM",
+  "RAHISPAN",
+  "R8AGEY_E",       # end-of-wave age (precise)
+  "R8MSTAT",
+  "R8WORK",
+  "R8SMOKEN",
+  "R8DRINKD",
+  "R8VGACTX"
+)
+
+cov_actual_2006 <- nm_4[toupper(cov_req_2006)]
+cov_actual_2006 <- cov_actual_2006[!is.na(cov_actual_2006)]
+
+hrs_cov_2006 <- df_4 %>%
+  transmute(
+    hhidpn      = .data[[id_var_4]],
+    year        = year,
+    birth_year  = .data[[ byear_var_4 ]],
+    birth_month = .data[[ bmon_var_4 ]],
+    across(all_of(cov_actual_2006))
+  ) %>%
+  mutate(
+    # FIX: prefer R8AGEY_E; fall back to year - birth_year
+    age_2006 = coalesce(
+      as.numeric(R8AGEY_E),
+      if_else(!is.na(birth_year), as.numeric(year - birth_year), NA_real_)
+    ),
+
+    Gender = case_when(
+      RAGENDER %in% c(1, 2) ~ as.integer(RAGENDER),
+      TRUE ~ NA_integer_
+    ),
+
+    # FIX: HS grad (3) belongs with HS tier, not college
+    Education = case_when(
+      is.na(RAEDUC)       ~ NA_integer_,
+      RAEDUC == 1         ~ 0L,    # < HS
+      RAEDUC %in% c(2, 3) ~ 1L,    # GED + HS grad
+      RAEDUC %in% c(4, 5) ~ 2L,    # some college / college+
+      TRUE ~ NA_integer_
+    ),
+
+    # FIX: include partnered/spouse-absent (codes 2, 3) as married/partnered
+    Marital_status = case_when(
+      R8MSTAT %in% c(1, 2, 3)       ~ 1L,
+      R8MSTAT %in% c(4, 5, 6, 7, 8) ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+
+    Employment = case_when(
+      R8WORK == 1 ~ 1L,
+      R8WORK == 0 ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+
+    Smoking = case_when(
+      R8SMOKEN == 1 ~ 1L,
+      R8SMOKEN == 0 ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+
+    Alcohol = case_when(
+      R8DRINKD >  0 ~ 1L,
+      R8DRINKD == 0 ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+
+    # FIX: NH White still classified when RAHISPAN missing
+    Race = case_when(
+      (RAHISPAN == 0 | is.na(RAHISPAN)) & RARACEM == 1 ~ 0L,
+      RAHISPAN == 1 | RARACEM %in% c(2, 3)              ~ 1L,
+      TRUE ~ NA_integer_
+    ),
+
+    Physical_activity = case_when(
+      R8VGACTX %in% c(1, 2, 3) ~ 1L,
+      R8VGACTX %in% c(4, 5)    ~ 0L,
+      TRUE ~ NA_integer_
+    )
+  ) %>%
+  dplyr::select(
+    hhidpn, year, birth_year, birth_month, age_2006,
+    Gender, Education, Marital_status, Employment, Smoking, Alcohol,
+    Race, Physical_activity
+  )
+
+# dementia (Langa-Weir 2006)
+lw_2006 <- hrs_LangaWeir %>%
+  filter(interview2006 == 1) %>%
+  mutate(hhidpn = 1000 * as.numeric(hhid) + as.numeric(pn)) %>%
+  transmute(
+    hhidpn,
+    year        = 2006L,
+    cogfunction = cogfunction2006,
+    cogtot27    = cogtot27_imp2006
+  )
+
+```
+
+
+
+
+```{r}
+# FAT 2006 file
+fat_path_06 <- "data/HRS/h06f4b_STATA/h06f4b.dta"
+
+fat06 <- read_dta(
+  fat_path_06,
+  col_select = c(hhidpn,
+                 kc104, kc087,                                     # pain, incontinence
+                 kc095, kc096, kc097, kc098, kc101, kc102, kc103,  # sensory (incl. hearing_aid)
+                 kg086, kb082, kg198))                              # social activity
+
+## Pain & incontinence
+fat_pain_incont_2006 <- fat06 %>%
+  transmute(
+    hhidpn = as.character(hhidpn),
+    pain_2006 = case_when(
+      kc104 == 1 ~ 1,
+      kc104 == 5 ~ 0,
+      TRUE ~ NA_real_
+    ),
+    incont_2006 = case_when(
+      kc087 == 1 ~ 1,
+      kc087 == 5 ~ 0,
+      TRUE ~ NA_real_
+    )
+  )
+
+## Sensory (FAT) — hearing_aid kept; skip-patterns handled
+sensory_2006 <- fat06 %>%
+  transmute(
+    hhidpn = as.character(hhidpn),
+    hearing_loss = case_when(
+      kc103 %in% c(1, 2, 3) ~ 0L,
+      kc103 %in% c(4, 5)    ~ 1L,
+      TRUE ~ NA_integer_
+    ),
+    hearing_aid = case_when(
+      kc102 == 1         ~ 1L,
+      kc102 == 5         ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    vision_overall = case_when(
+      kc095 %in% c(1, 2, 3) ~ 0L,
+      kc095 %in% c(4, 5, 6) ~ 1L,    # 6 = Legally Blind → impaired
+      TRUE ~ NA_integer_
+    ),
+    # FIX: legally blind (kc095==6) → impaired for far/near (skip-coded)
+    vision_far = case_when(
+      kc095 == 6            ~ 1L,
+      kc096 %in% c(1, 2, 3) ~ 0L,
+      kc096 %in% c(4, 5)    ~ 1L,
+      TRUE ~ NA_integer_
+    ),
+    vision_near = case_when(
+      kc095 == 6            ~ 1L,
+      kc097 %in% c(1, 2, 3) ~ 0L,
+      kc097 %in% c(4, 5)    ~ 1L,
+      TRUE ~ NA_integer_
+    ),
+    # FIX: skip-pattern (no diagnosis) NaN → 0
+    cataract_surgery = case_when(
+      kc098 == 1         ~ 1L,
+      kc098 == 5         ~ 0L,
+      kc098 %in% c(8, 9) ~ NA_integer_,
+      is.na(kc098)       ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    glaucoma_treatment = case_when(
+      kc101 == 1         ~ 1L,
+      kc101 == 5         ~ 0L,
+      kc101 %in% c(8, 9) ~ NA_integer_,
+      is.na(kc101)       ~ 0L,
+      TRUE ~ NA_integer_
+    )
+  )
+
+## Social activity (FAT)
+social_2006 <- fat06 %>%
+  transmute(
+    hhidpn = as.character(hhidpn),
+    volunteer = case_when(
+      kg086 == 1 ~ 1L,
+      kg086 == 5 ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    religious_freq = case_when(
+      kb082 %in% c(1, 2, 3) ~ 1L,
+      kb082 %in% c(4, 5)    ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    helping = case_when(
+      kg198 == 1 ~ 1L,
+      kg198 == 5 ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    Social_activity = case_when(
+      volunteer == 1 | religious_freq == 1 | helping == 1 ~ 1L,
+      is.na(volunteer) & is.na(religious_freq) & is.na(helping) ~ NA_integer_,
+      TRUE ~ 0L
+    )
+  ) %>%
+  dplyr::select(hhidpn, Social_activity)
+
+## Frailty Index
+fi_vars_req_2006    <- paste0("R", wave, fi_stems)
+fi_vars_actual_2006 <- nm_4[fi_vars_req_2006]
+fi_vars_actual_2006 <- fi_vars_actual_2006[!is.na(fi_vars_actual_2006)]
+
+hrs_fi_2006 <- df_4 %>%
+  transmute(
+    hhidpn = .data[[id_var_4]],
+    across(all_of(fi_vars_actual_2006))     # named vector → renames to uppercase keys
+  )
+
+prefix <- paste0("R", wave)
+
+hrs_fi_06 <- hrs_fi_2006 %>%
+  mutate(
+    # ADL/IADL/Mobility — code 7 ("don't do") treated as deficit
+    across(any_of(paste0(prefix, c(
+      "DRESS","BATH","EAT","BED","TOILT","WALKR",
+      "WALK1","WALKS","CLIM1","LIFT","CHAIR","STOOP","DIME","ARMS",
+      "PHONE","MONEY","MEALS","SHOP","MEDS"
+    ))),
+    ~ case_when(.x == 0            ~ 0,
+                .x %in% c(1, 2, 7) ~ 1,
+                TRUE ~ NA_real_)),
+
+    across(any_of(paste0(prefix, c("HIBP","DIAB","CANCR","ARTHR","LUNG","HEART"))),
+           ~ case_when(.x %in% c(0, 4) ~ 0,
+                       .x %in% c(1, 3) ~ 1,
+                       TRUE ~ NA_real_)),
+
+    across(any_of(paste0(prefix, "STROK")),
+           ~ case_when(.x %in% c(0, 4)    ~ 0,
+                       .x %in% c(1, 2, 3) ~ 1,
+                       TRUE ~ NA_real_)),
+
+    across(any_of(paste0(prefix, "SHLT")),
+           ~ case_when(.x == 1 ~ 0,
+                       .x == 2 ~ 0.25,
+                       .x == 3 ~ 0.50,
+                       .x == 4 ~ 0.75,
+                       .x == 5 ~ 1,
+                       TRUE ~ NA_real_)),
+
+    across(any_of(paste0(prefix, c("SLEEPR","DEPRES","EFFORT","FLONE","FSAD","GOING"))),
+           ~ case_when(.x == 0 ~ 0,
+                       .x == 1 ~ 1,
+                       TRUE ~ NA_real_)),
+
+    across(any_of(paste0(prefix, "ENLIFE")),
+           ~ case_when(.x == 1 ~ 0,
+                       .x == 0 ~ 1,
+                       TRUE ~ NA_real_)),
+
+    underweight_2006 = if (paste0(prefix, "BMI") %in% names(.)) {
+      case_when(.data[[paste0(prefix, "BMI")]] < 18.5  ~ 1,
+                .data[[paste0(prefix, "BMI")]] >= 18.5 ~ 0,
+                TRUE ~ NA_real_)
+    } else NA_real_
+  ) %>%
+  dplyr::select(-any_of(paste0(prefix, "BMI")))
+
+hrs_fi_06 <- hrs_fi_06 %>%
+  mutate(hhidpn = as.character(hhidpn)) %>%
+  left_join(fat_pain_incont_2006, by = "hhidpn")
+
+# ------------------------------------------------------------------
+# (a) ORIGINAL frailty index (all items)
+# ------------------------------------------------------------------
+fi_items_2006 <- setdiff(names(hrs_fi_06), c("hhidpn", paste0(prefix, "BMI")))
+
+n_items_2006 <- length(fi_items_2006)
+cutoff_2006  <- ceiling(0.80 * n_items_2006)
+
+hrs_fi_06_valid <- hrs_fi_06 %>%
+  mutate(fi_n_items = rowSums(!is.na(across(all_of(fi_items_2006))))) %>%
+  filter(fi_n_items >= cutoff_2006) %>%
+  mutate(
+    fi_n_deficits = rowSums(across(all_of(fi_items_2006)), na.rm = TRUE),
+    FI_score      = fi_n_deficits / fi_n_items
+  )
+
+hrs_fi_2006_orig <- hrs_fi_06_valid %>%
+  mutate(Frailty_status = if_else(FI_score >= 0.25, 1L, 0L)) %>%
+  dplyr::select(hhidpn, FI_score, Frailty_status)
+
+# ------------------------------------------------------------------
+# (b) MODIFIED frailty index — (I)ADL items removed (sensitivity)
+#     Same ≥0.25 threshold and ≥80% completeness rule, reapplied
+#     to the reduced item set.
+# ------------------------------------------------------------------
+iadl_vars_2006 <- paste0(prefix, iadl_stems)
+
+fi_items_2006_noIADL <- setdiff(fi_items_2006, iadl_vars_2006)
+
+n_items_2006_noIADL <- length(fi_items_2006_noIADL)
+cutoff_2006_noIADL  <- ceiling(0.80 * n_items_2006_noIADL)
+
+hrs_fi_06_valid_noIADL <- hrs_fi_06 %>%
+  mutate(fi_n_items_noIADL =
+           rowSums(!is.na(across(all_of(fi_items_2006_noIADL))))) %>%
+  filter(fi_n_items_noIADL >= cutoff_2006_noIADL) %>%
+  mutate(
+    fi_n_deficits_noIADL = rowSums(across(all_of(fi_items_2006_noIADL)),
+                                   na.rm = TRUE),
+    FI_score_noIADL      = fi_n_deficits_noIADL / fi_n_items_noIADL
+  )
+
+hrs_fi_2006_noIADL <- hrs_fi_06_valid_noIADL %>%
+  mutate(Frailty_status_noIADL = if_else(FI_score_noIADL >= 0.25, 1L, 0L)) %>%
+  dplyr::select(hhidpn, FI_score_noIADL, Frailty_status_noIADL)
+
+# ------------------------------------------------------------------
+# Combine both FI versions into a single per-person table
+# ------------------------------------------------------------------
+hrs_fi_2006_final <- hrs_fi_2006_orig %>%
+  full_join(hrs_fi_2006_noIADL, by = "hhidpn")
+
+
+```
+
+
+
+
+```{r}
+# 6. Merge 2006 data
+hrs_2006 <- hrs_cov_2006 %>%
+  mutate(hhidpn = as.character(hhidpn)) %>%
+  left_join(
+    sensory_2006,
+    by = "hhidpn"
+  ) %>%
+  left_join(
+    social_2006,
+    by = "hhidpn"
+  ) %>%
+  left_join(
+    lw_2006 %>% mutate(hhidpn = as.character(hhidpn)),
+    by = c("hhidpn", "year")
+  ) %>%
+  left_join(
+    hrs_fi_2006_final %>% mutate(hhidpn = as.character(hhidpn)),
+    by = "hhidpn"
+  ) %>%
+  left_join(
+    fat_pain_incont_2006,
+    by = "hhidpn"
+  ) %>%
+  mutate(dementia = if_else(cogfunction == 3, 1L, 0L, missing = NA_integer_))
+
+
+# 7. Imputation (consistent with ELSA approach)
+imp06 <- hrs_2006 %>%
+  mutate(hhidpn = as.character(hhidpn)) %>%
+  transmute(
+    hhidpn,
+    Gender,
+    age_2006 = as.numeric(age_2006),
+    Education = ordered(Education),
+    Race = factor(Race, levels = c(0, 1)),
+    across(c(Marital_status, Employment, Smoking, Alcohol, Physical_activity,
+             Social_activity),
+           ~ factor(.x, levels = c(0, 1)))
+  ) %>%
+  mutate(Gender = factor(Gender, levels = c(1, 2)))
+
+# Define imputation methods
+meth <- make.method(imp06)
+meth[c("hhidpn", "Gender", "Race")] <- ""
+meth["age_2006"] <- "pmm"
+meth["Education"] <- "polr"
+meth[c("Marital_status", "Employment", "Smoking", "Alcohol",
+       "Physical_activity", "Social_activity")] <- "logreg"
+
+# Predictor matrix
+pred <- make.predictorMatrix(imp06)
+pred[, "hhidpn"] <- 0
+pred["hhidpn", ] <- 0
+
+# Run MICE
+set.seed(6)
+imp_mice06 <- mice(
+  imp06,
+  m = 20,
+  maxit = 10,
+  method = meth,
+  predictorMatrix = pred,
+  printFlag = TRUE
+)
+
+# Extract completed dataset and merge back
+imp06_complete1 <- complete(imp_mice06, 1)
+
+imputed_vars <- c("Education", "Marital_status", "Employment", "Smoking", "Alcohol",
+                  "Physical_activity", "Social_activity", "age_2006")
+
+hrs06_clean <- hrs_2006 %>%
+  mutate(hhidpn = as.character(hhidpn)) %>%
+  dplyr::select(-all_of(imputed_vars)) %>%
+  left_join(
+    imp06_complete1 %>%
+      mutate(hhidpn = as.character(hhidpn)) %>%
+      dplyr::select(hhidpn, all_of(imputed_vars)),
+    by = "hhidpn"
+  )
+
+
+# 8. Compute impaired_vision (no filtering — all NAs preserved)
+HRS_2006 <- hrs06_clean %>%
+  mutate(
+    impaired_vision = pmax(
+      coalesce(cataract_surgery, 0L),
+      coalesce(glaucoma_treatment, 0L)
+    )
+  )
+
+```
+
+
+
+
+```{r}
+# hrs data 2008
+df_5 <- hrs_2022summary
+wave <- 9      # 2008
+year <- 2008L
+
+nm_5 <- setNames(names(df_5), toupper(names(df_5)))
+
+id_var_5    <- nm_5["HHIDPN"]
+byear_var_5 <- nm_5["RABYEAR"]
+bmon_var_5  <- nm_5["RABMONTH"]
+
+if (any(is.na(c(id_var_5, byear_var_5, bmon_var_5))))
+  stop("ID or birth variables missing (2008).")
+
+cov_req_2008 <- c(
+  "RAGENDER",
+  "RAEDUC",
+  "RARACEM",
+  "RAHISPAN",
+  "R9AGEY_E",       # end-of-wave age (precise)
+  "R9MSTAT",
+  "R9WORK",
+  "R9SMOKEN",
+  "R9DRINKD",
+  "R9VGACTX"
+)
+
+cov_actual_2008 <- nm_5[toupper(cov_req_2008)]
+cov_actual_2008 <- cov_actual_2008[!is.na(cov_actual_2008)]
+
+hrs_cov_2008 <- df_5 %>%
+  transmute(
+    hhidpn      = .data[[id_var_5]],
+    year        = year,
+    birth_year  = .data[[ byear_var_5 ]],
+    birth_month = .data[[ bmon_var_5 ]],
+    across(all_of(cov_actual_2008))
+  ) %>%
+  mutate(
+    # FIX: prefer R9AGEY_E; fall back to year - birth_year
+    age_2008 = coalesce(
+      as.numeric(R9AGEY_E),
+      if_else(!is.na(birth_year), as.numeric(year - birth_year), NA_real_)
+    ),
+
+    Gender = case_when(
+      RAGENDER %in% c(1, 2) ~ as.integer(RAGENDER),
+      TRUE ~ NA_integer_
+    ),
+
+    # FIX: HS grad (3) belongs with HS tier, not college
+    Education = case_when(
+      is.na(RAEDUC)       ~ NA_integer_,
+      RAEDUC == 1         ~ 0L,
+      RAEDUC %in% c(2, 3) ~ 1L,
+      RAEDUC %in% c(4, 5) ~ 2L,
+      TRUE ~ NA_integer_
+    ),
+
+    # FIX: include partnered/spouse-absent (codes 2, 3) as married/partnered
+    Marital_status = case_when(
+      R9MSTAT %in% c(1, 2, 3)       ~ 1L,
+      R9MSTAT %in% c(4, 5, 6, 7, 8) ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+
+    Employment = case_when(
+      R9WORK == 1 ~ 1L,
+      R9WORK == 0 ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+
+    Smoking = case_when(
+      R9SMOKEN == 1 ~ 1L,
+      R9SMOKEN == 0 ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+
+    Alcohol = case_when(
+      R9DRINKD >  0 ~ 1L,
+      R9DRINKD == 0 ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+
+    # FIX: NH White still classified when RAHISPAN missing
+    Race = case_when(
+      (RAHISPAN == 0 | is.na(RAHISPAN)) & RARACEM == 1 ~ 0L,
+      RAHISPAN == 1 | RARACEM %in% c(2, 3)              ~ 1L,
+      TRUE ~ NA_integer_
+    ),
+
+    Physical_activity = case_when(
+      R9VGACTX %in% c(1, 2, 3) ~ 1L,
+      R9VGACTX %in% c(4, 5)    ~ 0L,
+      TRUE ~ NA_integer_
+    )
+  ) %>%
+  dplyr::select(
+    hhidpn, year, birth_year, birth_month, age_2008,
+    Gender, Education, Marital_status, Employment, Smoking, Alcohol,
+    Race, Physical_activity
+  )
+
+# dementia (Langa-Weir 2008)
+lw_2008 <- hrs_LangaWeir %>%
+  filter(interview2008 == 1) %>%
+  mutate(hhidpn = 1000 * as.numeric(hhid) + as.numeric(pn)) %>%
+  transmute(
+    hhidpn,
+    year        = 2008L,
+    cogfunction = cogfunction2008,
+    cogtot27    = cogtot27_imp2008
+  )
+
+```
+
+
+
+
+```{r}
+# FAT 2008 file
+fat_path_08 <- "data/HRS/h08f3b_STATA/h08f3b.dta"
+
+fat08 <- read_dta(
+  fat_path_08,
+  col_select = c(hhidpn,
+                 lc104, lc087,                                     # pain, incontinence
+                 lc095, lc096, lc097, lc098, lc101, lc102, lc103,  # sensory (incl. hearing_aid)
+                 lg086, lb082, lg198))                              # social activity
+
+## Pain & incontinence
+fat_pain_incont_2008 <- fat08 %>%
+  transmute(
+    hhidpn = as.character(hhidpn),
+    pain_2008 = case_when(
+      lc104 == 1 ~ 1,
+      lc104 == 5 ~ 0,
+      TRUE ~ NA_real_
+    ),
+    incont_2008 = case_when(
+      lc087 == 1 ~ 1,
+      lc087 == 5 ~ 0,
+      TRUE ~ NA_real_
+    )
+  )
+
+## Sensory (FAT) — hearing_aid kept; skip-patterns handled
+sensory_2008 <- fat08 %>%
+  transmute(
+    hhidpn = as.character(hhidpn),
+    hearing_loss = case_when(
+      lc103 %in% c(1, 2, 3) ~ 0L,
+      lc103 %in% c(4, 5)    ~ 1L,
+      TRUE ~ NA_integer_
+    ),
+    hearing_aid = case_when(
+      lc102 == 1         ~ 1L,
+      lc102 == 5         ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    vision_overall = case_when(
+      lc095 %in% c(1, 2, 3) ~ 0L,
+      lc095 %in% c(4, 5, 6) ~ 1L,    # 6 = Legally Blind → impaired
+      TRUE ~ NA_integer_
+    ),
+    # FIX: legally blind (lc095==6) → impaired for far/near (skip-coded)
+    vision_far = case_when(
+      lc095 == 6            ~ 1L,
+      lc096 %in% c(1, 2, 3) ~ 0L,
+      lc096 %in% c(4, 5)    ~ 1L,
+      TRUE ~ NA_integer_
+    ),
+    vision_near = case_when(
+      lc095 == 6            ~ 1L,
+      lc097 %in% c(1, 2, 3) ~ 0L,
+      lc097 %in% c(4, 5)    ~ 1L,
+      TRUE ~ NA_integer_
+    ),
+    # FIX: skip-pattern (no diagnosis) NaN → 0
+    cataract_surgery = case_when(
+      lc098 == 1         ~ 1L,
+      lc098 == 5         ~ 0L,
+      lc098 %in% c(8, 9) ~ NA_integer_,
+      is.na(lc098)       ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    glaucoma_treatment = case_when(
+      lc101 == 1         ~ 1L,
+      lc101 == 5         ~ 0L,
+      lc101 %in% c(8, 9) ~ NA_integer_,
+      is.na(lc101)       ~ 0L,
+      TRUE ~ NA_integer_
+    )
+  )
+
+## Social activity (FAT)
+social_2008 <- fat08 %>%
+  transmute(
+    hhidpn = as.character(hhidpn),
+    volunteer = case_when(
+      lg086 == 1 ~ 1L,
+      lg086 == 5 ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    religious_freq = case_when(
+      lb082 %in% c(1, 2, 3) ~ 1L,
+      lb082 %in% c(4, 5)    ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    helping = case_when(
+      lg198 == 1 ~ 1L,
+      lg198 == 5 ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    Social_activity = case_when(
+      volunteer == 1 | religious_freq == 1 | helping == 1 ~ 1L,
+      is.na(volunteer) & is.na(religious_freq) & is.na(helping) ~ NA_integer_,
+      TRUE ~ 0L
+    )
+  ) %>%
+  dplyr::select(hhidpn, Social_activity)
+
+## Frailty Index
+fi_vars_req_2008    <- paste0("R", wave, fi_stems)
+fi_vars_actual_2008 <- nm_5[fi_vars_req_2008]
+fi_vars_actual_2008 <- fi_vars_actual_2008[!is.na(fi_vars_actual_2008)]
+
+hrs_fi_2008 <- df_5 %>%
+  transmute(
+    hhidpn = .data[[id_var_5]],
+    across(all_of(fi_vars_actual_2008))     # named vector → renames to uppercase keys
+  )
+
+prefix <- paste0("R", wave)
+
+hrs_fi_08 <- hrs_fi_2008 %>%
+  mutate(
+    # ADL/IADL/Mobility — code 7 ("don't do") treated as deficit
+    across(any_of(paste0(prefix, c(
+      "DRESS","BATH","EAT","BED","TOILT","WALKR",
+      "WALK1","WALKS","CLIM1","LIFT","CHAIR","STOOP","DIME","ARMS",
+      "PHONE","MONEY","MEALS","SHOP","MEDS"
+    ))),
+    ~ case_when(.x == 0            ~ 0,
+                .x %in% c(1, 2, 7) ~ 1,
+                TRUE ~ NA_real_)),
+
+    across(any_of(paste0(prefix, c("HIBP","DIAB","CANCR","ARTHR","LUNG","HEART"))),
+           ~ case_when(.x %in% c(0, 4) ~ 0,
+                       .x %in% c(1, 3) ~ 1,
+                       TRUE ~ NA_real_)),
+
+    across(any_of(paste0(prefix, "STROK")),
+           ~ case_when(.x %in% c(0, 4)    ~ 0,
+                       .x %in% c(1, 2, 3) ~ 1,
+                       TRUE ~ NA_real_)),
+
+    across(any_of(paste0(prefix, "SHLT")),
+           ~ case_when(.x == 1 ~ 0,
+                       .x == 2 ~ 0.25,
+                       .x == 3 ~ 0.50,
+                       .x == 4 ~ 0.75,
+                       .x == 5 ~ 1,
+                       TRUE ~ NA_real_)),
+
+    across(any_of(paste0(prefix, c("SLEEPR","DEPRES","EFFORT","FLONE","FSAD","GOING"))),
+           ~ case_when(.x == 0 ~ 0,
+                       .x == 1 ~ 1,
+                       TRUE ~ NA_real_)),
+
+    across(any_of(paste0(prefix, "ENLIFE")),
+           ~ case_when(.x == 1 ~ 0,
+                       .x == 0 ~ 1,
+                       TRUE ~ NA_real_)),
+
+    underweight_2008 = if (paste0(prefix, "BMI") %in% names(.)) {
+      case_when(.data[[paste0(prefix, "BMI")]] < 18.5  ~ 1,
+                .data[[paste0(prefix, "BMI")]] >= 18.5 ~ 0,
+                TRUE ~ NA_real_)
+    } else NA_real_
+  ) %>%
+  dplyr::select(-any_of(paste0(prefix, "BMI")))
+
+hrs_fi_08 <- hrs_fi_08 %>%
+  mutate(hhidpn = as.character(hhidpn)) %>%
+  left_join(fat_pain_incont_2008, by = "hhidpn")
+
+# ------------------------------------------------------------------
+# (a) ORIGINAL frailty index (all items)
+# ------------------------------------------------------------------
+fi_items_2008 <- setdiff(names(hrs_fi_08), c("hhidpn", paste0(prefix, "BMI")))
+
+n_items_2008 <- length(fi_items_2008)
+cutoff_2008  <- ceiling(0.80 * n_items_2008)
+
+hrs_fi_08_valid <- hrs_fi_08 %>%
+  mutate(fi_n_items = rowSums(!is.na(across(all_of(fi_items_2008))))) %>%
+  filter(fi_n_items >= cutoff_2008) %>%
+  mutate(
+    fi_n_deficits = rowSums(across(all_of(fi_items_2008)), na.rm = TRUE),
+    FI_score      = fi_n_deficits / fi_n_items
+  )
+
+hrs_fi_2008_orig <- hrs_fi_08_valid %>%
+  mutate(Frailty_status = if_else(FI_score >= 0.25, 1L, 0L)) %>%
+  dplyr::select(hhidpn, FI_score, Frailty_status)
+
+# ------------------------------------------------------------------
+# (b) MODIFIED frailty index — (I)ADL items removed (sensitivity)
+#     Same ≥0.25 threshold and ≥80% completeness rule, reapplied
+#     to the reduced item set.
+# ------------------------------------------------------------------
+iadl_vars_2008 <- paste0(prefix, iadl_stems)
+
+fi_items_2008_noIADL <- setdiff(fi_items_2008, iadl_vars_2008)
+
+n_items_2008_noIADL <- length(fi_items_2008_noIADL)
+cutoff_2008_noIADL  <- ceiling(0.80 * n_items_2008_noIADL)
+
+hrs_fi_08_valid_noIADL <- hrs_fi_08 %>%
+  mutate(fi_n_items_noIADL =
+           rowSums(!is.na(across(all_of(fi_items_2008_noIADL))))) %>%
+  filter(fi_n_items_noIADL >= cutoff_2008_noIADL) %>%
+  mutate(
+    fi_n_deficits_noIADL = rowSums(across(all_of(fi_items_2008_noIADL)),
+                                   na.rm = TRUE),
+    FI_score_noIADL      = fi_n_deficits_noIADL / fi_n_items_noIADL
+  )
+
+hrs_fi_2008_noIADL <- hrs_fi_08_valid_noIADL %>%
+  mutate(Frailty_status_noIADL = if_else(FI_score_noIADL >= 0.25, 1L, 0L)) %>%
+  dplyr::select(hhidpn, FI_score_noIADL, Frailty_status_noIADL)
+
+# ------------------------------------------------------------------
+# Combine both FI versions into a single per-person table
+# ------------------------------------------------------------------
+hrs_fi_2008_final <- hrs_fi_2008_orig %>%
+  full_join(hrs_fi_2008_noIADL, by = "hhidpn")
+
+```
+
+
+
+
+```{r}
+# 6. Merge 2008 data
+hrs_2008 <- hrs_cov_2008 %>%
+  mutate(hhidpn = as.character(hhidpn)) %>%
+  left_join(
+    sensory_2008,
+    by = "hhidpn"
+  ) %>%
+  left_join(
+    social_2008,
+    by = "hhidpn"
+  ) %>%
+  left_join(
+    lw_2008 %>% mutate(hhidpn = as.character(hhidpn)),
+    by = c("hhidpn", "year")
+  ) %>%
+  left_join(
+    hrs_fi_2008_final %>% mutate(hhidpn = as.character(hhidpn)),
+    by = "hhidpn"
+  ) %>%
+  left_join(
+    fat_pain_incont_2008,
+    by = "hhidpn"
+  ) %>%
+  mutate(dementia = if_else(cogfunction == 3, 1L, 0L, missing = NA_integer_))
+
+
+# 7. Imputation (consistent with ELSA approach)
+imp08 <- hrs_2008 %>%
+  mutate(hhidpn = as.character(hhidpn)) %>%
+  transmute(
+    hhidpn,
+    Gender,
+    age_2008 = as.numeric(age_2008),
+    Education = ordered(Education),
+    Race = factor(Race, levels = c(0, 1)),
+    across(c(Marital_status, Employment, Smoking, Alcohol, Physical_activity,
+             Social_activity),
+           ~ factor(.x, levels = c(0, 1)))
+  ) %>%
+  mutate(Gender = factor(Gender, levels = c(1, 2)))
+
+# Define imputation methods
+meth <- make.method(imp08)
+meth[c("hhidpn", "Gender", "Race")] <- ""
+meth["age_2008"] <- "pmm"
+meth["Education"] <- "polr"
+meth[c("Marital_status", "Employment", "Smoking", "Alcohol",
+       "Physical_activity", "Social_activity")] <- "logreg"
+
+# Predictor matrix
+pred <- make.predictorMatrix(imp08)
+pred[, "hhidpn"] <- 0
+pred["hhidpn", ] <- 0
+
+# Run MICE
+set.seed(8)
+imp_mice08 <- mice(
+  imp08,
+  m = 20,
+  maxit = 10,
+  method = meth,
+  predictorMatrix = pred,
+  printFlag = TRUE
+)
+
+# Extract completed dataset and merge back
+imp08_complete1 <- complete(imp_mice08, 1)
+
+imputed_vars <- c("Education", "Marital_status", "Employment", "Smoking", "Alcohol",
+                  "Physical_activity", "Social_activity", "age_2008")
+
+hrs08_clean <- hrs_2008 %>%
+  mutate(hhidpn = as.character(hhidpn)) %>%
+  dplyr::select(-all_of(imputed_vars)) %>%
+  left_join(
+    imp08_complete1 %>%
+      mutate(hhidpn = as.character(hhidpn)) %>%
+      dplyr::select(hhidpn, all_of(imputed_vars)),
+    by = "hhidpn"
+  )
+
+
+# 8. Compute impaired_vision (no filtering — all NAs preserved)
+HRS_2008 <- hrs08_clean %>%
+  mutate(
+    impaired_vision = pmax(
+      coalesce(cataract_surgery, 0L),
+      coalesce(glaucoma_treatment, 0L)
+    )
+  )
+    
+```
+
+
+
+
+```{r}
+# HRS data 2010 (Wave 10)
+df_6 <- hrs_2022summary
+wave <- 10
+year <- 2010L
+
+nm_6 <- setNames(names(df_6), toupper(names(df_6)))
+
+id_var_6    <- nm_6["HHIDPN"]
+byear_var_6 <- nm_6["RABYEAR"]
+bmon_var_6  <- nm_6["RABMONTH"]
+
+if (any(is.na(c(id_var_6, byear_var_6, bmon_var_6))))
+  stop("ID or birth variables missing (2010).")
+
+cov_req_2010 <- c(
+  "RAGENDER",
+  "RAEDUC",
+  "RARACEM",
+  "RAHISPAN",
+  "R10AGEY_E",       # end-of-wave age (precise)
+  "R10MSTAT",
+  "R10WORK",
+  "R10SMOKEN",
+  "R10DRINKD",
+  "R10VGACTX"
+)
+
+cov_actual_2010 <- nm_6[toupper(cov_req_2010)]
+cov_actual_2010 <- cov_actual_2010[!is.na(cov_actual_2010)]
+
+hrs_cov_2010 <- df_6 %>%
+  transmute(
+    hhidpn      = .data[[id_var_6]],
+    year        = year,
+    birth_year  = .data[[ byear_var_6 ]],
+    birth_month = .data[[ bmon_var_6 ]],
+    across(all_of(cov_actual_2010))
+  ) %>%
+  mutate(
+    # FIX: prefer R10AGEY_E; fall back to year - birth_year
+    age_2010 = coalesce(
+      as.numeric(R10AGEY_E),
+      if_else(!is.na(birth_year), as.numeric(year - birth_year), NA_real_)
+    ),
+
+    Gender = case_when(
+      RAGENDER %in% c(1, 2) ~ as.integer(RAGENDER),
+      TRUE ~ NA_integer_
+    ),
+
+    # FIX: HS grad (3) belongs with HS tier, not college
+    Education = case_when(
+      is.na(RAEDUC)       ~ NA_integer_,
+      RAEDUC == 1         ~ 0L,
+      RAEDUC %in% c(2, 3) ~ 1L,
+      RAEDUC %in% c(4, 5) ~ 2L,
+      TRUE ~ NA_integer_
+    ),
+
+    # FIX: include partnered/spouse-absent (codes 2, 3) as married/partnered
+    Marital_status = case_when(
+      R10MSTAT %in% c(1, 2, 3)       ~ 1L,
+      R10MSTAT %in% c(4, 5, 6, 7, 8) ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+
+    Employment = case_when(
+      R10WORK == 1 ~ 1L,
+      R10WORK == 0 ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+
+    Smoking = case_when(
+      R10SMOKEN == 1 ~ 1L,
+      R10SMOKEN == 0 ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+
+    Alcohol = case_when(
+      R10DRINKD >  0 ~ 1L,
+      R10DRINKD == 0 ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+
+    # FIX: NH White still classified when RAHISPAN missing
+    Race = case_when(
+      (RAHISPAN == 0 | is.na(RAHISPAN)) & RARACEM == 1 ~ 0L,
+      RAHISPAN == 1 | RARACEM %in% c(2, 3)              ~ 1L,
+      TRUE ~ NA_integer_
+    ),
+
+    Physical_activity = case_when(
+      R10VGACTX %in% c(1, 2, 3) ~ 1L,
+      R10VGACTX %in% c(4, 5)    ~ 0L,
+      TRUE ~ NA_integer_
+    )
+  ) %>%
+  dplyr::select(
+    hhidpn, year, birth_year, birth_month, age_2010,
+    Gender, Education, Marital_status, Employment, Smoking, Alcohol,
+    Race, Physical_activity
+  )
+
+# dementia (Langa-Weir 2010)
+lw_2010 <- hrs_LangaWeir %>%
+  filter(interview2010 == 1) %>%
+  mutate(hhidpn = 1000 * as.numeric(hhid) + as.numeric(pn)) %>%
+  transmute(
+    hhidpn,
+    year        = 2010L,
+    cogfunction = cogfunction2010,
+    cogtot27    = cogtot27_imp2010
+  )
+
+
+```
+
+
+
+```{r}
+# FAT 2010 file
+fat_path_10 <- "data/HRS/hd10f6b_STATA/hd10f6b.dta"
+
+fat10 <- read_dta(
+  fat_path_10,
+  col_select = c(hhidpn,
+                 mc104, mc087,                                     # pain, incontinence
+                 mc095, mc096, mc097, mc098, mc101, mc102, mc103,  # sensory (incl. hearing_aid)
+                 mg086, mb082, mg198))                              # social activity
+
+## Pain & incontinence
+fat_pain_incont_2010 <- fat10 %>%
+  transmute(
+    hhidpn = as.character(hhidpn),
+    pain_2010 = case_when(
+      mc104 == 1 ~ 1,
+      mc104 == 5 ~ 0,
+      TRUE ~ NA_real_
+    ),
+    incont_2010 = case_when(
+      mc087 == 1 ~ 1,
+      mc087 == 5 ~ 0,
+      TRUE ~ NA_real_
+    )
+  )
+
+## Sensory (FAT) — hearing_aid kept; skip-patterns handled
+sensory_2010 <- fat10 %>%
+  transmute(
+    hhidpn = as.character(hhidpn),
+    hearing_loss = case_when(
+      mc103 %in% c(1, 2, 3) ~ 0L,
+      mc103 %in% c(4, 5)    ~ 1L,
+      TRUE ~ NA_integer_
+    ),
+    hearing_aid = case_when(
+      mc102 == 1         ~ 1L,
+      mc102 == 5         ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    vision_overall = case_when(
+      mc095 %in% c(1, 2, 3) ~ 0L,
+      mc095 %in% c(4, 5, 6) ~ 1L,    # 6 = Legally Blind → impaired
+      TRUE ~ NA_integer_
+    ),
+    # FIX: legally blind (mc095==6) → impaired for far/near (skip-coded)
+    vision_far = case_when(
+      mc095 == 6            ~ 1L,
+      mc096 %in% c(1, 2, 3) ~ 0L,
+      mc096 %in% c(4, 5)    ~ 1L,
+      TRUE ~ NA_integer_
+    ),
+    vision_near = case_when(
+      mc095 == 6            ~ 1L,
+      mc097 %in% c(1, 2, 3) ~ 0L,
+      mc097 %in% c(4, 5)    ~ 1L,
+      TRUE ~ NA_integer_
+    ),
+    # FIX: skip-pattern (no diagnosis) NaN → 0
+    cataract_surgery = case_when(
+      mc098 == 1         ~ 1L,
+      mc098 == 5         ~ 0L,
+      mc098 %in% c(8, 9) ~ NA_integer_,
+      is.na(mc098)       ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    glaucoma_treatment = case_when(
+      mc101 == 1         ~ 1L,
+      mc101 == 5         ~ 0L,
+      mc101 %in% c(8, 9) ~ NA_integer_,
+      is.na(mc101)       ~ 0L,
+      TRUE ~ NA_integer_
+    )
+  )
+
+## Social activity (FAT)
+social_2010 <- fat10 %>%
+  transmute(
+    hhidpn = as.character(hhidpn),
+    volunteer = case_when(
+      mg086 == 1 ~ 1L,
+      mg086 == 5 ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    religious_freq = case_when(
+      mb082 %in% c(1, 2, 3) ~ 1L,
+      mb082 %in% c(4, 5)    ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    helping = case_when(
+      mg198 == 1 ~ 1L,
+      mg198 == 5 ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    Social_activity = case_when(
+      volunteer == 1 | religious_freq == 1 | helping == 1 ~ 1L,
+      is.na(volunteer) & is.na(religious_freq) & is.na(helping) ~ NA_integer_,
+      TRUE ~ 0L
+    )
+  ) %>%
+  dplyr::select(hhidpn, Social_activity)
+
+## Frailty Index
+fi_vars_req_2010    <- paste0("R", wave, fi_stems)
+fi_vars_actual_2010 <- nm_6[fi_vars_req_2010]
+fi_vars_actual_2010 <- fi_vars_actual_2010[!is.na(fi_vars_actual_2010)]
+
+hrs_fi_2010 <- df_6 %>%
+  transmute(
+    hhidpn = .data[[id_var_6]],
+    across(all_of(fi_vars_actual_2010))     # named vector → renames to uppercase keys
+  )
+
+prefix <- paste0("R", wave)
+
+hrs_fi_10 <- hrs_fi_2010 %>%
+  mutate(
+    # ADL/IADL/Mobility — code 7 ("don't do") treated as deficit
+    across(any_of(paste0(prefix, c(
+      "DRESS","BATH","EAT","BED","TOILT","WALKR",
+      "WALK1","WALKS","CLIM1","LIFT","CHAIR","STOOP","DIME","ARMS",
+      "PHONE","MONEY","MEALS","SHOP","MEDS"
+    ))),
+    ~ case_when(.x == 0            ~ 0,
+                .x %in% c(1, 2, 7) ~ 1,
+                TRUE ~ NA_real_)),
+
+    across(any_of(paste0(prefix, c("HIBP","DIAB","CANCR","ARTHR","LUNG","HEART"))),
+           ~ case_when(.x %in% c(0, 4) ~ 0,
+                       .x %in% c(1, 3) ~ 1,
+                       TRUE ~ NA_real_)),
+
+    across(any_of(paste0(prefix, "STROK")),
+           ~ case_when(.x %in% c(0, 4)    ~ 0,
+                       .x %in% c(1, 2, 3) ~ 1,
+                       TRUE ~ NA_real_)),
+
+    across(any_of(paste0(prefix, "SHLT")),
+           ~ case_when(.x == 1 ~ 0,
+                       .x == 2 ~ 0.25,
+                       .x == 3 ~ 0.50,
+                       .x == 4 ~ 0.75,
+                       .x == 5 ~ 1,
+                       TRUE ~ NA_real_)),
+
+    across(any_of(paste0(prefix, c("SLEEPR","DEPRES","EFFORT","FLONE","FSAD","GOING"))),
+           ~ case_when(.x == 0 ~ 0,
+                       .x == 1 ~ 1,
+                       TRUE ~ NA_real_)),
+
+    across(any_of(paste0(prefix, "ENLIFE")),
+           ~ case_when(.x == 1 ~ 0,
+                       .x == 0 ~ 1,
+                       TRUE ~ NA_real_)),
+
+    underweight_2010 = if (paste0(prefix, "BMI") %in% names(.)) {
+      case_when(.data[[paste0(prefix, "BMI")]] < 18.5  ~ 1,
+                .data[[paste0(prefix, "BMI")]] >= 18.5 ~ 0,
+                TRUE ~ NA_real_)
+    } else NA_real_
+  ) %>%
+  dplyr::select(-any_of(paste0(prefix, "BMI")))
+
+hrs_fi_10 <- hrs_fi_10 %>%
+  mutate(hhidpn = as.character(hhidpn)) %>%
+  left_join(fat_pain_incont_2010, by = "hhidpn")
+
+# ------------------------------------------------------------------
+# (a) ORIGINAL frailty index (all items)
+# ------------------------------------------------------------------
+fi_items_2010 <- setdiff(names(hrs_fi_10), c("hhidpn", paste0(prefix, "BMI")))
+
+n_items_2010 <- length(fi_items_2010)
+cutoff_2010  <- ceiling(0.80 * n_items_2010)
+
+hrs_fi_10_valid <- hrs_fi_10 %>%
+  mutate(fi_n_items = rowSums(!is.na(across(all_of(fi_items_2010))))) %>%
+  filter(fi_n_items >= cutoff_2010) %>%
+  mutate(
+    fi_n_deficits = rowSums(across(all_of(fi_items_2010)), na.rm = TRUE),
+    FI_score      = fi_n_deficits / fi_n_items
+  )
+
+hrs_fi_2010_orig <- hrs_fi_10_valid %>%
+  mutate(Frailty_status = if_else(FI_score >= 0.25, 1L, 0L)) %>%
+  dplyr::select(hhidpn, FI_score, Frailty_status)
+
+# ------------------------------------------------------------------
+# (b) MODIFIED frailty index — (I)ADL items removed (sensitivity)
+#     Same ≥0.25 threshold and ≥80% completeness rule, reapplied
+#     to the reduced item set.
+# ------------------------------------------------------------------
+iadl_vars_2010 <- paste0(prefix, iadl_stems)
+
+fi_items_2010_noIADL <- setdiff(fi_items_2010, iadl_vars_2010)
+
+n_items_2010_noIADL <- length(fi_items_2010_noIADL)
+cutoff_2010_noIADL  <- ceiling(0.80 * n_items_2010_noIADL)
+
+hrs_fi_10_valid_noIADL <- hrs_fi_10 %>%
+  mutate(fi_n_items_noIADL =
+           rowSums(!is.na(across(all_of(fi_items_2010_noIADL))))) %>%
+  filter(fi_n_items_noIADL >= cutoff_2010_noIADL) %>%
+  mutate(
+    fi_n_deficits_noIADL = rowSums(across(all_of(fi_items_2010_noIADL)),
+                                   na.rm = TRUE),
+    FI_score_noIADL      = fi_n_deficits_noIADL / fi_n_items_noIADL
+  )
+
+hrs_fi_2010_noIADL <- hrs_fi_10_valid_noIADL %>%
+  mutate(Frailty_status_noIADL = if_else(FI_score_noIADL >= 0.25, 1L, 0L)) %>%
+  dplyr::select(hhidpn, FI_score_noIADL, Frailty_status_noIADL)
+
+# ------------------------------------------------------------------
+# Combine both FI versions into a single per-person table
+# ------------------------------------------------------------------
+hrs_fi_2010_final <- hrs_fi_2010_orig %>%
+  full_join(hrs_fi_2010_noIADL, by = "hhidpn")
+
+```
+
+
+
+```{r}
+# 6. Merge 2010 data
+hrs_2010 <- hrs_cov_2010 %>%
+  mutate(hhidpn = as.character(hhidpn)) %>%
+  left_join(
+    sensory_2010,
+    by = "hhidpn"
+  ) %>%
+  left_join(
+    social_2010,
+    by = "hhidpn"
+  ) %>%
+  left_join(
+    lw_2010 %>% mutate(hhidpn = as.character(hhidpn)),
+    by = c("hhidpn", "year")
+  ) %>%
+  left_join(
+    hrs_fi_2010_final %>% mutate(hhidpn = as.character(hhidpn)),
+    by = "hhidpn"
+  ) %>%
+  left_join(
+    fat_pain_incont_2010,
+    by = "hhidpn"
+  ) %>%
+  mutate(dementia = if_else(cogfunction == 3, 1L, 0L, missing = NA_integer_))
+
+
+# 7. Imputation (consistent with ELSA approach)
+imp10 <- hrs_2010 %>%
+  mutate(hhidpn = as.character(hhidpn)) %>%
+  transmute(
+    hhidpn,
+    Gender,
+    age_2010 = as.numeric(age_2010),
+    Education = ordered(Education),
+    Race = factor(Race, levels = c(0, 1)),
+    across(c(Marital_status, Employment, Smoking, Alcohol, Physical_activity,
+             Social_activity),
+           ~ factor(.x, levels = c(0, 1)))
+  ) %>%
+  mutate(Gender = factor(Gender, levels = c(1, 2)))
+
+# Define imputation methods
+meth <- make.method(imp10)
+meth[c("hhidpn", "Gender", "Race")] <- ""
+meth["age_2010"] <- "pmm"
+meth["Education"] <- "polr"
+meth[c("Marital_status", "Employment", "Smoking", "Alcohol",
+       "Physical_activity", "Social_activity")] <- "logreg"
+
+# Predictor matrix
+pred <- make.predictorMatrix(imp10)
+pred[, "hhidpn"] <- 0
+pred["hhidpn", ] <- 0
+
+# Run MICE
+set.seed(10)
+imp_mice10 <- mice(
+  imp10,
+  m = 20,
+  maxit = 10,
+  method = meth,
+  predictorMatrix = pred,
+  printFlag = TRUE
+)
+
+# Extract completed dataset and merge back
+imp10_complete1 <- complete(imp_mice10, 1)
+
+imputed_vars <- c("Education", "Marital_status", "Employment", "Smoking", "Alcohol",
+                  "Physical_activity", "Social_activity", "age_2010")
+
+hrs10_clean <- hrs_2010 %>%
+  mutate(hhidpn = as.character(hhidpn)) %>%
+  dplyr::select(-all_of(imputed_vars)) %>%
+  left_join(
+    imp10_complete1 %>%
+      mutate(hhidpn = as.character(hhidpn)) %>%
+      dplyr::select(hhidpn, all_of(imputed_vars)),
+    by = "hhidpn"
+  )
+
+
+# 8. Compute impaired_vision (no filtering — all NAs preserved)
+HRS_2010 <- hrs10_clean %>%
+  mutate(
+    impaired_vision = pmax(
+      coalesce(cataract_surgery, 0L),
+      coalesce(glaucoma_treatment, 0L)
+    )
+  )
+
+```
+
+
+
+```{r}
+# HRS data 2012 (Wave 11)
+df_7 <- hrs_2022summary
+wave <- 11
+year <- 2012L
+
+nm_7 <- setNames(names(df_7), toupper(names(df_7)))
+
+id_var_7    <- nm_7["HHIDPN"]
+byear_var_7 <- nm_7["RABYEAR"]
+bmon_var_7  <- nm_7["RABMONTH"]
+
+if (any(is.na(c(id_var_7, byear_var_7, bmon_var_7))))
+  stop("ID or birth variables missing (2012).")
+
+cov_req_2012 <- c(
+  "RAGENDER",
+  "RAEDUC",
+  "RARACEM",
+  "RAHISPAN",
+  "R11AGEY_E",       # end-of-wave age (precise)
+  "R11MSTAT",
+  "R11WORK",
+  "R11SMOKEN",
+  "R11DRINKD",
+  "R11VGACTX"
+)
+
+cov_actual_2012 <- nm_7[toupper(cov_req_2012)]
+cov_actual_2012 <- cov_actual_2012[!is.na(cov_actual_2012)]
+
+hrs_cov_2012 <- df_7 %>%
+  transmute(
+    hhidpn      = .data[[id_var_7]],
+    year        = year,
+    birth_year  = .data[[ byear_var_7 ]],
+    birth_month = .data[[ bmon_var_7 ]],
+    across(all_of(cov_actual_2012))
+  ) %>%
+  mutate(
+    # FIX: prefer R11AGEY_E; fall back to year - birth_year
+    age_2012 = coalesce(
+      as.numeric(R11AGEY_E),
+      if_else(!is.na(birth_year), as.numeric(year - birth_year), NA_real_)
+    ),
+
+    Gender = case_when(
+      RAGENDER %in% c(1, 2) ~ as.integer(RAGENDER),
+      TRUE ~ NA_integer_
+    ),
+
+    # FIX: HS grad (3) belongs with HS tier, not college
+    Education = case_when(
+      is.na(RAEDUC)       ~ NA_integer_,
+      RAEDUC == 1         ~ 0L,
+      RAEDUC %in% c(2, 3) ~ 1L,
+      RAEDUC %in% c(4, 5) ~ 2L,
+      TRUE ~ NA_integer_
+    ),
+
+    # FIX: include partnered/spouse-absent (codes 2, 3) as married/partnered
+    Marital_status = case_when(
+      R11MSTAT %in% c(1, 2, 3)       ~ 1L,
+      R11MSTAT %in% c(4, 5, 6, 7, 8) ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+
+    Employment = case_when(
+      R11WORK == 1 ~ 1L,
+      R11WORK == 0 ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+
+    Smoking = case_when(
+      R11SMOKEN == 1 ~ 1L,
+      R11SMOKEN == 0 ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+
+    Alcohol = case_when(
+      R11DRINKD >  0 ~ 1L,
+      R11DRINKD == 0 ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+
+    # FIX: NH White still classified when RAHISPAN missing
+    Race = case_when(
+      (RAHISPAN == 0 | is.na(RAHISPAN)) & RARACEM == 1 ~ 0L,
+      RAHISPAN == 1 | RARACEM %in% c(2, 3)              ~ 1L,
+      TRUE ~ NA_integer_
+    ),
+
+    Physical_activity = case_when(
+      R11VGACTX %in% c(1, 2, 3) ~ 1L,
+      R11VGACTX %in% c(4, 5)    ~ 0L,
+      TRUE ~ NA_integer_
+    )
+  ) %>%
+  dplyr::select(
+    hhidpn, year, birth_year, birth_month, age_2012,
+    Gender, Education, Marital_status, Employment, Smoking, Alcohol,
+    Race, Physical_activity
+  )
+
+# dementia (Langa-Weir 2012)
+lw_2012 <- hrs_LangaWeir %>%
+  filter(interview2012 == 1) %>%
+  mutate(hhidpn = 1000 * as.numeric(hhid) + as.numeric(pn)) %>%
+  transmute(
+    hhidpn,
+    year        = 2012L,
+    cogfunction = cogfunction2012,
+    cogtot27    = cogtot27_imp2012
+  )
+
+
+```
+
+
+
+
+```{r}
+# FAT 2012 file
+fat_path_12 <- "data/HRS/h12f3a_STATA/h12f3a.dta"
+
+fat12 <- read_dta(
+  fat_path_12,
+  col_select = c(hhidpn,
+                 nc104, nc087,                                     # pain, incontinence
+                 nc095, nc096, nc097, nc098, nc101, nc102, nc103,  # sensory (incl. hearing_aid)
+                 ng086, nb082, ng198))                              # social activity
+
+## Pain & incontinence
+fat_pain_incont_2012 <- fat12 %>%
+  transmute(
+    hhidpn = as.character(hhidpn),
+    pain_2012 = case_when(
+      nc104 == 1 ~ 1,
+      nc104 == 5 ~ 0,
+      TRUE ~ NA_real_
+    ),
+    incont_2012 = case_when(
+      nc087 == 1 ~ 1,
+      nc087 == 5 ~ 0,
+      TRUE ~ NA_real_
+    )
+  )
+
+## Sensory (FAT) — hearing_aid kept; skip-patterns handled
+sensory_2012 <- fat12 %>%
+  transmute(
+    hhidpn = as.character(hhidpn),
+    hearing_loss = case_when(
+      nc103 %in% c(1, 2, 3) ~ 0L,
+      nc103 %in% c(4, 5)    ~ 1L,
+      TRUE ~ NA_integer_
+    ),
+    hearing_aid = case_when(
+      nc102 == 1         ~ 1L,
+      nc102 == 5         ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    vision_overall = case_when(
+      nc095 %in% c(1, 2, 3) ~ 0L,
+      nc095 %in% c(4, 5, 6) ~ 1L,    # 6 = Legally Blind → impaired
+      TRUE ~ NA_integer_
+    ),
+    # FIX: legally blind (nc095==6) → impaired for far/near (skip-coded)
+    vision_far = case_when(
+      nc095 == 6            ~ 1L,
+      nc096 %in% c(1, 2, 3) ~ 0L,
+      nc096 %in% c(4, 5)    ~ 1L,
+      TRUE ~ NA_integer_
+    ),
+    vision_near = case_when(
+      nc095 == 6            ~ 1L,
+      nc097 %in% c(1, 2, 3) ~ 0L,
+      nc097 %in% c(4, 5)    ~ 1L,
+      TRUE ~ NA_integer_
+    ),
+    # FIX: skip-pattern (no diagnosis) NaN → 0
+    cataract_surgery = case_when(
+      nc098 == 1         ~ 1L,
+      nc098 == 5         ~ 0L,
+      nc098 %in% c(8, 9) ~ NA_integer_,
+      is.na(nc098)       ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    glaucoma_treatment = case_when(
+      nc101 == 1         ~ 1L,
+      nc101 == 5         ~ 0L,
+      nc101 %in% c(8, 9) ~ NA_integer_,
+      is.na(nc101)       ~ 0L,
+      TRUE ~ NA_integer_
+    )
+  )
+
+## Social activity (FAT)
+social_2012 <- fat12 %>%
+  transmute(
+    hhidpn = as.character(hhidpn),
+    volunteer = case_when(
+      ng086 == 1 ~ 1L,
+      ng086 == 5 ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    religious_freq = case_when(
+      nb082 %in% c(1, 2, 3) ~ 1L,
+      nb082 %in% c(4, 5)    ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    helping = case_when(
+      ng198 == 1 ~ 1L,
+      ng198 == 5 ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    Social_activity = case_when(
+      volunteer == 1 | religious_freq == 1 | helping == 1 ~ 1L,
+      is.na(volunteer) & is.na(religious_freq) & is.na(helping) ~ NA_integer_,
+      TRUE ~ 0L
+    )
+  ) %>%
+  dplyr::select(hhidpn, Social_activity)
+
+## Frailty Index
+fi_vars_req_2012    <- paste0("R", wave, fi_stems)
+fi_vars_actual_2012 <- nm_7[fi_vars_req_2012]
+fi_vars_actual_2012 <- fi_vars_actual_2012[!is.na(fi_vars_actual_2012)]
+
+hrs_fi_2012 <- df_7 %>%
+  transmute(
+    hhidpn = .data[[id_var_7]],
+    across(all_of(fi_vars_actual_2012))     # named vector → renames to uppercase keys
+  )
+
+prefix <- paste0("R", wave)
+
+hrs_fi_12 <- hrs_fi_2012 %>%
+  mutate(
+    # ADL/IADL/Mobility — code 7 ("don't do") treated as deficit
+    across(any_of(paste0(prefix, c(
+      "DRESS","BATH","EAT","BED","TOILT","WALKR",
+      "WALK1","WALKS","CLIM1","LIFT","CHAIR","STOOP","DIME","ARMS",
+      "PHONE","MONEY","MEALS","SHOP","MEDS"
+    ))),
+    ~ case_when(.x == 0            ~ 0,
+                .x %in% c(1, 2, 7) ~ 1,
+                TRUE ~ NA_real_)),
+
+    across(any_of(paste0(prefix, c("HIBP","DIAB","CANCR","ARTHR","LUNG","HEART"))),
+           ~ case_when(.x %in% c(0, 4) ~ 0,
+                       .x %in% c(1, 3) ~ 1,
+                       TRUE ~ NA_real_)),
+
+    across(any_of(paste0(prefix, "STROK")),
+           ~ case_when(.x %in% c(0, 4)    ~ 0,
+                       .x %in% c(1, 2, 3) ~ 1,
+                       TRUE ~ NA_real_)),
+
+    across(any_of(paste0(prefix, "SHLT")),
+           ~ case_when(.x == 1 ~ 0,
+                       .x == 2 ~ 0.25,
+                       .x == 3 ~ 0.50,
+                       .x == 4 ~ 0.75,
+                       .x == 5 ~ 1,
+                       TRUE ~ NA_real_)),
+
+    across(any_of(paste0(prefix, c("SLEEPR","DEPRES","EFFORT","FLONE","FSAD","GOING"))),
+           ~ case_when(.x == 0 ~ 0,
+                       .x == 1 ~ 1,
+                       TRUE ~ NA_real_)),
+
+    across(any_of(paste0(prefix, "ENLIFE")),
+           ~ case_when(.x == 1 ~ 0,
+                       .x == 0 ~ 1,
+                       TRUE ~ NA_real_)),
+
+    underweight_2012 = if (paste0(prefix, "BMI") %in% names(.)) {
+      case_when(.data[[paste0(prefix, "BMI")]] < 18.5  ~ 1,
+                .data[[paste0(prefix, "BMI")]] >= 18.5 ~ 0,
+                TRUE ~ NA_real_)
+    } else NA_real_
+  ) %>%
+  dplyr::select(-any_of(paste0(prefix, "BMI")))
+
+hrs_fi_12 <- hrs_fi_12 %>%
+  mutate(hhidpn = as.character(hhidpn)) %>%
+  left_join(fat_pain_incont_2012, by = "hhidpn")
+
+# ------------------------------------------------------------------
+# (a) ORIGINAL frailty index (all items)
+# ------------------------------------------------------------------
+fi_items_2012 <- setdiff(names(hrs_fi_12), c("hhidpn", paste0(prefix, "BMI")))
+
+n_items_2012 <- length(fi_items_2012)
+cutoff_2012  <- ceiling(0.80 * n_items_2012)
+
+hrs_fi_12_valid <- hrs_fi_12 %>%
+  mutate(fi_n_items = rowSums(!is.na(across(all_of(fi_items_2012))))) %>%
+  filter(fi_n_items >= cutoff_2012) %>%
+  mutate(
+    fi_n_deficits = rowSums(across(all_of(fi_items_2012)), na.rm = TRUE),
+    FI_score      = fi_n_deficits / fi_n_items
+  )
+
+hrs_fi_2012_orig <- hrs_fi_12_valid %>%
+  mutate(Frailty_status = if_else(FI_score >= 0.25, 1L, 0L)) %>%
+  dplyr::select(hhidpn, FI_score, Frailty_status)
+
+# ------------------------------------------------------------------
+# (b) MODIFIED frailty index — (I)ADL items removed (sensitivity)
+#     Same ≥0.25 threshold and ≥80% completeness rule, reapplied
+#     to the reduced item set.
+# ------------------------------------------------------------------
+iadl_vars_2012 <- paste0(prefix, iadl_stems)
+
+fi_items_2012_noIADL <- setdiff(fi_items_2012, iadl_vars_2012)
+
+n_items_2012_noIADL <- length(fi_items_2012_noIADL)
+cutoff_2012_noIADL  <- ceiling(0.80 * n_items_2012_noIADL)
+
+hrs_fi_12_valid_noIADL <- hrs_fi_12 %>%
+  mutate(fi_n_items_noIADL =
+           rowSums(!is.na(across(all_of(fi_items_2012_noIADL))))) %>%
+  filter(fi_n_items_noIADL >= cutoff_2012_noIADL) %>%
+  mutate(
+    fi_n_deficits_noIADL = rowSums(across(all_of(fi_items_2012_noIADL)),
+                                   na.rm = TRUE),
+    FI_score_noIADL      = fi_n_deficits_noIADL / fi_n_items_noIADL
+  )
+
+hrs_fi_2012_noIADL <- hrs_fi_12_valid_noIADL %>%
+  mutate(Frailty_status_noIADL = if_else(FI_score_noIADL >= 0.25, 1L, 0L)) %>%
+  dplyr::select(hhidpn, FI_score_noIADL, Frailty_status_noIADL)
+
+# ------------------------------------------------------------------
+# Combine both FI versions into a single per-person table
+# ------------------------------------------------------------------
+hrs_fi_2012_final <- hrs_fi_2012_orig %>%
+  full_join(hrs_fi_2012_noIADL, by = "hhidpn")
+
+```
+
+
+
+```{r}
+# 6. Merge 2012 data
+hrs_2012 <- hrs_cov_2012 %>%
+  mutate(hhidpn = as.character(hhidpn)) %>%
+  left_join(
+    sensory_2012,
+    by = "hhidpn"
+  ) %>%
+  left_join(
+    social_2012,
+    by = "hhidpn"
+  ) %>%
+  left_join(
+    lw_2012 %>% mutate(hhidpn = as.character(hhidpn)),
+    by = c("hhidpn", "year")
+  ) %>%
+  left_join(
+    hrs_fi_2012_final %>% mutate(hhidpn = as.character(hhidpn)),
+    by = "hhidpn"
+  ) %>%
+  left_join(
+    fat_pain_incont_2012,
+    by = "hhidpn"
+  ) %>%
+  mutate(dementia = if_else(cogfunction == 3, 1L, 0L, missing = NA_integer_))
+
+
+# 7. Imputation (consistent with ELSA approach)
+imp12 <- hrs_2012 %>%
+  mutate(hhidpn = as.character(hhidpn)) %>%
+  transmute(
+    hhidpn,
+    Gender,
+    age_2012 = as.numeric(age_2012),
+    Education = ordered(Education),
+    Race = factor(Race, levels = c(0, 1)),
+    across(c(Marital_status, Employment, Smoking, Alcohol, Physical_activity,
+             Social_activity),
+           ~ factor(.x, levels = c(0, 1)))
+  ) %>%
+  mutate(Gender = factor(Gender, levels = c(1, 2)))
+
+# Define imputation methods
+meth <- make.method(imp12)
+meth[c("hhidpn", "Gender", "Race")] <- ""
+meth["age_2012"] <- "pmm"
+meth["Education"] <- "polr"
+meth[c("Marital_status", "Employment", "Smoking", "Alcohol",
+       "Physical_activity", "Social_activity")] <- "logreg"
+
+# Predictor matrix
+pred <- make.predictorMatrix(imp12)
+pred[, "hhidpn"] <- 0
+pred["hhidpn", ] <- 0
+
+# Run MICE
+set.seed(12)
+imp_mice12 <- mice(
+  imp12,
+  m = 20,
+  maxit = 10,
+  method = meth,
+  predictorMatrix = pred,
+  printFlag = TRUE
+)
+
+# Extract completed dataset and merge back
+imp12_complete1 <- complete(imp_mice12, 1)
+
+imputed_vars <- c("Education", "Marital_status", "Employment", "Smoking", "Alcohol",
+                  "Physical_activity", "Social_activity", "age_2012")
+
+hrs12_clean <- hrs_2012 %>%
+  mutate(hhidpn = as.character(hhidpn)) %>%
+  dplyr::select(-all_of(imputed_vars)) %>%
+  left_join(
+    imp12_complete1 %>%
+      mutate(hhidpn = as.character(hhidpn)) %>%
+      dplyr::select(hhidpn, all_of(imputed_vars)),
+    by = "hhidpn"
+  )
+
+
+# 8. Compute impaired_vision (no filtering — all NAs preserved)
+HRS_2012 <- hrs12_clean %>%
+  mutate(
+    impaired_vision = pmax(
+      coalesce(cataract_surgery, 0L),
+      coalesce(glaucoma_treatment, 0L)
+    )
+  )
+
+```
+
+
+
+
+```{r}
+# HRS data 2014 (Wave 12)
+df_8 <- hrs_2022summary
+wave <- 12
+year <- 2014L
+
+nm_8 <- setNames(names(df_8), toupper(names(df_8)))
+
+id_var_8    <- nm_8["HHIDPN"]
+byear_var_8 <- nm_8["RABYEAR"]
+bmon_var_8  <- nm_8["RABMONTH"]
+
+if (any(is.na(c(id_var_8, byear_var_8, bmon_var_8))))
+  stop("ID or birth variables missing (2014).")
+
+cov_req_2014 <- c(
+  "RAGENDER",
+  "RAEDUC",
+  "RARACEM",
+  "RAHISPAN",
+  "R12AGEY_E",       # end-of-wave age (precise)
+  "R12MSTAT",
+  "R12WORK",
+  "R12SMOKEN",
+  "R12DRINKD",
+  "R12VGACTX"
+)
+
+cov_actual_2014 <- nm_8[toupper(cov_req_2014)]
+cov_actual_2014 <- cov_actual_2014[!is.na(cov_actual_2014)]
+
+hrs_cov_2014 <- df_8 %>%
+  transmute(
+    hhidpn      = .data[[id_var_8]],
+    year        = year,
+    birth_year  = .data[[ byear_var_8 ]],
+    birth_month = .data[[ bmon_var_8 ]],
+    across(all_of(cov_actual_2014))
+  ) %>%
+  mutate(
+    # FIX: prefer R12AGEY_E; fall back to year - birth_year
+    age_2014 = coalesce(
+      as.numeric(R12AGEY_E),
+      if_else(!is.na(birth_year), as.numeric(year - birth_year), NA_real_)
+    ),
+
+    Gender = case_when(
+      RAGENDER %in% c(1, 2) ~ as.integer(RAGENDER),
+      TRUE ~ NA_integer_
+    ),
+
+    # FIX: HS grad (3) belongs with HS tier, not college
+    Education = case_when(
+      is.na(RAEDUC)       ~ NA_integer_,
+      RAEDUC == 1         ~ 0L,
+      RAEDUC %in% c(2, 3) ~ 1L,
+      RAEDUC %in% c(4, 5) ~ 2L,
+      TRUE ~ NA_integer_
+    ),
+
+    # FIX: include partnered/spouse-absent (codes 2, 3) as married/partnered
+    Marital_status = case_when(
+      R12MSTAT %in% c(1, 2, 3)       ~ 1L,
+      R12MSTAT %in% c(4, 5, 6, 7, 8) ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+
+    Employment = case_when(
+      R12WORK == 1 ~ 1L,
+      R12WORK == 0 ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+
+    Smoking = case_when(
+      R12SMOKEN == 1 ~ 1L,
+      R12SMOKEN == 0 ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+
+    Alcohol = case_when(
+      R12DRINKD >  0 ~ 1L,
+      R12DRINKD == 0 ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+
+    # FIX: NH White still classified when RAHISPAN missing
+    Race = case_when(
+      (RAHISPAN == 0 | is.na(RAHISPAN)) & RARACEM == 1 ~ 0L,
+      RAHISPAN == 1 | RARACEM %in% c(2, 3)              ~ 1L,
+      TRUE ~ NA_integer_
+    ),
+
+    Physical_activity = case_when(
+      R12VGACTX %in% c(1, 2, 3) ~ 1L,
+      R12VGACTX %in% c(4, 5)    ~ 0L,
+      TRUE ~ NA_integer_
+    )
+  ) %>%
+  dplyr::select(
+    hhidpn, year, birth_year, birth_month, age_2014,
+    Gender, Education, Marital_status, Employment, Smoking, Alcohol,
+    Race, Physical_activity
+  )
+
+# dementia (Langa-Weir 2014)
+lw_2014 <- hrs_LangaWeir %>%
+  filter(interview2014 == 1) %>%
+  mutate(hhidpn = 1000 * as.numeric(hhid) + as.numeric(pn)) %>%
+  transmute(
+    hhidpn,
+    year        = 2014L,
+    cogfunction = cogfunction2014,
+    cogtot27    = cogtot27_imp2014
+  )
+
+```
+
+
+
+
+```{r}
+# FAT 2014 file
+fat_path_14 <- "data/HRS/h14f2b_STATA/h14f2b.dta"
+
+fat14 <- read_dta(
+  fat_path_14,
+  col_select = c(hhidpn,
+                 oc104, oc087,                                     # pain, incontinence
+                 oc095, oc096, oc097, oc098, oc101, oc102, oc103,  # sensory (incl. hearing_aid)
+                 og086, ob082, og198))                              # social activity
+
+## Pain & incontinence
+fat_pain_incont_2014 <- fat14 %>%
+  transmute(
+    hhidpn = as.character(hhidpn),
+    pain_2014 = case_when(
+      oc104 == 1 ~ 1,
+      oc104 == 5 ~ 0,
+      TRUE ~ NA_real_
+    ),
+    incont_2014 = case_when(
+      oc087 == 1 ~ 1,
+      oc087 == 5 ~ 0,
+      TRUE ~ NA_real_
+    )
+  )
+
+## Sensory (FAT) — hearing_aid kept; skip-patterns handled
+sensory_2014 <- fat14 %>%
+  transmute(
+    hhidpn = as.character(hhidpn),
+    hearing_loss = case_when(
+      oc103 %in% c(1, 2, 3) ~ 0L,
+      oc103 %in% c(4, 5)    ~ 1L,
+      TRUE ~ NA_integer_
+    ),
+    hearing_aid = case_when(
+      oc102 == 1         ~ 1L,
+      oc102 == 5         ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    vision_overall = case_when(
+      oc095 %in% c(1, 2, 3) ~ 0L,
+      oc095 %in% c(4, 5, 6) ~ 1L,    # 6 = Legally Blind → impaired
+      TRUE ~ NA_integer_
+    ),
+    # FIX: legally blind (oc095==6) → impaired for far/near (skip-coded)
+    vision_far = case_when(
+      oc095 == 6            ~ 1L,
+      oc096 %in% c(1, 2, 3) ~ 0L,
+      oc096 %in% c(4, 5)    ~ 1L,
+      TRUE ~ NA_integer_
+    ),
+    vision_near = case_when(
+      oc095 == 6            ~ 1L,
+      oc097 %in% c(1, 2, 3) ~ 0L,
+      oc097 %in% c(4, 5)    ~ 1L,
+      TRUE ~ NA_integer_
+    ),
+    # FIX: skip-pattern (no diagnosis) NaN → 0
+    cataract_surgery = case_when(
+      oc098 == 1         ~ 1L,
+      oc098 == 5         ~ 0L,
+      oc098 %in% c(8, 9) ~ NA_integer_,
+      is.na(oc098)       ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    glaucoma_treatment = case_when(
+      oc101 == 1         ~ 1L,
+      oc101 == 5         ~ 0L,
+      oc101 %in% c(8, 9) ~ NA_integer_,
+      is.na(oc101)       ~ 0L,
+      TRUE ~ NA_integer_
+    )
+  )
+
+## Social activity (FAT)
+social_2014 <- fat14 %>%
+  transmute(
+    hhidpn = as.character(hhidpn),
+    volunteer = case_when(
+      og086 == 1 ~ 1L,
+      og086 == 5 ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    religious_freq = case_when(
+      ob082 %in% c(1, 2, 3) ~ 1L,
+      ob082 %in% c(4, 5)    ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    helping = case_when(
+      og198 == 1 ~ 1L,
+      og198 == 5 ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    Social_activity = case_when(
+      volunteer == 1 | religious_freq == 1 | helping == 1 ~ 1L,
+      is.na(volunteer) & is.na(religious_freq) & is.na(helping) ~ NA_integer_,
+      TRUE ~ 0L
+    )
+  ) %>%
+  dplyr::select(hhidpn, Social_activity)
+
+## Frailty Index
+fi_vars_req_2014    <- paste0("R", wave, fi_stems)
+fi_vars_actual_2014 <- nm_8[fi_vars_req_2014]
+fi_vars_actual_2014 <- fi_vars_actual_2014[!is.na(fi_vars_actual_2014)]
+
+hrs_fi_2014 <- df_8 %>%
+  transmute(
+    hhidpn = .data[[id_var_8]],
+    across(all_of(fi_vars_actual_2014))     # named vector → renames to uppercase keys
+  )
+
+prefix <- paste0("R", wave)
+
+hrs_fi_14 <- hrs_fi_2014 %>%
+  mutate(
+    # ADL/IADL/Mobility — code 7 ("don't do") treated as deficit
+    across(any_of(paste0(prefix, c(
+      "DRESS","BATH","EAT","BED","TOILT","WALKR",
+      "WALK1","WALKS","CLIM1","LIFT","CHAIR","STOOP","DIME","ARMS",
+      "PHONE","MONEY","MEALS","SHOP","MEDS"
+    ))),
+    ~ case_when(.x == 0            ~ 0,
+                .x %in% c(1, 2, 7) ~ 1,
+                TRUE ~ NA_real_)),
+
+    across(any_of(paste0(prefix, c("HIBP","DIAB","CANCR","ARTHR","LUNG","HEART"))),
+           ~ case_when(.x %in% c(0, 4) ~ 0,
+                       .x %in% c(1, 3) ~ 1,
+                       TRUE ~ NA_real_)),
+
+    across(any_of(paste0(prefix, "STROK")),
+           ~ case_when(.x %in% c(0, 4)    ~ 0,
+                       .x %in% c(1, 2, 3) ~ 1,
+                       TRUE ~ NA_real_)),
+
+    across(any_of(paste0(prefix, "SHLT")),
+           ~ case_when(.x == 1 ~ 0,
+                       .x == 2 ~ 0.25,
+                       .x == 3 ~ 0.50,
+                       .x == 4 ~ 0.75,
+                       .x == 5 ~ 1,
+                       TRUE ~ NA_real_)),
+
+    across(any_of(paste0(prefix, c("SLEEPR","DEPRES","EFFORT","FLONE","FSAD","GOING"))),
+           ~ case_when(.x == 0 ~ 0,
+                       .x == 1 ~ 1,
+                       TRUE ~ NA_real_)),
+
+    across(any_of(paste0(prefix, "ENLIFE")),
+           ~ case_when(.x == 1 ~ 0,
+                       .x == 0 ~ 1,
+                       TRUE ~ NA_real_)),
+
+    underweight_2014 = if (paste0(prefix, "BMI") %in% names(.)) {
+      case_when(.data[[paste0(prefix, "BMI")]] < 18.5  ~ 1,
+                .data[[paste0(prefix, "BMI")]] >= 18.5 ~ 0,
+                TRUE ~ NA_real_)
+    } else NA_real_
+  ) %>%
+  dplyr::select(-any_of(paste0(prefix, "BMI")))
+
+hrs_fi_14 <- hrs_fi_14 %>%
+  mutate(hhidpn = as.character(hhidpn)) %>%
+  left_join(fat_pain_incont_2014, by = "hhidpn")
+
+# ------------------------------------------------------------------
+# (a) ORIGINAL frailty index (all items)
+# ------------------------------------------------------------------
+fi_items_2014 <- setdiff(names(hrs_fi_14), c("hhidpn", paste0(prefix, "BMI")))
+
+n_items_2014 <- length(fi_items_2014)
+cutoff_2014  <- ceiling(0.80 * n_items_2014)
+
+hrs_fi_14_valid <- hrs_fi_14 %>%
+  mutate(fi_n_items = rowSums(!is.na(across(all_of(fi_items_2014))))) %>%
+  filter(fi_n_items >= cutoff_2014) %>%
+  mutate(
+    fi_n_deficits = rowSums(across(all_of(fi_items_2014)), na.rm = TRUE),
+    FI_score      = fi_n_deficits / fi_n_items
+  )
+
+hrs_fi_2014_orig <- hrs_fi_14_valid %>%
+  mutate(Frailty_status = if_else(FI_score >= 0.25, 1L, 0L)) %>%
+  dplyr::select(hhidpn, FI_score, Frailty_status)
+
+# ------------------------------------------------------------------
+# (b) MODIFIED frailty index — (I)ADL items removed (sensitivity)
+#     Same ≥0.25 threshold and ≥80% completeness rule, reapplied
+#     to the reduced item set.
+# ------------------------------------------------------------------
+iadl_vars_2014 <- paste0(prefix, iadl_stems)
+
+fi_items_2014_noIADL <- setdiff(fi_items_2014, iadl_vars_2014)
+
+n_items_2014_noIADL <- length(fi_items_2014_noIADL)
+cutoff_2014_noIADL  <- ceiling(0.80 * n_items_2014_noIADL)
+
+hrs_fi_14_valid_noIADL <- hrs_fi_14 %>%
+  mutate(fi_n_items_noIADL =
+           rowSums(!is.na(across(all_of(fi_items_2014_noIADL))))) %>%
+  filter(fi_n_items_noIADL >= cutoff_2014_noIADL) %>%
+  mutate(
+    fi_n_deficits_noIADL = rowSums(across(all_of(fi_items_2014_noIADL)),
+                                   na.rm = TRUE),
+    FI_score_noIADL      = fi_n_deficits_noIADL / fi_n_items_noIADL
+  )
+
+hrs_fi_2014_noIADL <- hrs_fi_14_valid_noIADL %>%
+  mutate(Frailty_status_noIADL = if_else(FI_score_noIADL >= 0.25, 1L, 0L)) %>%
+  dplyr::select(hhidpn, FI_score_noIADL, Frailty_status_noIADL)
+
+# ------------------------------------------------------------------
+# Combine both FI versions into a single per-person table
+# ------------------------------------------------------------------
+hrs_fi_2014_final <- hrs_fi_2014_orig %>%
+  full_join(hrs_fi_2014_noIADL, by = "hhidpn")
+
+```
+
+
+
+```{r}
+# 6. Merge 2014 data
+hrs_2014 <- hrs_cov_2014 %>%
+  mutate(hhidpn = as.character(hhidpn)) %>%
+  left_join(
+    sensory_2014,
+    by = "hhidpn"
+  ) %>%
+  left_join(
+    social_2014,
+    by = "hhidpn"
+  ) %>%
+  left_join(
+    lw_2014 %>% mutate(hhidpn = as.character(hhidpn)),
+    by = c("hhidpn", "year")
+  ) %>%
+  left_join(
+    hrs_fi_2014_final %>% mutate(hhidpn = as.character(hhidpn)),
+    by = "hhidpn"
+  ) %>%
+  left_join(
+    fat_pain_incont_2014,
+    by = "hhidpn"
+  ) %>%
+  mutate(dementia = if_else(cogfunction == 3, 1L, 0L, missing = NA_integer_))
+
+
+# 7. Imputation (consistent with ELSA approach)
+imp14 <- hrs_2014 %>%
+  mutate(hhidpn = as.character(hhidpn)) %>%
+  transmute(
+    hhidpn,
+    Gender,
+    age_2014 = as.numeric(age_2014),
+    Education = ordered(Education),
+    Race = factor(Race, levels = c(0, 1)),
+    across(c(Marital_status, Employment, Smoking, Alcohol, Physical_activity,
+             Social_activity),
+           ~ factor(.x, levels = c(0, 1)))
+  ) %>%
+  mutate(Gender = factor(Gender, levels = c(1, 2)))
+
+# Define imputation methods
+meth <- make.method(imp14)
+meth[c("hhidpn", "Gender", "Race")] <- ""
+meth["age_2014"] <- "pmm"
+meth["Education"] <- "polr"
+meth[c("Marital_status", "Employment", "Smoking", "Alcohol",
+       "Physical_activity", "Social_activity")] <- "logreg"
+
+# Predictor matrix
+pred <- make.predictorMatrix(imp14)
+pred[, "hhidpn"] <- 0
+pred["hhidpn", ] <- 0
+
+# Run MICE
+set.seed(14)
+imp_mice14 <- mice(
+  imp14,
+  m = 20,
+  maxit = 10,
+  method = meth,
+  predictorMatrix = pred,
+  printFlag = TRUE
+)
+
+# Extract completed dataset and merge back
+imp14_complete1 <- complete(imp_mice14, 1)
+
+imputed_vars <- c("Education", "Marital_status", "Employment", "Smoking", "Alcohol",
+                  "Physical_activity", "Social_activity", "age_2014")
+
+hrs14_clean <- hrs_2014 %>%
+  mutate(hhidpn = as.character(hhidpn)) %>%
+  dplyr::select(-all_of(imputed_vars)) %>%
+  left_join(
+    imp14_complete1 %>%
+      mutate(hhidpn = as.character(hhidpn)) %>%
+      dplyr::select(hhidpn, all_of(imputed_vars)),
+    by = "hhidpn"
+  )
+
+
+# 8. Compute impaired_vision (no filtering — all NAs preserved)
+HRS_2014 <- hrs14_clean %>%
+  mutate(
+    impaired_vision = pmax(
+      coalesce(cataract_surgery, 0L),
+      coalesce(glaucoma_treatment, 0L)
+    )
+  )
+    
+```
+
+
+
+
+```{r}
+# HRS data 2016 (Wave 13)
+df_9 <- hrs_2022summary
+wave <- 13
+year <- 2016L
+
+nm_9 <- setNames(names(df_9), toupper(names(df_9)))
+
+id_var_9    <- nm_9["HHIDPN"]
+byear_var_9 <- nm_9["RABYEAR"]
+bmon_var_9  <- nm_9["RABMONTH"]
+
+if (any(is.na(c(id_var_9, byear_var_9, bmon_var_9))))
+  stop("ID or birth variables missing (2016).")
+
+cov_req_2016 <- c(
+  "RAGENDER",
+  "RAEDUC",
+  "RARACEM",
+  "RAHISPAN",
+  "R13AGEY_E",       # end-of-wave age (precise)
+  "R13MSTAT",
+  "R13WORK",
+  "R13SMOKEN",
+  "R13DRINKD",
+  "R13VGACTX"
+)
+
+cov_actual_2016 <- nm_9[toupper(cov_req_2016)]
+cov_actual_2016 <- cov_actual_2016[!is.na(cov_actual_2016)]
+
+hrs_cov_2016 <- df_9 %>%
+  transmute(
+    hhidpn      = .data[[id_var_9]],
+    year        = year,
+    birth_year  = .data[[ byear_var_9 ]],
+    birth_month = .data[[ bmon_var_9 ]],
+    across(all_of(cov_actual_2016))
+  ) %>%
+  mutate(
+    # FIX: prefer R13AGEY_E; fall back to year - birth_year
+    age_2016 = coalesce(
+      as.numeric(R13AGEY_E),
+      if_else(!is.na(birth_year), as.numeric(year - birth_year), NA_real_)
+    ),
+
+    Gender = case_when(
+      RAGENDER %in% c(1, 2) ~ as.integer(RAGENDER),
+      TRUE ~ NA_integer_
+    ),
+
+    # FIX: HS grad (3) belongs with HS tier, not college
+    Education = case_when(
+      is.na(RAEDUC)       ~ NA_integer_,
+      RAEDUC == 1         ~ 0L,
+      RAEDUC %in% c(2, 3) ~ 1L,
+      RAEDUC %in% c(4, 5) ~ 2L,
+      TRUE ~ NA_integer_
+    ),
+
+    # FIX: include partnered/spouse-absent (codes 2, 3) as married/partnered
+    Marital_status = case_when(
+      R13MSTAT %in% c(1, 2, 3)       ~ 1L,
+      R13MSTAT %in% c(4, 5, 6, 7, 8) ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+
+    Employment = case_when(
+      R13WORK == 1 ~ 1L,
+      R13WORK == 0 ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+
+    Smoking = case_when(
+      R13SMOKEN == 1 ~ 1L,
+      R13SMOKEN == 0 ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+
+    Alcohol = case_when(
+      R13DRINKD >  0 ~ 1L,
+      R13DRINKD == 0 ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+
+    # FIX: NH White still classified when RAHISPAN missing
+    Race = case_when(
+      (RAHISPAN == 0 | is.na(RAHISPAN)) & RARACEM == 1 ~ 0L,
+      RAHISPAN == 1 | RARACEM %in% c(2, 3)              ~ 1L,
+      TRUE ~ NA_integer_
+    ),
+
+    Physical_activity = case_when(
+      R13VGACTX %in% c(1, 2, 3) ~ 1L,
+      R13VGACTX %in% c(4, 5)    ~ 0L,
+      TRUE ~ NA_integer_
+    )
+  ) %>%
+  dplyr::select(
+    hhidpn, year, birth_year, birth_month, age_2016,
+    Gender, Education, Marital_status, Employment, Smoking, Alcohol,
+    Race, Physical_activity
+  )
+
+# dementia (Langa-Weir 2016)
+lw_2016 <- hrs_LangaWeir %>%
+  filter(interview2016 == 1) %>%
+  mutate(hhidpn = 1000 * as.numeric(hhid) + as.numeric(pn)) %>%
+  transmute(
+    hhidpn,
+    year        = 2016L,
+    cogfunction = cogfunction2016,
+    cogtot27    = cogtot27_imp2016
+  )
+
+```
+
+
+
+```{r}
+# FAT 2016 file
+fat_path_16 <- "data/HRS/h16f2c_STATA/h16f2c.dta"
+
+fat16 <- read_dta(
+  fat_path_16,
+  col_select = c(hhidpn,
+                 pc104, pc087,                                     # pain, incontinence
+                 pc095, pc096, pc097, pc098, pc101, pc102, pc103,  # sensory (incl. hearing_aid)
+                 pg086, pb082, pg198))                              # social activity
+
+## Pain & incontinence
+fat_pain_incont_2016 <- fat16 %>%
+  transmute(
+    hhidpn = as.character(hhidpn),
+    pain_2016 = case_when(
+      pc104 == 1 ~ 1,
+      pc104 == 5 ~ 0,
+      TRUE ~ NA_real_
+    ),
+    incont_2016 = case_when(
+      pc087 == 1 ~ 1,
+      pc087 == 5 ~ 0,
+      TRUE ~ NA_real_
+    )
+  )
+
+## Sensory (FAT) — hearing_aid kept; skip-patterns handled
+sensory_2016 <- fat16 %>%
+  transmute(
+    hhidpn = as.character(hhidpn),
+    hearing_loss = case_when(
+      pc103 %in% c(1, 2, 3) ~ 0L,
+      pc103 %in% c(4, 5)    ~ 1L,
+      TRUE ~ NA_integer_
+    ),
+    hearing_aid = case_when(
+      pc102 == 1         ~ 1L,
+      pc102 == 5         ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    vision_overall = case_when(
+      pc095 %in% c(1, 2, 3) ~ 0L,
+      pc095 %in% c(4, 5, 6) ~ 1L,    # 6 = Legally Blind → impaired
+      TRUE ~ NA_integer_
+    ),
+    # FIX: legally blind (pc095==6) → impaired for far/near (skip-coded)
+    vision_far = case_when(
+      pc095 == 6            ~ 1L,
+      pc096 %in% c(1, 2, 3) ~ 0L,
+      pc096 %in% c(4, 5)    ~ 1L,
+      TRUE ~ NA_integer_
+    ),
+    vision_near = case_when(
+      pc095 == 6            ~ 1L,
+      pc097 %in% c(1, 2, 3) ~ 0L,
+      pc097 %in% c(4, 5)    ~ 1L,
+      TRUE ~ NA_integer_
+    ),
+    # FIX: skip-pattern (no diagnosis) NaN → 0
+    cataract_surgery = case_when(
+      pc098 == 1         ~ 1L,
+      pc098 == 5         ~ 0L,
+      pc098 %in% c(8, 9) ~ NA_integer_,
+      is.na(pc098)       ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    glaucoma_treatment = case_when(
+      pc101 == 1         ~ 1L,
+      pc101 == 5         ~ 0L,
+      pc101 %in% c(8, 9) ~ NA_integer_,
+      is.na(pc101)       ~ 0L,
+      TRUE ~ NA_integer_
+    )
+  )
+
+## Social activity (FAT)
+social_2016 <- fat16 %>%
+  transmute(
+    hhidpn = as.character(hhidpn),
+    volunteer = case_when(
+      pg086 == 1 ~ 1L,
+      pg086 == 5 ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    religious_freq = case_when(
+      pb082 %in% c(1, 2, 3) ~ 1L,
+      pb082 %in% c(4, 5)    ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    helping = case_when(
+      pg198 == 1 ~ 1L,
+      pg198 == 5 ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    Social_activity = case_when(
+      volunteer == 1 | religious_freq == 1 | helping == 1 ~ 1L,
+      is.na(volunteer) & is.na(religious_freq) & is.na(helping) ~ NA_integer_,
+      TRUE ~ 0L
+    )
+  ) %>%
+  dplyr::select(hhidpn, Social_activity)
+
+## Frailty Index
+fi_vars_req_2016    <- paste0("R", wave, fi_stems)
+fi_vars_actual_2016 <- nm_9[fi_vars_req_2016]
+fi_vars_actual_2016 <- fi_vars_actual_2016[!is.na(fi_vars_actual_2016)]
+
+hrs_fi_2016 <- df_9 %>%
+  transmute(
+    hhidpn = .data[[id_var_9]],
+    across(all_of(fi_vars_actual_2016))     # named vector → renames to uppercase keys
+  )
+
+prefix <- paste0("R", wave)
+
+hrs_fi_16 <- hrs_fi_2016 %>%
+  mutate(
+    # ADL/IADL/Mobility — code 7 ("don't do") treated as deficit
+    across(any_of(paste0(prefix, c(
+      "DRESS","BATH","EAT","BED","TOILT","WALKR",
+      "WALK1","WALKS","CLIM1","LIFT","CHAIR","STOOP","DIME","ARMS",
+      "PHONE","MONEY","MEALS","SHOP","MEDS"
+    ))),
+    ~ case_when(.x == 0            ~ 0,
+                .x %in% c(1, 2, 7) ~ 1,
+                TRUE ~ NA_real_)),
+
+    across(any_of(paste0(prefix, c("HIBP","DIAB","CANCR","ARTHR","LUNG","HEART"))),
+           ~ case_when(.x %in% c(0, 4) ~ 0,
+                       .x %in% c(1, 3) ~ 1,
+                       TRUE ~ NA_real_)),
+
+    across(any_of(paste0(prefix, "STROK")),
+           ~ case_when(.x %in% c(0, 4)    ~ 0,
+                       .x %in% c(1, 2, 3) ~ 1,
+                       TRUE ~ NA_real_)),
+
+    across(any_of(paste0(prefix, "SHLT")),
+           ~ case_when(.x == 1 ~ 0,
+                       .x == 2 ~ 0.25,
+                       .x == 3 ~ 0.50,
+                       .x == 4 ~ 0.75,
+                       .x == 5 ~ 1,
+                       TRUE ~ NA_real_)),
+
+    across(any_of(paste0(prefix, c("SLEEPR","DEPRES","EFFORT","FLONE","FSAD","GOING"))),
+           ~ case_when(.x == 0 ~ 0,
+                       .x == 1 ~ 1,
+                       TRUE ~ NA_real_)),
+
+    across(any_of(paste0(prefix, "ENLIFE")),
+           ~ case_when(.x == 1 ~ 0,
+                       .x == 0 ~ 1,
+                       TRUE ~ NA_real_)),
+
+    underweight_2016 = if (paste0(prefix, "BMI") %in% names(.)) {
+      case_when(.data[[paste0(prefix, "BMI")]] < 18.5  ~ 1,
+                .data[[paste0(prefix, "BMI")]] >= 18.5 ~ 0,
+                TRUE ~ NA_real_)
+    } else NA_real_
+  ) %>%
+  dplyr::select(-any_of(paste0(prefix, "BMI")))
+
+hrs_fi_16 <- hrs_fi_16 %>%
+  mutate(hhidpn = as.character(hhidpn)) %>%
+  left_join(fat_pain_incont_2016, by = "hhidpn")
+
+# ------------------------------------------------------------------
+# (a) ORIGINAL frailty index (all items)
+# ------------------------------------------------------------------
+fi_items_2016 <- setdiff(names(hrs_fi_16), c("hhidpn", paste0(prefix, "BMI")))
+
+n_items_2016 <- length(fi_items_2016)
+cutoff_2016  <- ceiling(0.80 * n_items_2016)
+
+hrs_fi_16_valid <- hrs_fi_16 %>%
+  mutate(fi_n_items = rowSums(!is.na(across(all_of(fi_items_2016))))) %>%
+  filter(fi_n_items >= cutoff_2016) %>%
+  mutate(
+    fi_n_deficits = rowSums(across(all_of(fi_items_2016)), na.rm = TRUE),
+    FI_score      = fi_n_deficits / fi_n_items
+  )
+
+hrs_fi_2016_orig <- hrs_fi_16_valid %>%
+  mutate(Frailty_status = if_else(FI_score >= 0.25, 1L, 0L)) %>%
+  dplyr::select(hhidpn, FI_score, Frailty_status)
+
+# ------------------------------------------------------------------
+# (b) MODIFIED frailty index — (I)ADL items removed (sensitivity)
+#     Same ≥0.25 threshold and ≥80% completeness rule, reapplied
+#     to the reduced item set.
+# ------------------------------------------------------------------
+iadl_vars_2016 <- paste0(prefix, iadl_stems)
+
+fi_items_2016_noIADL <- setdiff(fi_items_2016, iadl_vars_2016)
+
+n_items_2016_noIADL <- length(fi_items_2016_noIADL)
+cutoff_2016_noIADL  <- ceiling(0.80 * n_items_2016_noIADL)
+
+hrs_fi_16_valid_noIADL <- hrs_fi_16 %>%
+  mutate(fi_n_items_noIADL =
+           rowSums(!is.na(across(all_of(fi_items_2016_noIADL))))) %>%
+  filter(fi_n_items_noIADL >= cutoff_2016_noIADL) %>%
+  mutate(
+    fi_n_deficits_noIADL = rowSums(across(all_of(fi_items_2016_noIADL)),
+                                   na.rm = TRUE),
+    FI_score_noIADL      = fi_n_deficits_noIADL / fi_n_items_noIADL
+  )
+
+hrs_fi_2016_noIADL <- hrs_fi_16_valid_noIADL %>%
+  mutate(Frailty_status_noIADL = if_else(FI_score_noIADL >= 0.25, 1L, 0L)) %>%
+  dplyr::select(hhidpn, FI_score_noIADL, Frailty_status_noIADL)
+
+# ------------------------------------------------------------------
+# Combine both FI versions into a single per-person table
+# ------------------------------------------------------------------
+hrs_fi_2016_final <- hrs_fi_2016_orig %>%
+  full_join(hrs_fi_2016_noIADL, by = "hhidpn")
+
+```
+
+
+
+
+```{r}
+# 6. Merge 2016 data
+hrs_2016 <- hrs_cov_2016 %>%
+  mutate(hhidpn = as.character(hhidpn)) %>%
+  left_join(
+    sensory_2016,
+    by = "hhidpn"
+  ) %>%
+  left_join(
+    social_2016,
+    by = "hhidpn"
+  ) %>%
+  left_join(
+    lw_2016 %>% mutate(hhidpn = as.character(hhidpn)),
+    by = c("hhidpn", "year")
+  ) %>%
+  left_join(
+    hrs_fi_2016_final %>% mutate(hhidpn = as.character(hhidpn)),
+    by = "hhidpn"
+  ) %>%
+  left_join(
+    fat_pain_incont_2016,
+    by = "hhidpn"
+  ) %>%
+  mutate(dementia = if_else(cogfunction == 3, 1L, 0L, missing = NA_integer_))
+
+
+# 7. Imputation (consistent with ELSA approach)
+imp16 <- hrs_2016 %>%
+  mutate(hhidpn = as.character(hhidpn)) %>%
+  transmute(
+    hhidpn,
+    Gender,
+    age_2016 = as.numeric(age_2016),
+    Education = ordered(Education),
+    Race = factor(Race, levels = c(0, 1)),
+    across(c(Marital_status, Employment, Smoking, Alcohol, Physical_activity,
+             Social_activity),
+           ~ factor(.x, levels = c(0, 1)))
+  ) %>%
+  mutate(Gender = factor(Gender, levels = c(1, 2)))
+
+# Define imputation methods
+meth <- make.method(imp16)
+meth[c("hhidpn", "Gender", "Race")] <- ""
+meth["age_2016"] <- "pmm"
+meth["Education"] <- "polr"
+meth[c("Marital_status", "Employment", "Smoking", "Alcohol",
+       "Physical_activity", "Social_activity")] <- "logreg"
+
+# Predictor matrix
+pred <- make.predictorMatrix(imp16)
+pred[, "hhidpn"] <- 0
+pred["hhidpn", ] <- 0
+
+# Run MICE
+set.seed(16)
+imp_mice16 <- mice(
+  imp16,
+  m = 20,
+  maxit = 10,
+  method = meth,
+  predictorMatrix = pred,
+  printFlag = TRUE
+)
+
+# Extract completed dataset and merge back
+imp16_complete1 <- complete(imp_mice16, 1)
+
+imputed_vars <- c("Education", "Marital_status", "Employment", "Smoking", "Alcohol",
+                  "Physical_activity", "Social_activity", "age_2016")
+
+hrs16_clean <- hrs_2016 %>%
+  mutate(hhidpn = as.character(hhidpn)) %>%
+  dplyr::select(-all_of(imputed_vars)) %>%
+  left_join(
+    imp16_complete1 %>%
+      mutate(hhidpn = as.character(hhidpn)) %>%
+      dplyr::select(hhidpn, all_of(imputed_vars)),
+    by = "hhidpn"
+  )
+
+
+# 8. Compute impaired_vision (no filtering — all NAs preserved)
+HRS_2016 <- hrs16_clean %>%
+  mutate(
+    impaired_vision = pmax(
+      coalesce(cataract_surgery, 0L),
+      coalesce(glaucoma_treatment, 0L)
+    )
+  )
+    
+```
+
+
+
+```{r}
+# HRS data 2018 (Wave 14)
+df_10 <- hrs_2022summary
+wave <- 14
+year <- 2018L
+
+nm_10 <- setNames(names(df_10), toupper(names(df_10)))
+
+id_var_10    <- nm_10["HHIDPN"]
+byear_var_10 <- nm_10["RABYEAR"]
+bmon_var_10  <- nm_10["RABMONTH"]
+
+if (any(is.na(c(id_var_10, byear_var_10, bmon_var_10))))
+  stop("ID or birth variables missing (2018).")
+
+cov_req_2018 <- c(
+  "RAGENDER",
+  "RAEDUC",
+  "RARACEM",
+  "RAHISPAN",
+  "R14AGEY_E",       # end-of-wave age (precise)
+  "R14MSTAT",
+  "R14WORK",
+  "R14SMOKEN",
+  "R14DRINKD",
+  "R14VGACTX"
+)
+
+cov_actual_2018 <- nm_10[toupper(cov_req_2018)]
+cov_actual_2018 <- cov_actual_2018[!is.na(cov_actual_2018)]
+
+hrs_cov_2018 <- df_10 %>%
+  transmute(
+    hhidpn      = .data[[id_var_10]],
+    year        = year,
+    birth_year  = .data[[ byear_var_10 ]],
+    birth_month = .data[[ bmon_var_10 ]],
+    across(all_of(cov_actual_2018))
+  ) %>%
+  mutate(
+    age_2018 = coalesce(
+      as.numeric(R14AGEY_E),
+      if_else(!is.na(birth_year), as.numeric(year - birth_year), NA_real_)
+    ),
+
+    Gender = case_when(
+      RAGENDER %in% c(1, 2) ~ as.integer(RAGENDER),
+      TRUE ~ NA_integer_
+    ),
+
+    Education = case_when(
+      is.na(RAEDUC)       ~ NA_integer_,
+      RAEDUC == 1         ~ 0L,
+      RAEDUC %in% c(2, 3) ~ 1L,
+      RAEDUC %in% c(4, 5) ~ 2L,
+      TRUE ~ NA_integer_
+    ),
+
+    Marital_status = case_when(
+      R14MSTAT %in% c(1, 2, 3)       ~ 1L,
+      R14MSTAT %in% c(4, 5, 6, 7, 8) ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+
+    Employment = case_when(
+      R14WORK == 1 ~ 1L,
+      R14WORK == 0 ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+
+    Smoking = case_when(
+      R14SMOKEN == 1 ~ 1L,
+      R14SMOKEN == 0 ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+
+    Alcohol = case_when(
+      R14DRINKD >  0 ~ 1L,
+      R14DRINKD == 0 ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+
+    Race = case_when(
+      (RAHISPAN == 0 | is.na(RAHISPAN)) & RARACEM == 1 ~ 0L,
+      RAHISPAN == 1 | RARACEM %in% c(2, 3)              ~ 1L,
+      TRUE ~ NA_integer_
+    ),
+
+    Physical_activity = case_when(
+      R14VGACTX %in% c(1, 2, 3) ~ 1L,
+      R14VGACTX %in% c(4, 5)    ~ 0L,
+      TRUE ~ NA_integer_
+    )
+  ) %>%
+  dplyr::select(
+    hhidpn, year, birth_year, birth_month, age_2018,
+    Gender, Education, Marital_status, Employment, Smoking, Alcohol,
+    Race, Physical_activity
+  )
+
+# dementia (Langa-Weir 2018)
+lw_2018 <- hrs_LangaWeir %>%
+  filter(interview2018 == 1) %>%
+  mutate(hhidpn = 1000 * as.numeric(hhid) + as.numeric(pn)) %>%
+  transmute(
+    hhidpn,
+    year        = 2018L,
+    cogfunction = cogfunction2018,
+    cogtot27    = cogtot27_imp2018
+  )
+
+```
+
+
+
+```{r}
+# FAT 2018 file
+fat_path_18 <- "data/HRS/h18f2c_STATA/h18f2c.dta"
+
+fat18 <- read_dta(
+  fat_path_18,
+  col_select = c(hhidpn,
+                 qc104, qc087,                                     # pain, incontinence
+                 qc095, qc096, qc097, qc098, qc101, qc102, qc103,  # sensory (includes hearing_aid)
+                 qg086, qb082, qg198))                              # social activity
+
+## Pain & incontinence
+fat_pain_incont_2018 <- fat18 %>%
+  transmute(
+    hhidpn = as.character(hhidpn),
+    pain_2018 = case_when(
+      qc104 == 1 ~ 1,
+      qc104 == 5 ~ 0,
+      qc104 > 5  ~ NA_real_,
+      TRUE ~ NA_real_
+    ),
+    incont_2018 = case_when(
+      qc087 == 1 ~ 1,
+      qc087 == 5 ~ 0,
+      qc087 > 5  ~ NA_real_,
+      TRUE ~ NA_real_
+    )
+  )
+
+## Sensory (FAT)
+sensory_2018 <- fat18 %>%
+  transmute(
+    hhidpn = as.character(hhidpn),
+    hearing_loss = case_when(
+      qc103 %in% c(1, 2, 3) ~ 0L,
+      qc103 %in% c(4, 5)    ~ 1L,
+      qc103 %in% c(8, 9)    ~ NA_integer_,
+      TRUE ~ NA_integer_
+    ),
+    hearing_aid = case_when(
+      qc102 == 1         ~ 1L,
+      qc102 == 5         ~ 0L,
+      qc102 %in% c(8, 9) ~ NA_integer_,
+      TRUE ~ NA_integer_
+    ),
+    vision_overall = case_when(
+      qc095 %in% c(1, 2, 3) ~ 0L,
+      qc095 %in% c(4, 5, 6) ~ 1L,
+      qc095 %in% c(8, 9)    ~ NA_integer_,
+      TRUE ~ NA_integer_
+    ),
+    vision_far = case_when(
+      qc095 == 6            ~ 1L,      # legally blind → impaired
+      qc096 %in% c(1, 2, 3) ~ 0L,
+      qc096 %in% c(4, 5)    ~ 1L,
+      qc096 %in% c(8, 9)    ~ NA_integer_,
+      TRUE ~ NA_integer_
+    ),
+    vision_near = case_when(
+      qc095 == 6            ~ 1L,      # legally blind → impaired
+      qc097 %in% c(1, 2, 3) ~ 0L,
+      qc097 %in% c(4, 5)    ~ 1L,
+      qc097 %in% c(8, 9)    ~ NA_integer_,
+      TRUE ~ NA_integer_
+    ),
+    cataract_surgery = case_when(
+      qc098 == 1         ~ 1L,
+      qc098 == 5         ~ 0L,
+      qc098 %in% c(8, 9) ~ NA_integer_,
+      is.na(qc098)       ~ 0L,         # skip-pattern: not diagnosed → no surgery
+      TRUE ~ NA_integer_
+    ),
+    glaucoma_treatment = case_when(
+      qc101 == 1         ~ 1L,
+      qc101 == 5         ~ 0L,
+      qc101 %in% c(8, 9) ~ NA_integer_,
+      is.na(qc101)       ~ 0L,         # skip-pattern: not diagnosed → no treatment
+      TRUE ~ NA_integer_
+    )
+  )
+
+## Social activity (FAT)
+social_2018 <- fat18 %>%
+  transmute(
+    hhidpn = as.character(hhidpn),
+
+    volunteer = case_when(
+      qg086 == 1 ~ 1L,
+      qg086 == 5 ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    religious_freq = case_when(
+      qb082 %in% c(1, 2, 3) ~ 1L,
+      qb082 %in% c(4, 5)    ~ 0L,
+      qb082 %in% c(8, 9)    ~ NA_integer_,
+      TRUE ~ NA_integer_
+    ),
+    helping = case_when(
+      qg198 == 1 ~ 1L,
+      qg198 == 5 ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+
+    Social_activity = case_when(
+      volunteer == 1 | religious_freq == 1 | helping == 1 ~ 1L,
+      is.na(volunteer) & is.na(religious_freq) & is.na(helping) ~ NA_integer_,
+      TRUE ~ 0L
+    )
+  ) %>%
+  dplyr::select(hhidpn, Social_activity)
+
+## Frailty Index
+fi_vars_req_2018    <- paste0("R", wave, fi_stems)
+fi_vars_actual_2018 <- nm_10[fi_vars_req_2018]
+fi_vars_actual_2018 <- fi_vars_actual_2018[!is.na(fi_vars_actual_2018)]
+
+hrs_fi_2018 <- df_10 %>%
+  transmute(
+    hhidpn = .data[[id_var_10]],
+    across(all_of(fi_vars_actual_2018))     # named vector → renames to uppercase keys
+  )
+
+prefix <- paste0("R", wave)
+
+hrs_fi_18 <- hrs_fi_2018 %>%
+  mutate(
+    # ADL/IADL/Mobility — code 7 ("don't do") treated as deficit
+    across(any_of(paste0(prefix, c(
+      "DRESS","BATH","EAT","BED","TOILT","WALKR",
+      "WALK1","WALKS","CLIM1","LIFT","CHAIR","STOOP","DIME","ARMS",
+      "PHONE","MONEY","MEALS","SHOP","MEDS"
+    ))),
+    ~ case_when(.x == 0            ~ 0,
+                .x %in% c(1, 2, 7) ~ 1,
+                TRUE ~ NA_real_)),
+
+    across(any_of(paste0(prefix, c("HIBP","DIAB","CANCR","ARTHR","LUNG","HEART"))),
+           ~ case_when(.x %in% c(0, 4) ~ 0,
+                       .x %in% c(1, 3) ~ 1,
+                       TRUE ~ NA_real_)),
+
+    across(any_of(paste0(prefix, "STROK")),
+           ~ case_when(.x %in% c(0, 4)    ~ 0,
+                       .x %in% c(1, 2, 3) ~ 1,
+                       TRUE ~ NA_real_)),
+
+    across(any_of(paste0(prefix, "SHLT")),
+           ~ case_when(.x == 1 ~ 0,
+                       .x == 2 ~ 0.25,
+                       .x == 3 ~ 0.50,
+                       .x == 4 ~ 0.75,
+                       .x == 5 ~ 1,
+                       TRUE ~ NA_real_)),
+
+    across(any_of(paste0(prefix, c("SLEEPR","DEPRES","EFFORT","FLONE","FSAD","GOING"))),
+           ~ case_when(.x == 0 ~ 0,
+                       .x == 1 ~ 1,
+                       TRUE ~ NA_real_)),
+
+    across(any_of(paste0(prefix, "ENLIFE")),
+           ~ case_when(.x == 1 ~ 0,
+                       .x == 0 ~ 1,
+                       TRUE ~ NA_real_)),
+
+    underweight_2018 = if (paste0(prefix, "BMI") %in% names(.)) {
+      case_when(.data[[paste0(prefix, "BMI")]] < 18.5  ~ 1,
+                .data[[paste0(prefix, "BMI")]] >= 18.5 ~ 0,
+                TRUE ~ NA_real_)
+    } else NA_real_
+  ) %>%
+  dplyr::select(-any_of(paste0(prefix, "BMI")))
+
+hrs_fi_18 <- hrs_fi_18 %>%
+  mutate(hhidpn = as.character(hhidpn)) %>%
+  left_join(fat_pain_incont_2018, by = "hhidpn")
+
+# ------------------------------------------------------------------
+# (a) ORIGINAL frailty index (all items)
+# ------------------------------------------------------------------
+fi_items_2018 <- setdiff(names(hrs_fi_18), c("hhidpn", paste0(prefix, "BMI")))
+
+n_items_2018 <- length(fi_items_2018)
+cutoff_2018  <- ceiling(0.80 * n_items_2018)
+
+hrs_fi_18_valid <- hrs_fi_18 %>%
+  mutate(fi_n_items = rowSums(!is.na(across(all_of(fi_items_2018))))) %>%
+  filter(fi_n_items >= cutoff_2018) %>%
+  mutate(
+    fi_n_deficits = rowSums(across(all_of(fi_items_2018)), na.rm = TRUE),
+    FI_score      = fi_n_deficits / fi_n_items
+  )
+
+hrs_fi_2018_orig <- hrs_fi_18_valid %>%
+  mutate(Frailty_status = if_else(FI_score >= 0.25, 1L, 0L)) %>%
+  dplyr::select(hhidpn, FI_score, Frailty_status)
+
+# ------------------------------------------------------------------
+# (b) MODIFIED frailty index — (I)ADL items removed (sensitivity)
+#     Same ≥0.25 threshold and ≥80% completeness rule, reapplied
+#     to the reduced item set.
+# ------------------------------------------------------------------
+iadl_vars_2018 <- paste0(prefix, iadl_stems)
+
+fi_items_2018_noIADL <- setdiff(fi_items_2018, iadl_vars_2018)
+
+n_items_2018_noIADL <- length(fi_items_2018_noIADL)
+cutoff_2018_noIADL  <- ceiling(0.80 * n_items_2018_noIADL)
+
+hrs_fi_18_valid_noIADL <- hrs_fi_18 %>%
+  mutate(fi_n_items_noIADL =
+           rowSums(!is.na(across(all_of(fi_items_2018_noIADL))))) %>%
+  filter(fi_n_items_noIADL >= cutoff_2018_noIADL) %>%
+  mutate(
+    fi_n_deficits_noIADL = rowSums(across(all_of(fi_items_2018_noIADL)),
+                                   na.rm = TRUE),
+    FI_score_noIADL      = fi_n_deficits_noIADL / fi_n_items_noIADL
+  )
+
+hrs_fi_2018_noIADL <- hrs_fi_18_valid_noIADL %>%
+  mutate(Frailty_status_noIADL = if_else(FI_score_noIADL >= 0.25, 1L, 0L)) %>%
+  dplyr::select(hhidpn, FI_score_noIADL, Frailty_status_noIADL)
+
+# ------------------------------------------------------------------
+# Combine both FI versions into a single per-person table
+# ------------------------------------------------------------------
+hrs_fi_2018_final <- hrs_fi_2018_orig %>%
+  full_join(hrs_fi_2018_noIADL, by = "hhidpn")
+
+
+```
+
+
+
+
+```{r}
+# 6. Merge 2018 data
+hrs_2018 <- hrs_cov_2018 %>%
+  mutate(hhidpn = as.character(hhidpn)) %>%
+  left_join(
+    sensory_2018,
+    by = "hhidpn"
+  ) %>%
+  left_join(
+    social_2018,
+    by = "hhidpn"
+  ) %>%
+  left_join(
+    lw_2018 %>% mutate(hhidpn = as.character(hhidpn)),
+    by = c("hhidpn", "year")
+  ) %>%
+  left_join(
+    hrs_fi_2018_final %>% mutate(hhidpn = as.character(hhidpn)),
+    by = "hhidpn"
+  ) %>%
+  left_join(
+    fat_pain_incont_2018,
+    by = "hhidpn"
+  ) %>%
+  mutate(dementia = if_else(cogfunction == 3, 1L, 0L, missing = NA_integer_))
+
+
+# 7. Imputation (consistent with ELSA approach)
+imp18 <- hrs_2018 %>%
+  mutate(hhidpn = as.character(hhidpn)) %>%
+  transmute(
+    hhidpn,
+    Gender,
+    age_2018 = as.numeric(age_2018),
+    Education = ordered(Education),
+    Race = factor(Race, levels = c(0, 1)),
+    across(c(Marital_status, Employment, Smoking, Alcohol, Physical_activity,
+             Social_activity),
+           ~ factor(.x, levels = c(0, 1)))
+  ) %>%
+  mutate(Gender = factor(Gender, levels = c(1, 2)))
+
+# Define imputation methods
+meth <- make.method(imp18)
+meth[c("hhidpn", "Gender", "Race")] <- ""
+meth["age_2018"] <- "pmm"
+meth["Education"] <- "polr"
+meth[c("Marital_status", "Employment", "Smoking", "Alcohol",
+       "Physical_activity", "Social_activity")] <- "logreg"
+
+# Predictor matrix
+pred <- make.predictorMatrix(imp18)
+pred[, "hhidpn"] <- 0
+pred["hhidpn", ] <- 0
+
+# Run MICE
+set.seed(18)
+imp_mice18 <- mice(
+  imp18,
+  m = 20,
+  maxit = 10,
+  method = meth,
+  predictorMatrix = pred,
+  printFlag = TRUE
+)
+
+# Extract completed dataset and merge back
+imp18_complete1 <- complete(imp_mice18, 1)
+
+imputed_vars <- c("Education", "Marital_status", "Employment", "Smoking", "Alcohol",
+                  "Physical_activity", "Social_activity", "age_2018")
+
+hrs18_clean <- hrs_2018 %>%
+  mutate(hhidpn = as.character(hhidpn)) %>%
+  dplyr::select(-all_of(imputed_vars)) %>%
+  left_join(
+    imp18_complete1 %>%
+      mutate(hhidpn = as.character(hhidpn)) %>%
+      dplyr::select(hhidpn, all_of(imputed_vars)),
+    by = "hhidpn"
+  )
+
+
+# 8. Compute impaired_vision (no filtering — all NAs preserved)
+HRS_2018 <- hrs18_clean %>%
+  mutate(
+    impaired_vision = pmax(
+      coalesce(cataract_surgery, 0L),
+      coalesce(glaucoma_treatment, 0L)
+    )
+  )
+    
+```
+
+
+
+```{r}
+# HRS data 2020 (Wave 15)
+df_11 <- hrs_2022summary
+wave <- 15
+year <- 2020L
+
+nm_11 <- setNames(names(df_11), toupper(names(df_11)))
+
+id_var_11    <- nm_11["HHIDPN"]
+byear_var_11 <- nm_11["RABYEAR"]
+bmon_var_11  <- nm_11["RABMONTH"]
+
+if (any(is.na(c(id_var_11, byear_var_11, bmon_var_11))))
+  stop("ID or birth variables missing (2020).")
+
+cov_req_2020 <- c(
+  "RAGENDER",
+  "RAEDUC",
+  "RARACEM",
+  "RAHISPAN",
+  "R15AGEY_E",       # end-of-wave age (precise)
+  "R15MSTAT",
+  "R15WORK",
+  "R15SMOKEN",
+  "R15DRINKD",
+  "R15VGACTX"
+)
+
+cov_actual_2020 <- nm_11[toupper(cov_req_2020)]
+cov_actual_2020 <- cov_actual_2020[!is.na(cov_actual_2020)]
+
+hrs_cov_2020 <- df_11 %>%
+  transmute(
+    hhidpn      = .data[[id_var_11]],
+    year        = year,
+    birth_year  = .data[[byear_var_11]],
+    birth_month = .data[[bmon_var_11]],
+    across(all_of(cov_actual_2020))
+  ) %>%
+  mutate(
+    # FIX: prefer R15AGEY_E; fall back to year - birth_year
+    age_2020 = coalesce(
+      as.numeric(R15AGEY_E),
+      if_else(!is.na(birth_year), as.numeric(year - birth_year), NA_real_)
+    ),
+
+    Gender = case_when(
+      RAGENDER %in% c(1, 2) ~ as.integer(RAGENDER),
+      TRUE ~ NA_integer_
+    ),
+
+    # FIX: HS grad (3) belongs with HS tier, not college
+    Education = case_when(
+      is.na(RAEDUC)       ~ NA_integer_,
+      RAEDUC == 1         ~ 0L,
+      RAEDUC %in% c(2, 3) ~ 1L,
+      RAEDUC %in% c(4, 5) ~ 2L,
+      TRUE ~ NA_integer_
+    ),
+
+    # FIX: include partnered/spouse-absent (codes 2, 3) as married/partnered
+    Marital_status = case_when(
+      R15MSTAT %in% c(1, 2, 3)       ~ 1L,
+      R15MSTAT %in% c(4, 5, 6, 7, 8) ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+
+    Employment = case_when(
+      R15WORK == 1 ~ 1L,
+      R15WORK == 0 ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+
+    Smoking = case_when(
+      R15SMOKEN == 1 ~ 1L,
+      R15SMOKEN == 0 ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+
+    Alcohol = case_when(
+      R15DRINKD >  0 ~ 1L,
+      R15DRINKD == 0 ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+
+    # FIX: NH White still classified when RAHISPAN missing
+    Race = case_when(
+      (RAHISPAN == 0 | is.na(RAHISPAN)) & RARACEM == 1 ~ 0L,
+      RAHISPAN == 1 | RARACEM %in% c(2, 3)              ~ 1L,
+      TRUE ~ NA_integer_
+    ),
+
+    Physical_activity = case_when(
+      R15VGACTX %in% c(1, 2, 3) ~ 1L,
+      R15VGACTX %in% c(4, 5)    ~ 0L,
+      TRUE ~ NA_integer_
+    )
+  ) %>%
+  dplyr::select(
+    hhidpn, year, birth_year, birth_month, age_2020,
+    Gender, Education, Marital_status, Employment, Smoking, Alcohol,
+    Race, Physical_activity
+  )
+
+# dementia (Langa-Weir 2020)
+lw_2020 <- hrs_LangaWeir %>%
+  filter(interview2020 == 1) %>%
+  mutate(hhidpn = 1000 * as.numeric(hhid) + as.numeric(pn)) %>%
+  transmute(
+    hhidpn,
+    year        = 2020L,
+    cogfunction = cogfunction2020,
+    cogtot27    = cogtot27_imp2020
+  )
+
+```
+
+
+
+```{r}
+# FAT 2020 file
+fat_path_20 <- "data/HRS/h20f1b_STATA/h20f1b.dta"
+
+fat20 <- read_dta(
+  fat_path_20,
+  col_select = c(hhidpn,
+                 rc104, rc087,                                     # pain, incontinence
+                 rc095, rc096, rc097, rc098, rc101, rc102, rc103,  # sensory (incl. hearing_aid)
+                 rg086, rb082, rg198))                              # social activity
+
+## Pain & incontinence
+fat_pain_incont_2020 <- fat20 %>%
+  transmute(
+    hhidpn = as.character(hhidpn),
+    pain_2020 = case_when(
+      rc104 == 1 ~ 1,
+      rc104 == 5 ~ 0,
+      TRUE ~ NA_real_
+    ),
+    incont_2020 = case_when(
+      rc087 == 1 ~ 1,
+      rc087 == 5 ~ 0,
+      TRUE ~ NA_real_
+    )
+  )
+
+## Sensory (FAT) — hearing_aid kept; skip-patterns handled
+sensory_2020 <- fat20 %>%
+  transmute(
+    hhidpn = as.character(hhidpn),
+    hearing_loss = case_when(
+      rc103 %in% c(1, 2, 3) ~ 0L,
+      rc103 %in% c(4, 5)    ~ 1L,
+      TRUE ~ NA_integer_
+    ),
+    hearing_aid = case_when(
+      rc102 == 1         ~ 1L,
+      rc102 == 5         ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    vision_overall = case_when(
+      rc095 %in% c(1, 2, 3) ~ 0L,
+      rc095 %in% c(4, 5, 6) ~ 1L,    # 6 = Legally Blind → impaired
+      TRUE ~ NA_integer_
+    ),
+    # FIX: legally blind (rc095==6) → impaired for far/near (skip-coded)
+    vision_far = case_when(
+      rc095 == 6            ~ 1L,
+      rc096 %in% c(1, 2, 3) ~ 0L,
+      rc096 %in% c(4, 5)    ~ 1L,
+      TRUE ~ NA_integer_
+    ),
+    vision_near = case_when(
+      rc095 == 6            ~ 1L,
+      rc097 %in% c(1, 2, 3) ~ 0L,
+      rc097 %in% c(4, 5)    ~ 1L,
+      TRUE ~ NA_integer_
+    ),
+    # FIX: skip-pattern (no diagnosis) NaN → 0
+    cataract_surgery = case_when(
+      rc098 == 1         ~ 1L,
+      rc098 == 5         ~ 0L,
+      rc098 %in% c(8, 9) ~ NA_integer_,
+      is.na(rc098)       ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    glaucoma_treatment = case_when(
+      rc101 == 1         ~ 1L,
+      rc101 == 5         ~ 0L,
+      rc101 %in% c(8, 9) ~ NA_integer_,
+      is.na(rc101)       ~ 0L,
+      TRUE ~ NA_integer_
+    )
+  )
+
+## Social activity (FAT)
+social_2020 <- fat20 %>%
+  transmute(
+    hhidpn = as.character(hhidpn),
+    volunteer = case_when(
+      rg086 == 1 ~ 1L,
+      rg086 == 5 ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    religious_freq = case_when(
+      rb082 %in% c(1, 2, 3) ~ 1L,
+      rb082 %in% c(4, 5)    ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    helping = case_when(
+      rg198 == 1 ~ 1L,
+      rg198 == 5 ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    Social_activity = case_when(
+      volunteer == 1 | religious_freq == 1 | helping == 1 ~ 1L,
+      is.na(volunteer) & is.na(religious_freq) & is.na(helping) ~ NA_integer_,
+      TRUE ~ 0L
+    )
+  ) %>%
+  dplyr::select(hhidpn, Social_activity)
+
+## Frailty Index
+fi_vars_req_2020    <- paste0("R", wave, fi_stems)
+fi_vars_actual_2020 <- nm_11[fi_vars_req_2020]
+fi_vars_actual_2020 <- fi_vars_actual_2020[!is.na(fi_vars_actual_2020)]
+
+hrs_fi_2020 <- df_11 %>%
+  transmute(
+    hhidpn = .data[[id_var_11]],
+    across(all_of(fi_vars_actual_2020))     # named vector → renames to uppercase keys
+  )
+
+prefix <- paste0("R", wave)
+
+hrs_fi_20 <- hrs_fi_2020 %>%
+  mutate(
+    # ADL/IADL/Mobility — code 7 ("don't do") treated as deficit
+    across(any_of(paste0(prefix, c(
+      "DRESS","BATH","EAT","BED","TOILT","WALKR",
+      "WALK1","WALKS","CLIM1","LIFT","CHAIR","STOOP","DIME","ARMS",
+      "PHONE","MONEY","MEALS","SHOP","MEDS"
+    ))),
+    ~ case_when(.x == 0            ~ 0,
+                .x %in% c(1, 2, 7) ~ 1,
+                TRUE ~ NA_real_)),
+
+    across(any_of(paste0(prefix, c("HIBP","DIAB","CANCR","ARTHR","LUNG","HEART"))),
+           ~ case_when(.x %in% c(0, 4) ~ 0,
+                       .x %in% c(1, 3) ~ 1,
+                       TRUE ~ NA_real_)),
+
+    across(any_of(paste0(prefix, "STROK")),
+           ~ case_when(.x %in% c(0, 4)    ~ 0,
+                       .x %in% c(1, 2, 3) ~ 1,
+                       TRUE ~ NA_real_)),
+
+    across(any_of(paste0(prefix, "SHLT")),
+           ~ case_when(.x == 1 ~ 0,
+                       .x == 2 ~ 0.25,
+                       .x == 3 ~ 0.50,
+                       .x == 4 ~ 0.75,
+                       .x == 5 ~ 1,
+                       TRUE ~ NA_real_)),
+
+    across(any_of(paste0(prefix, c("SLEEPR","DEPRES","EFFORT","FLONE","FSAD","GOING"))),
+           ~ case_when(.x == 0 ~ 0,
+                       .x == 1 ~ 1,
+                       TRUE ~ NA_real_)),
+
+    across(any_of(paste0(prefix, "ENLIFE")),
+           ~ case_when(.x == 1 ~ 0,
+                       .x == 0 ~ 1,
+                       TRUE ~ NA_real_)),
+
+    underweight_2020 = if (paste0(prefix, "BMI") %in% names(.)) {
+      case_when(.data[[paste0(prefix, "BMI")]] < 18.5  ~ 1,
+                .data[[paste0(prefix, "BMI")]] >= 18.5 ~ 0,
+                TRUE ~ NA_real_)
+    } else NA_real_
+  ) %>%
+  dplyr::select(-any_of(paste0(prefix, "BMI")))
+
+hrs_fi_20 <- hrs_fi_20 %>%
+  mutate(hhidpn = as.character(hhidpn)) %>%
+  left_join(fat_pain_incont_2020, by = "hhidpn")
+
+# ------------------------------------------------------------------
+# (a) ORIGINAL frailty index (all items)
+# ------------------------------------------------------------------
+fi_items_2020 <- setdiff(names(hrs_fi_20), c("hhidpn", paste0(prefix, "BMI")))
+
+n_items_2020 <- length(fi_items_2020)
+cutoff_2020  <- ceiling(0.80 * n_items_2020)
+
+hrs_fi_20_valid <- hrs_fi_20 %>%
+  mutate(fi_n_items = rowSums(!is.na(across(all_of(fi_items_2020))))) %>%
+  filter(fi_n_items >= cutoff_2020) %>%
+  mutate(
+    fi_n_deficits = rowSums(across(all_of(fi_items_2020)), na.rm = TRUE),
+    FI_score      = fi_n_deficits / fi_n_items
+  )
+
+hrs_fi_2020_orig <- hrs_fi_20_valid %>%
+  mutate(Frailty_status = if_else(FI_score >= 0.25, 1L, 0L)) %>%
+  dplyr::select(hhidpn, FI_score, Frailty_status)
+
+# ------------------------------------------------------------------
+# (b) MODIFIED frailty index — (I)ADL items removed (sensitivity)
+#     Same ≥0.25 threshold and ≥80% completeness rule, reapplied
+#     to the reduced item set.
+# ------------------------------------------------------------------
+iadl_vars_2020 <- paste0(prefix, iadl_stems)
+
+fi_items_2020_noIADL <- setdiff(fi_items_2020, iadl_vars_2020)
+
+n_items_2020_noIADL <- length(fi_items_2020_noIADL)
+cutoff_2020_noIADL  <- ceiling(0.80 * n_items_2020_noIADL)
+
+hrs_fi_20_valid_noIADL <- hrs_fi_20 %>%
+  mutate(fi_n_items_noIADL =
+           rowSums(!is.na(across(all_of(fi_items_2020_noIADL))))) %>%
+  filter(fi_n_items_noIADL >= cutoff_2020_noIADL) %>%
+  mutate(
+    fi_n_deficits_noIADL = rowSums(across(all_of(fi_items_2020_noIADL)),
+                                   na.rm = TRUE),
+    FI_score_noIADL      = fi_n_deficits_noIADL / fi_n_items_noIADL
+  )
+
+hrs_fi_2020_noIADL <- hrs_fi_20_valid_noIADL %>%
+  mutate(Frailty_status_noIADL = if_else(FI_score_noIADL >= 0.25, 1L, 0L)) %>%
+  dplyr::select(hhidpn, FI_score_noIADL, Frailty_status_noIADL)
+
+# ------------------------------------------------------------------
+# Combine both FI versions into a single per-person table
+# ------------------------------------------------------------------
+hrs_fi_2020_final <- hrs_fi_2020_orig %>%
+  full_join(hrs_fi_2020_noIADL, by = "hhidpn")
+
+```
+
+
+
+
+```{r}
+# 6. Merge 2020 data
+hrs_2020 <- hrs_cov_2020 %>%
+  mutate(hhidpn = as.character(hhidpn)) %>%
+  left_join(
+    sensory_2020,
+    by = "hhidpn"
+  ) %>%
+  left_join(
+    social_2020,
+    by = "hhidpn"
+  ) %>%
+  left_join(
+    lw_2020 %>% mutate(hhidpn = as.character(hhidpn)),
+    by = c("hhidpn", "year")
+  ) %>%
+  left_join(
+    hrs_fi_2020_final %>% mutate(hhidpn = as.character(hhidpn)),
+    by = "hhidpn"
+  ) %>%
+  left_join(
+    fat_pain_incont_2020,
+    by = "hhidpn"
+  ) %>%
+  mutate(dementia = if_else(cogfunction == 3, 1L, 0L, missing = NA_integer_))
+
+
+# 7. Imputation (consistent with ELSA approach)
+imp20 <- hrs_2020 %>%
+  mutate(hhidpn = as.character(hhidpn)) %>%
+  transmute(
+    hhidpn,
+    Gender,
+    age_2020 = as.numeric(age_2020),
+    Education = ordered(Education),
+    Race = factor(Race, levels = c(0, 1)),
+    across(c(Marital_status, Employment, Smoking, Alcohol, Physical_activity,
+             Social_activity),
+           ~ factor(.x, levels = c(0, 1)))
+  ) %>%
+  mutate(Gender = factor(Gender, levels = c(1, 2)))
+
+# Define imputation methods
+meth <- make.method(imp20)
+meth[c("hhidpn", "Gender", "Race")] <- ""
+meth["age_2020"] <- "pmm"
+meth["Education"] <- "polr"
+meth[c("Marital_status", "Employment", "Smoking", "Alcohol",
+       "Physical_activity", "Social_activity")] <- "logreg"
+
+# Predictor matrix
+pred <- make.predictorMatrix(imp20)
+pred[, "hhidpn"] <- 0
+pred["hhidpn", ] <- 0
+
+# Run MICE
+set.seed(20)
+imp_mice20 <- mice(
+  imp20,
+  m = 20,
+  maxit = 10,
+  method = meth,
+  predictorMatrix = pred,
+  printFlag = TRUE
+)
+
+# Extract completed dataset and merge back
+imp20_complete1 <- complete(imp_mice20, 1)
+
+imputed_vars <- c("Education", "Marital_status", "Employment", "Smoking", "Alcohol",
+                  "Physical_activity", "Social_activity", "age_2020")
+
+hrs20_clean <- hrs_2020 %>%
+  mutate(hhidpn = as.character(hhidpn)) %>%
+  dplyr::select(-all_of(imputed_vars)) %>%
+  left_join(
+    imp20_complete1 %>%
+      mutate(hhidpn = as.character(hhidpn)) %>%
+      dplyr::select(hhidpn, all_of(imputed_vars)),
+    by = "hhidpn"
+  )
+
+
+# 8. Compute impaired_vision (no filtering — all NAs preserved)
+HRS_2020 <- hrs20_clean %>%
+  mutate(
+    impaired_vision = pmax(
+      coalesce(cataract_surgery, 0L),
+      coalesce(glaucoma_treatment, 0L)
+    )
+  )
+    
+```
+
+
+
+```{r}
+library(purrr)
+
+# Put all wave datasets into a list
+dat_list <- list(
+  hrs2004 = HRS_2004,
+  hrs2006 = HRS_2006,
+  hrs2008 = HRS_2008,
+  hrs2010 = HRS_2010,
+  hrs2012 = HRS_2012,
+  hrs2014 = HRS_2014,
+  hrs2016 = HRS_2016,
+  hrs2018 = HRS_2018,
+  hrs2020 = HRS_2020
+)
+
+hrs_long <- bind_rows(dat_list, .id = "source") %>%
+  mutate(
+    hhidpn = as.character(hhidpn),
+    year   = as.integer(year)
+  )
+
+hrs_long <- hrs_long %>%
+  mutate(
+    age = coalesce(age_2004, age_2006, age_2008, age_2010,
+                   age_2012, age_2014, age_2016, age_2018, age_2020)
+  ) %>%
+  dplyr::select(-matches("^age_\\d{4}$"))
+
+write.csv(hrs_long,
+          file = "hrs_long.csv",
+          row.names = FALSE)
+
+```
+
+
+
+```{r}
+
+```
+
+
+
+```{r}
+
+```
+
+
+
