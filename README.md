@@ -1,6 +1,6 @@
 <div align="center">
 
-# Sensory impairment, frailty, and incident dementia
+# Temporal sequencing of sensory impairments and frailty reveals vulnerability-dependent dementia risk
 
 ### A two-cohort multi-state analysis in HRS (United States) and ELSA (England)
 
