@@ -1,18 +1,25 @@
 ---
-title: "HRS — cohort construction & harmonised person-wave dataset"
+title: "R Notebook"
 output: html_notebook
 ---
 
-<!--
-  Analysis code for the manuscript on sensory impairment, frailty, and incident
-  dementia in the HRS (United States) and ELSA (England) cohorts.
+```{r setup-libraries, message=FALSE, warning=FALSE}
+# FIX E: load every package this notebook uses. Previously the only library()
+# call was purrr, at the very end -- so a clean session failed immediately.
+library(haven)      # read_dta
+library(readr)      # read_csv / write_csv
+library(dplyr)      # transmute, mutate, joins, case_when, ...
+library(tidyr)
+library(stringr)
+library(purrr)
+library(mice)       # make.method, make.predictorMatrix, mice, complete
+library(lattice)    # densityplot / stripplot in the MICE diagnostics
 
-  DATA NOT INCLUDED. HRS and ELSA are restricted-access and cannot be
-  redistributed. Obtain the source data from the data providers and place them
-  under data/ (git-ignored) so the relative paths in this notebook resolve.
-  See README.md for setup and run order.
--->
-
+# Shared output location -- MUST match `data_dir` in HRS_analysis.Rmd so the
+# analysis notebook reads exactly what this notebook writes.
+data_dir <- "data"
+dir.create(data_dir, recursive = TRUE, showWarnings = FALSE)
+```
 
 ```{r}
 #hrs summary data 
@@ -27,27 +34,62 @@ hrs_LangaWeir <- read_dta(hrs_LangaWeir)
 hrs_Track <- "data/HRS/trk2022v1/trk2022tr_r.csv"
 hrs_Track <- read_csv(hrs_Track)
 
+# ---- Determine death events from the HRS Tracker ------------------------
+# A person is a death event (died == 1) iff a death YEAR can be established
+# from any tracker source. Sources, in priority order:
+#   1. KNOWNDECEASED* : confirmed deceased (highest quality)
+#   2. EXDEATH*       : death reported at/around an exit interview
+#   3. N* (NYEAR/NMONTH): National Death Index linkage
+#
+# FIX (death-date integrity): the previous code coalesced year and month
+# INDEPENDENTLY, so a year from one source could be paired with a month from a
+# different source. Here year and month are taken TOGETHER from the first
+# (highest-priority) source that supplies a year, keeping each date consistent.
 death_track <- hrs_Track %>%
   transmute(
     # ID
     hhidpn = 1000 * as.numeric(HHID) + as.numeric(PN),
 
-    # Best death date (priority: known > exit > ndi)
-    death_year = coalesce(KNOWNDECEASEDYR, EXDEATHYR, NYEAR),
-    death_month = coalesce(KNOWNDECEASEDMO, EXDEATHMO, NMONTH),
+    # source-specific year/month, kept as pairs
+    ky = KNOWNDECEASEDYR, km = KNOWNDECEASEDMO,   # confirmed deceased
+    ey = EXDEATHYR,       em = EXDEATHMO,          # exit interview
+    ny = NYEAR,           nm = NMONTH,             # NDI linkage
 
     # Last observed alive
-    lastalive_year = LASTALIVEYR,
+    lastalive_year  = LASTALIVEYR,
     lastalive_month = LASTALIVEMO
   ) %>%
   mutate(
+    # take YEAR and MONTH from the SAME highest-priority available source
+    death_year = case_when(
+      !is.na(ky) ~ as.numeric(ky),
+      !is.na(ey) ~ as.numeric(ey),
+      !is.na(ny) ~ as.numeric(ny),
+      TRUE       ~ NA_real_
+    ),
+    death_month = case_when(
+      !is.na(ky) ~ as.numeric(km),
+      !is.na(ey) ~ as.numeric(em),
+      !is.na(ny) ~ as.numeric(nm),
+      TRUE       ~ NA_real_
+    ),
+
     died = if_else(!is.na(death_year), 1L, 0L),
 
-    # fill missing months for stability
+    # fill missing month with mid-year ONLY when a death year exists
     death_month = if_else(is.na(death_month) & !is.na(death_year), 6, death_month),
     lastalive_month = if_else(is.na(lastalive_month) & !is.na(lastalive_year),
                               6, lastalive_month)
-  )
+  ) %>%
+  dplyr::select(hhidpn, death_year, death_month,
+                lastalive_year, lastalive_month, died)
+
+# Quick look at how many death events were established
+cat("Death events determined from tracker:\n")
+cat("  individuals in tracker :", nrow(death_track), "\n")
+cat("  died == 1              :", sum(death_track$died == 1, na.rm = TRUE), "\n")
+cat("  death-year range       :",
+    paste(range(death_track$death_year, na.rm = TRUE), collapse = "-"), "\n")
 
 ```
 
@@ -445,9 +487,16 @@ hrs_2004 <- hrs_cov_2004 %>%
   ) %>%
   mutate(dementia = if_else(cogfunction == 3, 1L, 0L, missing = NA_integer_))
 
-
 # 7. Imputation (consistent with ELSA approach)
 # ---- 1. Prepare dataset for imputation -----------------------------
+# FIX (specification): FI_score, Frailty_status and dementia were carried here
+# as "auxiliary predictors" with method "" while remaining in the predictor
+# matrix. mice never fills the missing cells of a non-imputed variable, so
+# their NAs were entering the design matrix of every imputation model. They are
+# removed rather than imputed: the Methods state that the primary study
+# variables were not imputed, and waves 2006-2020 (and ELSA) never included
+# them, so dropping them also makes 2004 consistent with every other wave.
+# FI_score and Frailty_status were additionally collinear by construction.
 imp04 <- hrs_2004 %>%
   mutate(hhidpn = as.character(hhidpn)) %>%
   transmute(
@@ -458,37 +507,45 @@ imp04 <- hrs_2004 %>%
     Race      = factor(Race, levels = c(0, 1)),
     across(c(Marital_status, Employment, Smoking, Alcohol,
              Physical_activity, Social_activity),
-           ~ factor(.x, levels = c(0, 1))),
-    # auxiliary predictors -- inform imputation but are not imputed
-    FI_score,
-    Frailty_status = factor(Frailty_status, levels = c(0, 1)),
-    dementia       = factor(dementia,       levels = c(0, 1))
+           ~ factor(.x, levels = c(0, 1)))
   )
 
 # ---- 2. Quantify missingness (for methods text) --------------------
 miss_pct <- sapply(imp04, function(x) mean(is.na(x)) * 100)
-miss_cov <- miss_pct[miss_pct > 0 &
-                     !names(miss_pct) %in% c("FI_score",
-                                             "Frailty_status",
-                                             "dementia")]
+miss_cov <- miss_pct[miss_pct > 0]
 cat("Percentage missing per variable:\n"); print(round(miss_pct, 2))
-cat(sprintf("\nMean missing across covariates: %.2f%%\n", mean(miss_cov)))
-cat(sprintf("Maximum missing: %.2f%% (%s)\n",
-            max(miss_cov), names(which.max(miss_cov))))
+if (length(miss_cov) > 0) {
+  cat(sprintf("\nMean missing across covariates: %.2f%%\n", mean(miss_cov)))
+  cat(sprintf("Maximum missing: %.2f%% (%s)\n",
+              max(miss_cov), names(which.max(miss_cov))))
+} else {
+  cat("\nNo missing values among covariates.\n")
+}
 
 # ---- 3. Imputation method per variable -----------------------------
+# FIX (specification): Gender and Race are now imputed INSIDE the fully
+# conditional specification so that no predictor carries NAs into the design
+# matrix. They are NOT carried back into the analysis data -- vars_imputed
+# below excludes them -- so hrs_2004 retains its original Gender and Race,
+# including missing values (this preserves the missing-race count in Table 1).
 meth <- make.method(imp04)
-meth[c("hhidpn", "Gender", "Race",
-       "FI_score", "Frailty_status", "dementia")] <- ""   # not imputed
+meth["hhidpn"]    <- ""              # ID: never imputed
 meth["age_2004"]  <- "pmm"
 meth["Education"] <- "polr"
-meth[c("Marital_status", "Employment", "Smoking", "Alcohol",
+meth[c("Gender", "Race", "Marital_status", "Employment", "Smoking", "Alcohol",
        "Physical_activity", "Social_activity")] <- "logreg"
+# Variables with no missing values are not imputed (mice requirement).
+meth[colSums(is.na(imp04)) == 0] <- ""
 
 # ---- 4. Predictor matrix: all other covariates as predictors -------
 pred <- make.predictorMatrix(imp04)
 pred[, "hhidpn"] <- 0   # ID is never a predictor
 pred["hhidpn", ] <- 0   # ID is never imputed
+
+# GUARD: an incomplete variable must never be used as a predictor unless it is
+# itself imputed, or mice feeds NAs into every imputation model.
+incomplete04 <- names(imp04)[colSums(is.na(imp04)) > 0]
+stopifnot(all(meth[incomplete04] != ""))
 
 # ---- 5. Run MICE: 20 imputed datasets, 10 iterations ---------------
 set.seed(3)
@@ -500,6 +557,13 @@ imp_mice04 <- mice(
   predictorMatrix = pred,
   printFlag       = TRUE
 )
+
+# Any logged event means mice silently altered the specification (e.g. dropped
+# a collinear predictor) -- inspect rather than assume the spec above was used.
+if (!is.null(imp_mice04$loggedEvents)) {
+  cat("\nMICE logged events (HRS 2004):\n")
+  print(imp_mice04$loggedEvents)
+}
 
 # ---- 6. Convergence diagnostics ----
 plot(imp_mice04)   # trace plot is safe — only includes imputed vars
@@ -546,23 +610,25 @@ vars_imputed <- c("age_2004", "Education", "Marital_status", "Employment",
 diag_tables  <- lapply(vars_imputed, compare_summaries, mids_obj = imp_mice04)
 print(diag_tables)
 
-# ---- 8. Long-format completed data, preserving all 20 imputations --
-imp_long <- complete(imp_mice04, action = "long", include = FALSE) %>%
-  mutate(hhidpn = as.character(hhidpn))
+# ---- 8. Extract ONE completed dataset (consistent with 2006-2020 waves) ----
+# FIX: previously this pulled complete(imp_mice04, action = "long") and kept
+# .imp/.id all the way into HRS_2004, giving every 2004 person 20 rows while
+# every other wave has 1. mice() above still runs m = 20 so the convergence
+# and density/strip-plot diagnostics above stay valid -- we just now take a
+# single completed dataset (imputation #1), matching 2006-2020 exactly.
+imp04_complete1 <- complete(imp_mice04, 1)
 
-# Carry .imp and .id through the join so each of the 20 imputations
-# remains separable for pooling at the analysis stage.
-hrs04_clean <- imp_long %>%
-  dplyr::select(.imp, .id, hhidpn, all_of(vars_imputed)) %>%
+hrs04_clean <- hrs_2004 %>%
+  mutate(hhidpn = as.character(hhidpn)) %>%
+  dplyr::select(-all_of(vars_imputed)) %>%
   left_join(
-    hrs_2004 %>%
+    imp04_complete1 %>%
       mutate(hhidpn = as.character(hhidpn)) %>%
-      dplyr::select(-any_of(vars_imputed)),
+      dplyr::select(hhidpn, all_of(vars_imputed)),
     by = "hhidpn"
   )
 
-
-# 8. Compute impaired_vision (no filtering — all NAs preserved)
+# 9. Compute impaired_vision (no filtering — all NAs preserved)
 HRS_2004 <- hrs04_clean %>%
   mutate(
     impaired_vision = pmax(
@@ -964,17 +1030,29 @@ imp06 <- hrs_2006 %>%
   mutate(Gender = factor(Gender, levels = c(1, 2)))
 
 # Define imputation methods
+# FIX (specification): Gender and Race previously had method "" while remaining
+# in the predictor matrix, so mice never filled their missing cells and NAs were
+# fed into every imputation model. They are now imputed INSIDE the FCS but are
+# NOT carried back (imputed_vars below excludes them), so the analysis data
+# keeps its original Gender and Race, including missing values.
 meth <- make.method(imp06)
-meth[c("hhidpn", "Gender", "Race")] <- ""
-meth["age_2006"] <- "pmm"
+meth["hhidpn"]    <- ""              # ID: never imputed
+meth["age_2006"]  <- "pmm"
 meth["Education"] <- "polr"
-meth[c("Marital_status", "Employment", "Smoking", "Alcohol",
+meth[c("Gender", "Race", "Marital_status", "Employment", "Smoking", "Alcohol",
        "Physical_activity", "Social_activity")] <- "logreg"
+# Variables with no missing values are not imputed (mice requirement).
+meth[colSums(is.na(imp06)) == 0] <- ""
 
 # Predictor matrix
 pred <- make.predictorMatrix(imp06)
 pred[, "hhidpn"] <- 0
 pred["hhidpn", ] <- 0
+
+# GUARD: an incomplete variable must never be used as a predictor unless it is
+# itself imputed, or mice feeds NAs into every imputation model.
+incomplete06 <- names(imp06)[colSums(is.na(imp06)) > 0]
+stopifnot(all(meth[incomplete06] != ""))
 
 # Run MICE
 set.seed(6)
@@ -1406,17 +1484,29 @@ imp08 <- hrs_2008 %>%
   mutate(Gender = factor(Gender, levels = c(1, 2)))
 
 # Define imputation methods
+# FIX (specification): Gender and Race previously had method "" while remaining
+# in the predictor matrix, so mice never filled their missing cells and NAs were
+# fed into every imputation model. They are now imputed INSIDE the FCS but are
+# NOT carried back (imputed_vars below excludes them), so the analysis data
+# keeps its original Gender and Race, including missing values.
 meth <- make.method(imp08)
-meth[c("hhidpn", "Gender", "Race")] <- ""
-meth["age_2008"] <- "pmm"
+meth["hhidpn"]    <- ""              # ID: never imputed
+meth["age_2008"]  <- "pmm"
 meth["Education"] <- "polr"
-meth[c("Marital_status", "Employment", "Smoking", "Alcohol",
+meth[c("Gender", "Race", "Marital_status", "Employment", "Smoking", "Alcohol",
        "Physical_activity", "Social_activity")] <- "logreg"
+# Variables with no missing values are not imputed (mice requirement).
+meth[colSums(is.na(imp08)) == 0] <- ""
 
 # Predictor matrix
 pred <- make.predictorMatrix(imp08)
 pred[, "hhidpn"] <- 0
 pred["hhidpn", ] <- 0
+
+# GUARD: an incomplete variable must never be used as a predictor unless it is
+# itself imputed, or mice feeds NAs into every imputation model.
+incomplete08 <- names(imp08)[colSums(is.na(imp08)) > 0]
+stopifnot(all(meth[incomplete08] != ""))
 
 # Run MICE
 set.seed(8)
@@ -1847,17 +1937,29 @@ imp10 <- hrs_2010 %>%
   mutate(Gender = factor(Gender, levels = c(1, 2)))
 
 # Define imputation methods
+# FIX (specification): Gender and Race previously had method "" while remaining
+# in the predictor matrix, so mice never filled their missing cells and NAs were
+# fed into every imputation model. They are now imputed INSIDE the FCS but are
+# NOT carried back (imputed_vars below excludes them), so the analysis data
+# keeps its original Gender and Race, including missing values.
 meth <- make.method(imp10)
-meth[c("hhidpn", "Gender", "Race")] <- ""
-meth["age_2010"] <- "pmm"
+meth["hhidpn"]    <- ""              # ID: never imputed
+meth["age_2010"]  <- "pmm"
 meth["Education"] <- "polr"
-meth[c("Marital_status", "Employment", "Smoking", "Alcohol",
+meth[c("Gender", "Race", "Marital_status", "Employment", "Smoking", "Alcohol",
        "Physical_activity", "Social_activity")] <- "logreg"
+# Variables with no missing values are not imputed (mice requirement).
+meth[colSums(is.na(imp10)) == 0] <- ""
 
 # Predictor matrix
 pred <- make.predictorMatrix(imp10)
 pred[, "hhidpn"] <- 0
 pred["hhidpn", ] <- 0
+
+# GUARD: an incomplete variable must never be used as a predictor unless it is
+# itself imputed, or mice feeds NAs into every imputation model.
+incomplete10 <- names(imp10)[colSums(is.na(imp10)) > 0]
+stopifnot(all(meth[incomplete10] != ""))
 
 # Run MICE
 set.seed(10)
@@ -2288,17 +2390,29 @@ imp12 <- hrs_2012 %>%
   mutate(Gender = factor(Gender, levels = c(1, 2)))
 
 # Define imputation methods
+# FIX (specification): Gender and Race previously had method "" while remaining
+# in the predictor matrix, so mice never filled their missing cells and NAs were
+# fed into every imputation model. They are now imputed INSIDE the FCS but are
+# NOT carried back (imputed_vars below excludes them), so the analysis data
+# keeps its original Gender and Race, including missing values.
 meth <- make.method(imp12)
-meth[c("hhidpn", "Gender", "Race")] <- ""
-meth["age_2012"] <- "pmm"
+meth["hhidpn"]    <- ""              # ID: never imputed
+meth["age_2012"]  <- "pmm"
 meth["Education"] <- "polr"
-meth[c("Marital_status", "Employment", "Smoking", "Alcohol",
+meth[c("Gender", "Race", "Marital_status", "Employment", "Smoking", "Alcohol",
        "Physical_activity", "Social_activity")] <- "logreg"
+# Variables with no missing values are not imputed (mice requirement).
+meth[colSums(is.na(imp12)) == 0] <- ""
 
 # Predictor matrix
 pred <- make.predictorMatrix(imp12)
 pred[, "hhidpn"] <- 0
 pred["hhidpn", ] <- 0
+
+# GUARD: an incomplete variable must never be used as a predictor unless it is
+# itself imputed, or mice feeds NAs into every imputation model.
+incomplete12 <- names(imp12)[colSums(is.na(imp12)) > 0]
+stopifnot(all(meth[incomplete12] != ""))
 
 # Run MICE
 set.seed(12)
@@ -2729,17 +2843,29 @@ imp14 <- hrs_2014 %>%
   mutate(Gender = factor(Gender, levels = c(1, 2)))
 
 # Define imputation methods
+# FIX (specification): Gender and Race previously had method "" while remaining
+# in the predictor matrix, so mice never filled their missing cells and NAs were
+# fed into every imputation model. They are now imputed INSIDE the FCS but are
+# NOT carried back (imputed_vars below excludes them), so the analysis data
+# keeps its original Gender and Race, including missing values.
 meth <- make.method(imp14)
-meth[c("hhidpn", "Gender", "Race")] <- ""
-meth["age_2014"] <- "pmm"
+meth["hhidpn"]    <- ""              # ID: never imputed
+meth["age_2014"]  <- "pmm"
 meth["Education"] <- "polr"
-meth[c("Marital_status", "Employment", "Smoking", "Alcohol",
+meth[c("Gender", "Race", "Marital_status", "Employment", "Smoking", "Alcohol",
        "Physical_activity", "Social_activity")] <- "logreg"
+# Variables with no missing values are not imputed (mice requirement).
+meth[colSums(is.na(imp14)) == 0] <- ""
 
 # Predictor matrix
 pred <- make.predictorMatrix(imp14)
 pred[, "hhidpn"] <- 0
 pred["hhidpn", ] <- 0
+
+# GUARD: an incomplete variable must never be used as a predictor unless it is
+# itself imputed, or mice feeds NAs into every imputation model.
+incomplete14 <- names(imp14)[colSums(is.na(imp14)) > 0]
+stopifnot(all(meth[incomplete14] != ""))
 
 # Run MICE
 set.seed(14)
@@ -3170,17 +3296,29 @@ imp16 <- hrs_2016 %>%
   mutate(Gender = factor(Gender, levels = c(1, 2)))
 
 # Define imputation methods
+# FIX (specification): Gender and Race previously had method "" while remaining
+# in the predictor matrix, so mice never filled their missing cells and NAs were
+# fed into every imputation model. They are now imputed INSIDE the FCS but are
+# NOT carried back (imputed_vars below excludes them), so the analysis data
+# keeps its original Gender and Race, including missing values.
 meth <- make.method(imp16)
-meth[c("hhidpn", "Gender", "Race")] <- ""
-meth["age_2016"] <- "pmm"
+meth["hhidpn"]    <- ""              # ID: never imputed
+meth["age_2016"]  <- "pmm"
 meth["Education"] <- "polr"
-meth[c("Marital_status", "Employment", "Smoking", "Alcohol",
+meth[c("Gender", "Race", "Marital_status", "Employment", "Smoking", "Alcohol",
        "Physical_activity", "Social_activity")] <- "logreg"
+# Variables with no missing values are not imputed (mice requirement).
+meth[colSums(is.na(imp16)) == 0] <- ""
 
 # Predictor matrix
 pred <- make.predictorMatrix(imp16)
 pred[, "hhidpn"] <- 0
 pred["hhidpn", ] <- 0
+
+# GUARD: an incomplete variable must never be used as a predictor unless it is
+# itself imputed, or mice feeds NAs into every imputation model.
+incomplete16 <- names(imp16)[colSums(is.na(imp16)) > 0]
+stopifnot(all(meth[incomplete16] != ""))
 
 # Run MICE
 set.seed(16)
@@ -3615,17 +3753,29 @@ imp18 <- hrs_2018 %>%
   mutate(Gender = factor(Gender, levels = c(1, 2)))
 
 # Define imputation methods
+# FIX (specification): Gender and Race previously had method "" while remaining
+# in the predictor matrix, so mice never filled their missing cells and NAs were
+# fed into every imputation model. They are now imputed INSIDE the FCS but are
+# NOT carried back (imputed_vars below excludes them), so the analysis data
+# keeps its original Gender and Race, including missing values.
 meth <- make.method(imp18)
-meth[c("hhidpn", "Gender", "Race")] <- ""
-meth["age_2018"] <- "pmm"
+meth["hhidpn"]    <- ""              # ID: never imputed
+meth["age_2018"]  <- "pmm"
 meth["Education"] <- "polr"
-meth[c("Marital_status", "Employment", "Smoking", "Alcohol",
+meth[c("Gender", "Race", "Marital_status", "Employment", "Smoking", "Alcohol",
        "Physical_activity", "Social_activity")] <- "logreg"
+# Variables with no missing values are not imputed (mice requirement).
+meth[colSums(is.na(imp18)) == 0] <- ""
 
 # Predictor matrix
 pred <- make.predictorMatrix(imp18)
 pred[, "hhidpn"] <- 0
 pred["hhidpn", ] <- 0
+
+# GUARD: an incomplete variable must never be used as a predictor unless it is
+# itself imputed, or mice feeds NAs into every imputation model.
+incomplete18 <- names(imp18)[colSums(is.na(imp18)) > 0]
+stopifnot(all(meth[incomplete18] != ""))
 
 # Run MICE
 set.seed(18)
@@ -4055,17 +4205,29 @@ imp20 <- hrs_2020 %>%
   mutate(Gender = factor(Gender, levels = c(1, 2)))
 
 # Define imputation methods
+# FIX (specification): Gender and Race previously had method "" while remaining
+# in the predictor matrix, so mice never filled their missing cells and NAs were
+# fed into every imputation model. They are now imputed INSIDE the FCS but are
+# NOT carried back (imputed_vars below excludes them), so the analysis data
+# keeps its original Gender and Race, including missing values.
 meth <- make.method(imp20)
-meth[c("hhidpn", "Gender", "Race")] <- ""
-meth["age_2020"] <- "pmm"
+meth["hhidpn"]    <- ""              # ID: never imputed
+meth["age_2020"]  <- "pmm"
 meth["Education"] <- "polr"
-meth[c("Marital_status", "Employment", "Smoking", "Alcohol",
+meth[c("Gender", "Race", "Marital_status", "Employment", "Smoking", "Alcohol",
        "Physical_activity", "Social_activity")] <- "logreg"
+# Variables with no missing values are not imputed (mice requirement).
+meth[colSums(is.na(imp20)) == 0] <- ""
 
 # Predictor matrix
 pred <- make.predictorMatrix(imp20)
 pred[, "hhidpn"] <- 0
 pred["hhidpn", ] <- 0
+
+# GUARD: an incomplete variable must never be used as a predictor unless it is
+# itself imputed, or mice feeds NAs into every imputation model.
+incomplete20 <- names(imp20)[colSums(is.na(imp20)) > 0]
+stopifnot(all(meth[incomplete20] != ""))
 
 # Run MICE
 set.seed(20)
@@ -4137,9 +4299,13 @@ hrs_long <- hrs_long %>%
   ) %>%
   dplyr::select(-matches("^age_\\d{4}$"))
 
-write.csv(hrs_long,
-          file = "hrs_long.csv",
-          row.names = FALSE)
+# FIX E + D: write to the shared, absolute data_dir (matches HRS_analysis.Rmd)
+# and persist death_track so the analysis notebook can load it standalone
+# instead of relying on this notebook's objects lingering in the session.
+write_csv(hrs_long, file.path(data_dir, "hrs_long.csv"))
+saveRDS(death_track, file.path(data_dir, "death_track.rds"))
+cat("Wrote:\n  ", file.path(data_dir, "hrs_long.csv"),
+    "\n  ", file.path(data_dir, "death_track.rds"), "\n")
 
 ```
 

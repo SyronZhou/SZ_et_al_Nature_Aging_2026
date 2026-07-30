@@ -1,18 +1,7 @@
 ---
-title: "ELSA — multi-state & Cox models (sensory impairment, frailty, dementia)"
+title: "R Notebook"
 output: html_notebook
 ---
-
-<!--
-  Analysis code for the manuscript on sensory impairment, frailty, and incident
-  dementia in the HRS (United States) and ELSA (England) cohorts.
-
-  DATA NOT INCLUDED. HRS and ELSA are restricted-access and cannot be
-  redistributed. Obtain the source data from the data providers and place them
-  under data/ (git-ignored) so the relative paths in this notebook resolve.
-  See README.md for setup and run order.
--->
-
 
 ```{r}
 library(haven)

@@ -1,18 +1,7 @@
 ---
-title: "ELSA — cohort construction & harmonised person-wave dataset"
+title: "R Notebook"
 output: html_notebook
 ---
-
-<!--
-  Analysis code for the manuscript on sensory impairment, frailty, and incident
-  dementia in the HRS (United States) and ELSA (England) cohorts.
-
-  DATA NOT INCLUDED. HRS and ELSA are restricted-access and cannot be
-  redistributed. Obtain the source data from the data providers and place them
-  under data/ (git-ignored) so the relative paths in this notebook resolve.
-  See README.md for setup and run order.
--->
-
 
 ```{r}
 library(haven)
@@ -569,71 +558,198 @@ elsa_fi_2002 <- elsa_fi_2002_orig %>%
 
 
 ```{r}
-# 6. Merge 2002 data (extract only — no filtering) -----------------------
+# =========================================================================
+# 6. Merge 2002 data (extract only — no filtering)
+# =========================================================================
+# FIX: elsa_fi_2002 carries `year` only on rows that survived the 49-item
+# filter; the noIADL-only rows have year = NA and were therefore silently
+# dropped by a join on c("idauniq","year"). Join on idauniq alone and strip
+# the redundant `year` column from the FI table.
 elsa_2002 <- elsa_cov_2002 %>%
   left_join(sensory_var_2002, by = "idauniq") %>%
   left_join(elsa_cog_2002,    by = c("idauniq", "year")) %>%
-  left_join(elsa_fi_2002,     by = c("idauniq", "year"))
+  left_join(elsa_fi_2002 %>% dplyr::select(-any_of("year")), by = "idauniq")
+
+# One row per person is assumed by every join below.
+stopifnot(anyDuplicated(elsa_2002$idauniq) == 0)
 
 
-# 7. Imputation (MICE) ---------------------------------------------------
-# We impute only the lifestyle/demographic covariates.
-# Race and birth_year are *auxiliaries*: used to improve imputations,
-# but themselves left as-is (their NAs are preserved in the final dataset).
+# =========================================================================
+# 7. Multiple imputation (MICE) — ELSA wave 1 (2002)
+# =========================================================================
+# Design — identical in HRS_dataextract.Rmd and at every ELSA wave:
+#   * m = 20, maxit = 10, fully conditional specification; pmm for
+#     continuous, polr for ordered categorical, logreg for binary.
+#   * Imputed AND carried into the analysis data (the analysis covariates):
+#       age, Education, Marital_status, Employment, Smoking, Alcohol,
+#       Physical_activity, Social_activity.
+#   * Gender and Race are imputed INSIDE the FCS so that no predictor
+#     carries NAs into the design matrix, but are NOT carried back: the
+#     analysis data retains their original values, including missing ones.
+#     (This is the fix for predictors that previously had method "" while
+#     still sitting in the predictor matrix — mice never fills those cells,
+#     so NAs were being fed into every imputation model.)
+#   * The primary study variables (frailty index, sensory impairment,
+#     dementia) are neither imputed nor used as predictors, matching HRS and
+#     the Methods statement that they were not imputed.
+#   * birth_year is not a predictor (near-collinear with age). Age is
+#     resolved deterministically from birth_year where it is missing,
+#     mirroring the HRS coalesce(R*AGEY_E, year - birth_year) step.
+#   * A single completed dataset (imputation 1) is carried forward, as in
+#     HRS; the mids object is retained so pooled inference stays available.
+
+analysis_covars02 <- c("age_2002", "Education", "Marital_status", "Employment",
+                       "Smoking", "Alcohol", "Physical_activity", "Social_activity")
+
+# ---- 7a. Imputation frame ----------------------------------------------
 imp02_elsa <- elsa_2002 %>%
-  mutate(idauniq = as.character(idauniq)) %>%
   transmute(
-    idauniq,
+    idauniq    = as.character(idauniq),
+    age_2002   = coalesce(as.numeric(age_2002), 2002 - as.numeric(birth_year)),
     Gender     = factor(Gender, levels = c(1, 2)),
-    age_2002   = as.numeric(age_2002),
-    birth_year = as.numeric(birth_year),                   # auxiliary
-    Race       = factor(Race, levels = c(0, 1)),           # auxiliary
-    Education  = ordered(Education),
+    Race       = factor(Race,   levels = c(0, 1)),
+    Education  = ordered(Education, levels = c(0, 1, 2)),
     across(c(Marital_status, Employment, Smoking, Alcohol,
              Physical_activity, Social_activity),
            ~ factor(.x, levels = c(0, 1)))
   )
 
-# Imputation methods
-meth <- make.method(imp02_elsa)
-meth[c("idauniq", "Gender", "birth_year", "Race")] <- ""   # not imputed
-meth["age_2002"]  <- "pmm"
-meth["Education"] <- "polr"
-meth[c("Marital_status", "Employment", "Smoking", "Alcohol",
-       "Physical_activity", "Social_activity")] <- "logreg"
+# ELSA fielded a qualification item only at W1-W5; from W6 Education is an
+# all-NA placeholder back-filled from the earlier waves at the pooled stage.
+# mice cannot impute a wholly missing column, so any such variable is
+# dropped here and left untouched in the analysis data.
+all_missing02 <- names(imp02_elsa)[colSums(!is.na(imp02_elsa)) == 0]
+if (length(all_missing02) > 0) {
+  message("ELSA 2002 — no observed values, excluded from imputation: ",
+          paste(all_missing02, collapse = ", "))
+  imp02_elsa <- imp02_elsa %>% dplyr::select(-all_of(all_missing02))
+}
+imputed_vars02 <- setdiff(analysis_covars02, all_missing02)
 
-# Predictor matrix: exclude idauniq from both sides
-pred <- make.predictorMatrix(imp02_elsa)
-pred[, "idauniq"] <- 0
-pred["idauniq", ] <- 0
+# ---- 7b. Quantify missingness (for the Methods text) -------------------
+miss_pct02 <- sapply(imp02_elsa, function(x) mean(is.na(x)) * 100)
+cat("ELSA 2002 — percentage missing per variable:\n")
+print(round(miss_pct02, 2))
 
-# --- Choose one of these two MICE calls ---
-# (a) Single completion for descriptive table — faster:
+miss_cov02 <- miss_pct02[analysis_covars02]
+miss_cov02 <- miss_cov02[miss_cov02 > 0]
+if (length(miss_cov02) > 0) {
+  cat(sprintf("\nMean missing across analysis covariates: %.2f%%\n",
+              mean(miss_cov02)))
+  cat(sprintf("Maximum missing: %.2f%% (%s)\n",
+              max(miss_cov02), names(which.max(miss_cov02))))
+} else {
+  cat("\nNo missing values among analysis covariates.\n")
+}
+
+# ---- 7c. Imputation method per variable --------------------------------
+meth02 <- make.method(imp02_elsa)
+meth02["idauniq"]  <- ""             # ID: never imputed, never a predictor
+meth02["age_2002"] <- "pmm"
+meth02[intersect("Education", names(imp02_elsa))] <- "polr"   # ordered
+meth02[intersect(c("Gender", "Race", "Marital_status", "Employment", "Smoking",
+                   "Alcohol", "Physical_activity", "Social_activity"),
+                 names(imp02_elsa))] <- "logreg"
+# Variables with no missing values are not imputed (mice requirement).
+meth02[colSums(is.na(imp02_elsa)) == 0] <- ""
+
+# ---- 7d. Predictor matrix ---------------------------------------------
+pred02 <- make.predictorMatrix(imp02_elsa)
+pred02[, "idauniq"] <- 0
+pred02["idauniq", ] <- 0
+
+# GUARD: every incomplete variable that is used as a predictor must itself
+# be imputed, otherwise NAs leak into the design matrix.
+incomplete02 <- names(imp02_elsa)[colSums(is.na(imp02_elsa)) > 0]
+stopifnot(all(meth02[incomplete02] != ""))
+
+# ---- 7e. Run MICE: 20 imputed datasets, 10 iterations ------------------
 set.seed(3)
-imp_mice02_elsa <- mice(imp02_elsa, m = 20, maxit = 10,
-                        method = meth, predictorMatrix = pred,
-                        printFlag = TRUE)
+imp_mice02_elsa <- mice(
+  imp02_elsa,
+  m               = 20,
+  maxit           = 10,
+  method          = meth02,
+  predictorMatrix = pred02,
+  printFlag       = TRUE
+)
+
+# Any logged event means mice silently altered the specification — inspect.
+if (!is.null(imp_mice02_elsa$loggedEvents)) {
+  cat("\nMICE logged events (ELSA 2002):\n")
+  print(imp_mice02_elsa$loggedEvents)
+}
+
+# ---- 7f. Convergence diagnostics --------------------------------------
+plot(imp_mice02_elsa)          # trace plots across the 10 iterations
+
+has_imps02 <- function(mids_obj, v) {
+  !is.null(mids_obj$imp[[v]]) && nrow(mids_obj$imp[[v]]) >= 2
+}
+
+for (v in c("age_2002")) {
+  if (has_imps02(imp_mice02_elsa, v)) {
+    print(densityplot(imp_mice02_elsa, as.formula(paste("~", v))))
+    print(stripplot(imp_mice02_elsa, as.formula(paste(v, "~ .imp")),
+                    pch = 20, cex = 1.2))
+  } else {
+    message(sprintf("%s: %d missing value(s) — density/strip plots skipped.",
+                    v, sum(is.na(imp_mice02_elsa$data[[v]]))))
+  }
+}
+
+# ---- 7g. Observed vs imputed CELLS only -------------------------------
+# FIX: the previous version compared observed values against the *completed*
+# dataset, which is dominated by observed values and so barely moves. This
+# compares the observed distribution against the imputed cells themselves.
+imp_vs_obs02 <- function(mids_obj, v) {
+  obs   <- mids_obj$data[[v]]
+  cells <- mids_obj$imp[[v]]
+  if (is.null(cells) || nrow(cells) == 0) {
+    return(data.frame(variable = v, n_missing = 0L,
+                      observed = NA_character_, imputed = NA_character_))
+  }
+  if (is.numeric(obs)) {
+    data.frame(variable         = v,
+               n_missing        = nrow(cells),
+               observed         = sprintf("mean=%.3f", mean(obs, na.rm = TRUE)),
+               imputed          = sprintf("mean range %.3f-%.3f",
+                                          min(colMeans(cells)),
+                                          max(colMeans(cells))))
+  } else {
+    ot <- round(prop.table(table(as.character(obs))), 3)
+    it <- round(prop.table(table(unlist(lapply(cells, as.character)))), 3)
+    data.frame(variable  = v,
+               n_missing = nrow(cells),
+               observed  = paste(names(ot), ot, sep = "=", collapse = " | "),
+               imputed   = paste(names(it), it, sep = "=", collapse = " | "))
+  }
+}
+
+diag02 <- do.call(rbind, lapply(imputed_vars02, imp_vs_obs02,
+                                mids_obj = imp_mice02_elsa))
+print(diag02)
+
+# ---- 7h. Merge the completed covariates back ---------------------------
+# Single completion (imputation 1), as in HRS_dataextract.Rmd. Only the
+# analysis covariates are replaced; Gender, Race and every primary study
+# variable keep their ORIGINAL values, including NAs, so the primary study
+# variables remain un-imputed exactly as stated in the Methods.
 imp02_elsa_complete1 <- complete(imp_mice02_elsa, 1)
-
-# (b) If you want proper pooled inference later, keep m = 20 and use
-#     with(imp_mice02_elsa, model) %>% pool() downstream instead of
-#     complete(imp, 1).
-
-imputed_vars <- c("Education", "Marital_status", "Employment",
-                  "Smoking", "Alcohol", "Physical_activity",
-                  "Social_activity", "age_2002")
 
 elsa02_clean <- elsa_2002 %>%
   mutate(idauniq = as.character(idauniq)) %>%
-  dplyr::select(-all_of(imputed_vars)) %>%
+  dplyr::select(-all_of(imputed_vars02)) %>%
   left_join(
     imp02_elsa_complete1 %>%
       mutate(idauniq = as.character(idauniq)) %>%
-      dplyr::select(idauniq, all_of(imputed_vars)),
+      dplyr::select(idauniq, all_of(imputed_vars02)),
     by = "idauniq"
   )
 
 ELSA_2002 <- elsa02_clean
+
+stopifnot(nrow(ELSA_2002) == nrow(elsa_2002))
 
 ```
 
@@ -1119,61 +1235,127 @@ elsa_fi_2004 <- elsa_fi_2004_orig %>%
 
 # Merge 2004 data
 ```{r}
-# 6. Merge 2004 data --------------------------------------------------------
+# =========================================================================
+# 6. Merge 2004 data
+# =========================================================================
+# FIX (as at 2002): elsa_fi_2004 carries `year` only on rows that survived
+# the 49-item completeness filter, so noIADL-only rows have year = NA and
+# were silently dropped by a join on c("idauniq","year").
 elsa_2004 <- elsa_cov_2004 %>%
   left_join(sensory_var_2004, by = "idauniq") %>%
   left_join(elsa_cog_2004,    by = c("idauniq", "year")) %>%
-  left_join(elsa_fi_2004,     by = c("idauniq", "year"))
+  left_join(elsa_fi_2004 %>% dplyr::select(-any_of("year")), by = "idauniq")
 
+stopifnot(anyDuplicated(elsa_2004$idauniq) == 0)
 
-# 7. Imputation (MICE) ------------------------------------------------------
+# =========================================================================
+# 7. Multiple imputation (MICE) — ELSA wave 2 (2004)
+# =========================================================================
+# Identical specification to wave 1 — see the design notes in the 2002 block.
+# Full convergence and observed-vs-imputed diagnostics are produced once, at
+# wave 1, mirroring HRS_dataextract.Rmd (diagnostics at its 2004 baseline).
+
+analysis_covars04 <- c("age_2004", "Education", "Marital_status", "Employment",
+                       "Smoking", "Alcohol", "Physical_activity", "Social_activity")
+
+# ---- 7a. Imputation frame ----------------------------------------------
+# birth_year is not a predictor (near-collinear with age); age is resolved
+# deterministically where a birth year exists and pmm handles the residual
+# cases. Wave 2 fieldwork spanned 2004-2005, so that value can be ±1 year.
 imp04_elsa <- elsa_2004 %>%
-  mutate(idauniq = as.character(idauniq)) %>%
   transmute(
-    idauniq,
+    idauniq    = as.character(idauniq),
+    age_2004   = coalesce(as.numeric(age_2004), 2004 - as.numeric(birth_year)),
     Gender     = factor(Gender, levels = c(1, 2)),
-    age_2004   = as.numeric(age_2004),
-    birth_year = as.numeric(birth_year),            # auxiliary
-    Race       = factor(Race, levels = c(0, 1)),    # auxiliary
-    Education  = ordered(Education),
+    Race       = factor(Race,   levels = c(0, 1)),
+    Education  = ordered(Education, levels = c(0, 1, 2)),
     across(c(Marital_status, Employment, Smoking, Alcohol,
              Physical_activity, Social_activity),
            ~ factor(.x, levels = c(0, 1)))
   )
 
-meth <- make.method(imp04_elsa)
-meth[c("idauniq", "Gender", "birth_year", "Race")] <- ""
-meth["age_2004"]  <- "pmm"
-meth["Education"] <- "polr"
-meth[c("Marital_status", "Employment", "Smoking", "Alcohol",
-       "Physical_activity", "Social_activity")] <- "logreg"
+# Variables with no observed values (Education from W6 onward) cannot be
+# imputed; drop them here and leave them untouched in the analysis data.
+all_missing04 <- names(imp04_elsa)[colSums(!is.na(imp04_elsa)) == 0]
+if (length(all_missing04) > 0) {
+  message("ELSA 2004 — no observed values, excluded from imputation: ",
+          paste(all_missing04, collapse = ", "))
+  imp04_elsa <- imp04_elsa %>% dplyr::select(-all_of(all_missing04))
+}
+imputed_vars04 <- setdiff(analysis_covars04, all_missing04)
 
-pred <- make.predictorMatrix(imp04_elsa)
-pred[, "idauniq"] <- 0
-pred["idauniq", ] <- 0
+# ---- 7b. Quantify missingness (for the Methods text) -------------------
+miss_pct04 <- sapply(imp04_elsa, function(x) mean(is.na(x)) * 100)
+cat("ELSA 2004 — percentage missing per variable:\n")
+print(round(miss_pct04, 2))
 
-# Single completion for descriptive table (change to m=20 + pool() for inference)
+miss_cov04 <- miss_pct04[intersect(imputed_vars04, names(miss_pct04))]
+miss_cov04 <- miss_cov04[miss_cov04 > 0]
+if (length(miss_cov04) > 0) {
+  cat(sprintf("\nMean missing across analysis covariates: %.2f%%\n",
+              mean(miss_cov04)))
+  cat(sprintf("Maximum missing: %.2f%% (%s)\n",
+              max(miss_cov04), names(which.max(miss_cov04))))
+} else {
+  cat("\nNo missing values among analysis covariates.\n")
+}
+
+# ---- 7c. Imputation method per variable --------------------------------
+meth04 <- make.method(imp04_elsa)
+meth04["idauniq"]  <- ""
+meth04["age_2004"] <- "pmm"
+meth04[intersect("Education", names(imp04_elsa))] <- "polr"
+meth04[intersect(c("Gender", "Race", "Marital_status", "Employment", "Smoking",
+                   "Alcohol", "Physical_activity", "Social_activity"),
+                 names(imp04_elsa))] <- "logreg"
+# Variables with no missing values are not imputed (mice requirement).
+meth04[colSums(is.na(imp04_elsa)) == 0] <- ""
+
+# ---- 7d. Predictor matrix ---------------------------------------------
+pred04 <- make.predictorMatrix(imp04_elsa)
+pred04[, "idauniq"] <- 0
+pred04["idauniq", ] <- 0
+
+# GUARD: no incomplete variable may be used as a predictor without itself
+# being imputed, otherwise NAs leak into every imputation model.
+incomplete04 <- names(imp04_elsa)[colSums(is.na(imp04_elsa)) > 0]
+stopifnot(all(meth04[incomplete04] != ""))
+
+# ---- 7e. Run MICE: 20 imputed datasets, 10 iterations ------------------
 set.seed(3)
-imp_mice04_elsa      <- mice(imp04_elsa, m = 20, maxit = 10,
-                             method = meth, predictorMatrix = pred,
-                             printFlag = TRUE)
-imp04_elsa_complete1 <- complete(imp_mice04_elsa, 1)
+imp_mice04_elsa <- mice(
+  imp04_elsa,
+  m               = 20,
+  maxit           = 10,
+  method          = meth04,
+  predictorMatrix = pred04,
+  printFlag       = TRUE
+)
 
-imputed_vars <- c("Education", "Marital_status", "Employment",
-                  "Smoking", "Alcohol", "Physical_activity",
-                  "Social_activity", "age_2004")
+if (!is.null(imp_mice04_elsa$loggedEvents)) {
+  cat("\nMICE logged events (ELSA 2004):\n")
+  print(imp_mice04_elsa$loggedEvents)
+}
+
+# ---- 7f. Merge the completed covariates back ---------------------------
+# Single completion (imputation 1), as in HRS. Only the analysis covariates
+# are replaced; Gender, Race and the primary study variables keep their
+# ORIGINAL values, including NAs.
+imp04_elsa_complete1 <- complete(imp_mice04_elsa, 1)
 
 elsa04_clean <- elsa_2004 %>%
   mutate(idauniq = as.character(idauniq)) %>%
-  dplyr::select(-all_of(imputed_vars)) %>%
+  dplyr::select(-all_of(imputed_vars04)) %>%
   left_join(
     imp04_elsa_complete1 %>%
       mutate(idauniq = as.character(idauniq)) %>%
-      dplyr::select(idauniq, all_of(imputed_vars)),
+      dplyr::select(idauniq, all_of(imputed_vars04)),
     by = "idauniq"
   )
 
-ELSA_2004 <- elsa04_clean 
+ELSA_2004 <- elsa04_clean
+
+stopifnot(nrow(ELSA_2004) == nrow(elsa_2004))
 
 ```
 
@@ -1635,64 +1817,127 @@ elsa_fi_2006 <- elsa_fi_2006_orig %>%
 
 # Merge 2006 data
 ```{r}
+# ==========================================================================
 # 5. Merge 2006 data
 # ==========================================================================
+# FIX (as at 2002/2004): elsa_fi_2006 carries `year` only on rows that
+# survived the 49-item completeness filter, so noIADL-only rows have
+# year = NA and were silently dropped by a join on c("idauniq","year").
 elsa_2006 <- elsa_cov_2006 %>%
   left_join(sensory_var_2006, by = "idauniq") %>%
   left_join(elsa_cog_2006,    by = c("idauniq", "year")) %>%
-  left_join(elsa_fi_2006,     by = c("idauniq", "year"))
+  left_join(elsa_fi_2006 %>% dplyr::select(-any_of("year")), by = "idauniq")
 
+stopifnot(anyDuplicated(elsa_2006$idauniq) == 0)
 
 # ==========================================================================
-# 6. Multiple imputation (single completion)
+# 6. Multiple imputation (MICE) — ELSA wave 3 (2006)
 # ==========================================================================
+# Identical specification to waves 1-2 — see the design notes in the 2002
+# block. Full convergence and observed-vs-imputed diagnostics are produced
+# once, at wave 1, mirroring HRS_dataextract.Rmd.
+
+analysis_covars06 <- c("age_2006", "Education", "Marital_status", "Employment",
+                       "Smoking", "Alcohol", "Physical_activity", "Social_activity")
+
+# ---- 6a. Imputation frame ----------------------------------------------
+# birth_year is not a predictor (near-collinear with age); age is resolved
+# deterministically where a birth year exists and pmm handles the residual
+# cases. Wave 3 fieldwork spanned 2006-2007, so that value can be ±1 year.
 imp06_elsa <- elsa_2006 %>%
-  mutate(idauniq = as.character(idauniq)) %>%
   transmute(
-    idauniq,
+    idauniq    = as.character(idauniq),
+    age_2006   = coalesce(as.numeric(age_2006), 2006 - as.numeric(birth_year)),
     Gender     = factor(Gender, levels = c(1, 2)),
-    age_2006   = as.numeric(age_2006),
-    birth_year = as.numeric(birth_year),            # auxiliary
-    Race       = factor(Race, levels = c(0, 1)),    # auxiliary
-    Education  = ordered(Education),
+    Race       = factor(Race,   levels = c(0, 1)),
+    Education  = ordered(Education, levels = c(0, 1, 2)),
     across(c(Marital_status, Employment, Smoking, Alcohol,
              Physical_activity, Social_activity),
            ~ factor(.x, levels = c(0, 1)))
   )
 
-meth <- make.method(imp06_elsa)
-meth[c("idauniq", "Gender", "birth_year", "Race")] <- ""
-meth["age_2006"]  <- "pmm"
-meth["Education"] <- "polr"
-meth[c("Marital_status", "Employment", "Smoking", "Alcohol",
-       "Physical_activity", "Social_activity")] <- "logreg"
+# Variables with no observed values (Education from W6 onward) cannot be
+# imputed; drop them here and leave them untouched in the analysis data.
+all_missing06 <- names(imp06_elsa)[colSums(!is.na(imp06_elsa)) == 0]
+if (length(all_missing06) > 0) {
+  message("ELSA 2006 — no observed values, excluded from imputation: ",
+          paste(all_missing06, collapse = ", "))
+  imp06_elsa <- imp06_elsa %>% dplyr::select(-all_of(all_missing06))
+}
+imputed_vars06 <- setdiff(analysis_covars06, all_missing06)
 
-pred <- make.predictorMatrix(imp06_elsa)
-pred[, "idauniq"] <- 0
-pred["idauniq", ] <- 0
+# ---- 6b. Quantify missingness (for the Methods text) -------------------
+miss_pct06 <- sapply(imp06_elsa, function(x) mean(is.na(x)) * 100)
+cat("ELSA 2006 — percentage missing per variable:\n")
+print(round(miss_pct06, 2))
 
+miss_cov06 <- miss_pct06[intersect(imputed_vars06, names(miss_pct06))]
+miss_cov06 <- miss_cov06[miss_cov06 > 0]
+if (length(miss_cov06) > 0) {
+  cat(sprintf("\nMean missing across analysis covariates: %.2f%%\n",
+              mean(miss_cov06)))
+  cat(sprintf("Maximum missing: %.2f%% (%s)\n",
+              max(miss_cov06), names(which.max(miss_cov06))))
+} else {
+  cat("\nNo missing values among analysis covariates.\n")
+}
+
+# ---- 6c. Imputation method per variable --------------------------------
+meth06 <- make.method(imp06_elsa)
+meth06["idauniq"]  <- ""
+meth06["age_2006"] <- "pmm"
+meth06[intersect("Education", names(imp06_elsa))] <- "polr"
+meth06[intersect(c("Gender", "Race", "Marital_status", "Employment", "Smoking",
+                   "Alcohol", "Physical_activity", "Social_activity"),
+                 names(imp06_elsa))] <- "logreg"
+# Variables with no missing values are not imputed (mice requirement).
+meth06[colSums(is.na(imp06_elsa)) == 0] <- ""
+
+# ---- 6d. Predictor matrix ---------------------------------------------
+pred06 <- make.predictorMatrix(imp06_elsa)
+pred06[, "idauniq"] <- 0
+pred06["idauniq", ] <- 0
+
+# GUARD: no incomplete variable may be used as a predictor without itself
+# being imputed, otherwise NAs leak into every imputation model.
+incomplete06 <- names(imp06_elsa)[colSums(is.na(imp06_elsa)) > 0]
+stopifnot(all(meth06[incomplete06] != ""))
+
+# ---- 6e. Run MICE: 20 imputed datasets, 10 iterations ------------------
 set.seed(3)
-imp_mice06_elsa   <- mice(imp06_elsa, m = 20, maxit = 10,
-                          method = meth, predictorMatrix = pred,
-                          printFlag = TRUE)
-imp06_complete1   <- complete(imp_mice06_elsa, 1)
+imp_mice06_elsa <- mice(
+  imp06_elsa,
+  m               = 20,
+  maxit           = 10,
+  method          = meth06,
+  predictorMatrix = pred06,
+  printFlag       = TRUE
+)
 
-imputed_vars <- c("Education", "Marital_status", "Employment",
-                  "Smoking", "Alcohol", "Physical_activity",
-                  "Social_activity", "age_2006")
+if (!is.null(imp_mice06_elsa$loggedEvents)) {
+  cat("\nMICE logged events (ELSA 2006):\n")
+  print(imp_mice06_elsa$loggedEvents)
+}
+
+# ---- 6f. Merge the completed covariates back ---------------------------
+# Single completion (imputation 1), as in HRS. Only the analysis covariates
+# are replaced; Gender, Race and the primary study variables keep their
+# ORIGINAL values, including NAs.
+imp06_elsa_complete1 <- complete(imp_mice06_elsa, 1)
 
 elsa06_clean <- elsa_2006 %>%
   mutate(idauniq = as.character(idauniq)) %>%
-  dplyr::select(-all_of(imputed_vars)) %>%
+  dplyr::select(-all_of(imputed_vars06)) %>%
   left_join(
-    imp06_complete1 %>%
+    imp06_elsa_complete1 %>%
       mutate(idauniq = as.character(idauniq)) %>%
-      dplyr::select(idauniq, all_of(imputed_vars)),
+      dplyr::select(idauniq, all_of(imputed_vars06)),
     by = "idauniq"
   )
 
+ELSA_2006 <- elsa06_clean
 
-ELSA_2006 <- elsa06_clean 
+stopifnot(nrow(ELSA_2006) == nrow(elsa_2006))
 
 ```
 
@@ -2176,55 +2421,113 @@ elsa_2008 <- elsa_cov_2008 %>%
 
 
 # ==========================================================================
-# 6. Multiple imputation (single completion)
+# 6. Multiple imputation (MICE) — ELSA wave 4 (2008)
 # ==========================================================================
+# Identical specification to waves 1-3 — see the design notes in the 2002
+# block. Full convergence and observed-vs-imputed diagnostics are produced
+# once, at wave 1, mirroring HRS_dataextract.Rmd.
+
+analysis_covars08 <- c("age_2008", "Education", "Marital_status", "Employment",
+                       "Smoking", "Alcohol", "Physical_activity", "Social_activity")
+
+# ---- 6a. Imputation frame ----------------------------------------------
+# birth_year is not a predictor (near-collinear with age); age is resolved
+# deterministically where a birth year exists and pmm handles the residual
+# cases. Wave 4 fieldwork spanned 2008-2009, so that value can be ±1 year.
 imp08_elsa <- elsa_2008 %>%
-  mutate(idauniq = as.character(idauniq)) %>%
   transmute(
-    idauniq,
+    idauniq    = as.character(idauniq),
+    age_2008   = coalesce(as.numeric(age_2008), 2008 - as.numeric(birth_year)),
     Gender     = factor(Gender, levels = c(1, 2)),
-    age_2008   = as.numeric(age_2008),
-    birth_year = as.numeric(birth_year),            # auxiliary
-    Race       = factor(Race, levels = c(0, 1)),    # auxiliary
-    Education  = ordered(Education),
+    Race       = factor(Race,   levels = c(0, 1)),
+    Education  = ordered(Education, levels = c(0, 1, 2)),
     across(c(Marital_status, Employment, Smoking, Alcohol,
              Physical_activity, Social_activity),
            ~ factor(.x, levels = c(0, 1)))
   )
 
-meth <- make.method(imp08_elsa)
-meth[c("idauniq", "Gender", "birth_year", "Race")] <- ""
-meth["age_2008"]  <- "pmm"
-meth["Education"] <- "polr"
-meth[c("Marital_status", "Employment", "Smoking", "Alcohol",
-       "Physical_activity", "Social_activity")] <- "logreg"
+# Variables with no observed values (Education from W6 onward) cannot be
+# imputed; drop them here and leave them untouched in the analysis data.
+all_missing08 <- names(imp08_elsa)[colSums(!is.na(imp08_elsa)) == 0]
+if (length(all_missing08) > 0) {
+  message("ELSA 2008 — no observed values, excluded from imputation: ",
+          paste(all_missing08, collapse = ", "))
+  imp08_elsa <- imp08_elsa %>% dplyr::select(-all_of(all_missing08))
+}
+imputed_vars08 <- setdiff(analysis_covars08, all_missing08)
 
-pred <- make.predictorMatrix(imp08_elsa)
-pred[, "idauniq"] <- 0
-pred["idauniq", ] <- 0
+# ---- 6b. Quantify missingness (for the Methods text) -------------------
+miss_pct08 <- sapply(imp08_elsa, function(x) mean(is.na(x)) * 100)
+cat("ELSA 2008 — percentage missing per variable:\n")
+print(round(miss_pct08, 2))
 
+miss_cov08 <- miss_pct08[intersect(imputed_vars08, names(miss_pct08))]
+miss_cov08 <- miss_cov08[miss_cov08 > 0]
+if (length(miss_cov08) > 0) {
+  cat(sprintf("\nMean missing across analysis covariates: %.2f%%\n",
+              mean(miss_cov08)))
+  cat(sprintf("Maximum missing: %.2f%% (%s)\n",
+              max(miss_cov08), names(which.max(miss_cov08))))
+} else {
+  cat("\nNo missing values among analysis covariates.\n")
+}
+
+# ---- 6c. Imputation method per variable --------------------------------
+meth08 <- make.method(imp08_elsa)
+meth08["idauniq"]  <- ""
+meth08["age_2008"] <- "pmm"
+meth08[intersect("Education", names(imp08_elsa))] <- "polr"
+meth08[intersect(c("Gender", "Race", "Marital_status", "Employment", "Smoking",
+                   "Alcohol", "Physical_activity", "Social_activity"),
+                 names(imp08_elsa))] <- "logreg"
+# Variables with no missing values are not imputed (mice requirement).
+meth08[colSums(is.na(imp08_elsa)) == 0] <- ""
+
+# ---- 6d. Predictor matrix ---------------------------------------------
+pred08 <- make.predictorMatrix(imp08_elsa)
+pred08[, "idauniq"] <- 0
+pred08["idauniq", ] <- 0
+
+# GUARD: no incomplete variable may be used as a predictor without itself
+# being imputed, otherwise NAs leak into every imputation model.
+incomplete08 <- names(imp08_elsa)[colSums(is.na(imp08_elsa)) > 0]
+stopifnot(all(meth08[incomplete08] != ""))
+
+# ---- 6e. Run MICE: 20 imputed datasets, 10 iterations ------------------
 set.seed(3)
-imp_mice08_elsa      <- mice(imp08_elsa, m = 20, maxit = 10,
-                             method = meth, predictorMatrix = pred,
-                             printFlag = TRUE)
-imp08_elsa_complete1 <- complete(imp_mice08_elsa, 1)
+imp_mice08_elsa <- mice(
+  imp08_elsa,
+  m               = 20,
+  maxit           = 10,
+  method          = meth08,
+  predictorMatrix = pred08,
+  printFlag       = TRUE
+)
 
-imputed_vars <- c("Education", "Marital_status", "Employment",
-                  "Smoking", "Alcohol", "Physical_activity",
-                  "Social_activity", "age_2008")
+if (!is.null(imp_mice08_elsa$loggedEvents)) {
+  cat("\nMICE logged events (ELSA 2008):\n")
+  print(imp_mice08_elsa$loggedEvents)
+}
+
+# ---- 6f. Merge the completed covariates back ---------------------------
+# Single completion (imputation 1), as in HRS. Only the analysis covariates
+# are replaced; Gender, Race and the primary study variables keep their
+# ORIGINAL values, including NAs.
+imp08_elsa_complete1 <- complete(imp_mice08_elsa, 1)
 
 elsa08_clean <- elsa_2008 %>%
   mutate(idauniq = as.character(idauniq)) %>%
-  dplyr::select(-all_of(imputed_vars)) %>%
+  dplyr::select(-all_of(imputed_vars08)) %>%
   left_join(
     imp08_elsa_complete1 %>%
       mutate(idauniq = as.character(idauniq)) %>%
-      dplyr::select(idauniq, all_of(imputed_vars)),
+      dplyr::select(idauniq, all_of(imputed_vars08)),
     by = "idauniq"
   )
 
-
 ELSA_2008 <- elsa08_clean
+
+stopifnot(nrow(ELSA_2008) == nrow(elsa_2008))
 
 ```
 
@@ -2685,53 +2988,114 @@ elsa_2010 <- elsa_cov_2010 %>%
   left_join(elsa_fi_2010,     by = c("idauniq", "year"))
 
 
-# 6. Multiple imputation (single completion) ----------------------------
+# ==========================================================================
+# 6. Multiple imputation (MICE) — ELSA wave 5 (2010)
+# ==========================================================================
+# Identical specification to waves 1-4 — see the design notes in the 2002
+# block. Full convergence and observed-vs-imputed diagnostics are produced
+# once, at wave 1, mirroring HRS_dataextract.Rmd.
+
+analysis_covars10 <- c("age_2010", "Education", "Marital_status", "Employment",
+                       "Smoking", "Alcohol", "Physical_activity", "Social_activity")
+
+# ---- 6a. Imputation frame ----------------------------------------------
+# birth_year is not a predictor (near-collinear with age); age is resolved
+# deterministically where a birth year exists and pmm handles the residual
+# cases. Wave 5 fieldwork spanned 2010-2011, so that value can be ±1 year.
 imp10_elsa <- elsa_2010 %>%
-  mutate(idauniq = as.character(idauniq)) %>%
   transmute(
-    idauniq,
+    idauniq    = as.character(idauniq),
+    age_2010   = coalesce(as.numeric(age_2010), 2010 - as.numeric(birth_year)),
     Gender     = factor(Gender, levels = c(1, 2)),
-    age_2010   = as.numeric(age_2010),
-    birth_year = as.numeric(birth_year),            # auxiliary
-    Race       = factor(Race, levels = c(0, 1)),    # auxiliary
-    Education  = ordered(Education),
+    Race       = factor(Race,   levels = c(0, 1)),
+    Education  = ordered(Education, levels = c(0, 1, 2)),
     across(c(Marital_status, Employment, Smoking, Alcohol,
              Physical_activity, Social_activity),
            ~ factor(.x, levels = c(0, 1)))
   )
 
-meth <- make.method(imp10_elsa)
-meth[c("idauniq", "Gender", "birth_year", "Race")] <- ""
-meth["age_2010"]  <- "pmm"
-meth["Education"] <- "polr"
-meth[c("Marital_status", "Employment", "Smoking", "Alcohol",
-       "Physical_activity", "Social_activity")] <- "logreg"
+# Variables with no observed values (Education from W6 onward) cannot be
+# imputed; drop them here and leave them untouched in the analysis data.
+all_missing10 <- names(imp10_elsa)[colSums(!is.na(imp10_elsa)) == 0]
+if (length(all_missing10) > 0) {
+  message("ELSA 2010 — no observed values, excluded from imputation: ",
+          paste(all_missing10, collapse = ", "))
+  imp10_elsa <- imp10_elsa %>% dplyr::select(-all_of(all_missing10))
+}
+imputed_vars10 <- setdiff(analysis_covars10, all_missing10)
 
-pred <- make.predictorMatrix(imp10_elsa)
-pred[, "idauniq"] <- 0
-pred["idauniq", ] <- 0
+# ---- 6b. Quantify missingness (for the Methods text) -------------------
+miss_pct10 <- sapply(imp10_elsa, function(x) mean(is.na(x)) * 100)
+cat("ELSA 2010 — percentage missing per variable:\n")
+print(round(miss_pct10, 2))
 
+miss_cov10 <- miss_pct10[intersect(imputed_vars10, names(miss_pct10))]
+miss_cov10 <- miss_cov10[miss_cov10 > 0]
+if (length(miss_cov10) > 0) {
+  cat(sprintf("\nMean missing across analysis covariates: %.2f%%\n",
+              mean(miss_cov10)))
+  cat(sprintf("Maximum missing: %.2f%% (%s)\n",
+              max(miss_cov10), names(which.max(miss_cov10))))
+} else {
+  cat("\nNo missing values among analysis covariates.\n")
+}
+
+# ---- 6c. Imputation method per variable --------------------------------
+meth10 <- make.method(imp10_elsa)
+meth10["idauniq"]  <- ""
+meth10["age_2010"] <- "pmm"
+meth10[intersect("Education", names(imp10_elsa))] <- "polr"
+meth10[intersect(c("Gender", "Race", "Marital_status", "Employment", "Smoking",
+                   "Alcohol", "Physical_activity", "Social_activity"),
+                 names(imp10_elsa))] <- "logreg"
+# Variables with no missing values are not imputed (mice requirement).
+meth10[colSums(is.na(imp10_elsa)) == 0] <- ""
+
+# ---- 6d. Predictor matrix ---------------------------------------------
+pred10 <- make.predictorMatrix(imp10_elsa)
+pred10[, "idauniq"] <- 0
+pred10["idauniq", ] <- 0
+
+# GUARD: no incomplete variable may be used as a predictor without itself
+# being imputed, otherwise NAs leak into every imputation model.
+incomplete10 <- names(imp10_elsa)[colSums(is.na(imp10_elsa)) > 0]
+stopifnot(all(meth10[incomplete10] != ""))
+
+# ---- 6e. Run MICE: 20 imputed datasets, 10 iterations ------------------
 set.seed(3)
-imp_mice10_elsa      <- mice(imp10_elsa, m = 20, maxit = 10,
-                             method = meth, predictorMatrix = pred,
-                             printFlag = TRUE)
-imp10_elsa_complete1 <- complete(imp_mice10_elsa, 1)
+imp_mice10_elsa <- mice(
+  imp10_elsa,
+  m               = 20,
+  maxit           = 10,
+  method          = meth10,
+  predictorMatrix = pred10,
+  printFlag       = TRUE
+)
 
-imputed_vars <- c("Education", "Marital_status", "Employment",
-                  "Smoking", "Alcohol", "Physical_activity",
-                  "Social_activity", "age_2010")
+if (!is.null(imp_mice10_elsa$loggedEvents)) {
+  cat("\nMICE logged events (ELSA 2010):\n")
+  print(imp_mice10_elsa$loggedEvents)
+}
+
+# ---- 6f. Merge the completed covariates back ---------------------------
+# Single completion (imputation 1), as in HRS. Only the analysis covariates
+# are replaced; Gender, Race and the primary study variables keep their
+# ORIGINAL values, including NAs.
+imp10_elsa_complete1 <- complete(imp_mice10_elsa, 1)
 
 elsa10_clean <- elsa_2010 %>%
   mutate(idauniq = as.character(idauniq)) %>%
-  dplyr::select(-all_of(imputed_vars)) %>%
+  dplyr::select(-all_of(imputed_vars10)) %>%
   left_join(
     imp10_elsa_complete1 %>%
       mutate(idauniq = as.character(idauniq)) %>%
-      dplyr::select(idauniq, all_of(imputed_vars)),
+      dplyr::select(idauniq, all_of(imputed_vars10)),
     by = "idauniq"
   )
 
 ELSA_2010 <- elsa10_clean
+
+stopifnot(nrow(ELSA_2010) == nrow(elsa_2010))
 
 ```
 
@@ -3193,52 +3557,115 @@ elsa_2012 <- elsa_cov_2012 %>%
   left_join(elsa_fi_2012,     by = c("idauniq", "year"))
 
 
-# 6. Multiple imputation (single completion) -----------------------------
-# Education excluded because it is all-NA in W6.
+# ==========================================================================
+# 6. Multiple imputation (MICE) — ELSA wave 6 (2012)
+# ==========================================================================
+# Identical specification to waves 1-5 — see the design notes in the 2002
+# block. From W6 Education is an all-NA placeholder (ELSA fielded no
+# qualification item), so it is detected and excluded automatically below,
+# and is back-filled from W1-W5 at the pooled stage instead.
+
+analysis_covars12 <- c("age_2012", "Education", "Marital_status", "Employment",
+                       "Smoking", "Alcohol", "Physical_activity", "Social_activity")
+
+# ---- 6a. Imputation frame ----------------------------------------------
+# birth_year is not a predictor (near-collinear with age); age is resolved
+# deterministically where a birth year exists and pmm handles the residual
+# cases. Wave 6 fieldwork spanned 2012-2013, so that value can be ±1 year.
 imp12_elsa <- elsa_2012 %>%
-  mutate(idauniq = as.character(idauniq)) %>%
   transmute(
-    idauniq,
+    idauniq    = as.character(idauniq),
+    age_2012   = coalesce(as.numeric(age_2012), 2012 - as.numeric(birth_year)),
     Gender     = factor(Gender, levels = c(1, 2)),
-    age_2012   = as.numeric(age_2012),
-    birth_year = as.numeric(birth_year),            # auxiliary
-    Race       = factor(Race, levels = c(0, 1)),    # auxiliary
+    Race       = factor(Race,   levels = c(0, 1)),
+    Education  = ordered(Education, levels = c(0, 1, 2)),
     across(c(Marital_status, Employment, Smoking, Alcohol,
              Physical_activity, Social_activity),
            ~ factor(.x, levels = c(0, 1)))
   )
 
-meth <- make.method(imp12_elsa)
-meth[c("idauniq", "Gender", "birth_year", "Race")] <- ""
-meth["age_2012"] <- "pmm"
-meth[c("Marital_status", "Employment", "Smoking", "Alcohol",
-       "Physical_activity", "Social_activity")] <- "logreg"
+# Variables with no observed values (Education from W6 onward) cannot be
+# imputed; drop them here and leave them untouched in the analysis data.
+all_missing12 <- names(imp12_elsa)[colSums(!is.na(imp12_elsa)) == 0]
+if (length(all_missing12) > 0) {
+  message("ELSA 2012 — no observed values, excluded from imputation: ",
+          paste(all_missing12, collapse = ", "))
+  imp12_elsa <- imp12_elsa %>% dplyr::select(-all_of(all_missing12))
+}
+imputed_vars12 <- setdiff(analysis_covars12, all_missing12)
 
-pred <- make.predictorMatrix(imp12_elsa)
-pred[, "idauniq"] <- 0
-pred["idauniq", ] <- 0
+# ---- 6b. Quantify missingness (for the Methods text) -------------------
+miss_pct12 <- sapply(imp12_elsa, function(x) mean(is.na(x)) * 100)
+cat("ELSA 2012 — percentage missing per variable:\n")
+print(round(miss_pct12, 2))
 
+miss_cov12 <- miss_pct12[intersect(imputed_vars12, names(miss_pct12))]
+miss_cov12 <- miss_cov12[miss_cov12 > 0]
+if (length(miss_cov12) > 0) {
+  cat(sprintf("\nMean missing across analysis covariates: %.2f%%\n",
+              mean(miss_cov12)))
+  cat(sprintf("Maximum missing: %.2f%% (%s)\n",
+              max(miss_cov12), names(which.max(miss_cov12))))
+} else {
+  cat("\nNo missing values among analysis covariates.\n")
+}
+
+# ---- 6c. Imputation method per variable --------------------------------
+meth12 <- make.method(imp12_elsa)
+meth12["idauniq"]  <- ""
+meth12["age_2012"] <- "pmm"
+meth12[intersect("Education", names(imp12_elsa))] <- "polr"
+meth12[intersect(c("Gender", "Race", "Marital_status", "Employment", "Smoking",
+                   "Alcohol", "Physical_activity", "Social_activity"),
+                 names(imp12_elsa))] <- "logreg"
+# Variables with no missing values are not imputed (mice requirement).
+meth12[colSums(is.na(imp12_elsa)) == 0] <- ""
+
+# ---- 6d. Predictor matrix ---------------------------------------------
+pred12 <- make.predictorMatrix(imp12_elsa)
+pred12[, "idauniq"] <- 0
+pred12["idauniq", ] <- 0
+
+# GUARD: no incomplete variable may be used as a predictor without itself
+# being imputed, otherwise NAs leak into every imputation model.
+incomplete12 <- names(imp12_elsa)[colSums(is.na(imp12_elsa)) > 0]
+stopifnot(all(meth12[incomplete12] != ""))
+
+# ---- 6e. Run MICE: 20 imputed datasets, 10 iterations ------------------
 set.seed(3)
-imp_mice12_elsa      <- mice(imp12_elsa, m = 20, maxit = 10,
-                             method = meth, predictorMatrix = pred,
-                             printFlag = TRUE)
-imp12_elsa_complete1 <- complete(imp_mice12_elsa, 1)
+imp_mice12_elsa <- mice(
+  imp12_elsa,
+  m               = 20,
+  maxit           = 10,
+  method          = meth12,
+  predictorMatrix = pred12,
+  printFlag       = TRUE
+)
 
-imputed_vars_w6 <- c("Marital_status", "Employment", "Smoking", "Alcohol",
-                     "Physical_activity", "Social_activity", "age_2012")
+if (!is.null(imp_mice12_elsa$loggedEvents)) {
+  cat("\nMICE logged events (ELSA 2012):\n")
+  print(imp_mice12_elsa$loggedEvents)
+}
+
+# ---- 6f. Merge the completed covariates back ---------------------------
+# Single completion (imputation 1), as in HRS. Only the analysis covariates
+# are replaced; Gender, Race and the primary study variables keep their
+# ORIGINAL values, including NAs.
+imp12_elsa_complete1 <- complete(imp_mice12_elsa, 1)
 
 elsa12_clean <- elsa_2012 %>%
   mutate(idauniq = as.character(idauniq)) %>%
-  dplyr::select(-all_of(imputed_vars_w6)) %>%
+  dplyr::select(-all_of(imputed_vars12)) %>%
   left_join(
     imp12_elsa_complete1 %>%
       mutate(idauniq = as.character(idauniq)) %>%
-      dplyr::select(idauniq, all_of(imputed_vars_w6)),
+      dplyr::select(idauniq, all_of(imputed_vars12)),
     by = "idauniq"
   )
 
-
 ELSA_2012 <- elsa12_clean
+
+stopifnot(nrow(ELSA_2012) == nrow(elsa_2012))
 
 ```
 
@@ -3689,51 +4116,114 @@ elsa_2014 <- elsa_cov_2014 %>%
   left_join(elsa_fi_2014,     by = c("idauniq", "year"))
 
 
-# 6. Multiple imputation (single completion) -----------------------------
-# Education excluded — all-NA in W7.
+# ==========================================================================
+# 6. Multiple imputation (MICE) — ELSA wave 7 (2014)
+# ==========================================================================
+# Identical specification to waves 1-6 — see the design notes in the 2002
+# block. Education is an all-NA placeholder at W7 and is detected and
+# excluded automatically below.
+
+analysis_covars14 <- c("age_2014", "Education", "Marital_status", "Employment",
+                       "Smoking", "Alcohol", "Physical_activity", "Social_activity")
+
+# ---- 6a. Imputation frame ----------------------------------------------
+# birth_year is not a predictor (near-collinear with age); age is resolved
+# deterministically where a birth year exists and pmm handles the residual
+# cases. Wave 7 fieldwork spanned 2014-2015, so that value can be ±1 year.
 imp14_elsa <- elsa_2014 %>%
-  mutate(idauniq = as.character(idauniq)) %>%
   transmute(
-    idauniq,
+    idauniq    = as.character(idauniq),
+    age_2014   = coalesce(as.numeric(age_2014), 2014 - as.numeric(birth_year)),
     Gender     = factor(Gender, levels = c(1, 2)),
-    age_2014   = as.numeric(age_2014),
-    birth_year = as.numeric(birth_year),            # auxiliary
-    Race       = factor(Race, levels = c(0, 1)),    # auxiliary
+    Race       = factor(Race,   levels = c(0, 1)),
+    Education  = ordered(Education, levels = c(0, 1, 2)),
     across(c(Marital_status, Employment, Smoking, Alcohol,
              Physical_activity, Social_activity),
            ~ factor(.x, levels = c(0, 1)))
   )
 
-meth <- make.method(imp14_elsa)
-meth[c("idauniq", "Gender", "birth_year", "Race")] <- ""
-meth["age_2014"] <- "pmm"
-meth[c("Marital_status", "Employment", "Smoking", "Alcohol",
-       "Physical_activity", "Social_activity")] <- "logreg"
+# Variables with no observed values (Education from W6 onward) cannot be
+# imputed; drop them here and leave them untouched in the analysis data.
+all_missing14 <- names(imp14_elsa)[colSums(!is.na(imp14_elsa)) == 0]
+if (length(all_missing14) > 0) {
+  message("ELSA 2014 — no observed values, excluded from imputation: ",
+          paste(all_missing14, collapse = ", "))
+  imp14_elsa <- imp14_elsa %>% dplyr::select(-all_of(all_missing14))
+}
+imputed_vars14 <- setdiff(analysis_covars14, all_missing14)
 
-pred <- make.predictorMatrix(imp14_elsa)
-pred[, "idauniq"] <- 0
-pred["idauniq", ] <- 0
+# ---- 6b. Quantify missingness (for the Methods text) -------------------
+miss_pct14 <- sapply(imp14_elsa, function(x) mean(is.na(x)) * 100)
+cat("ELSA 2014 — percentage missing per variable:\n")
+print(round(miss_pct14, 2))
 
+miss_cov14 <- miss_pct14[intersect(imputed_vars14, names(miss_pct14))]
+miss_cov14 <- miss_cov14[miss_cov14 > 0]
+if (length(miss_cov14) > 0) {
+  cat(sprintf("\nMean missing across analysis covariates: %.2f%%\n",
+              mean(miss_cov14)))
+  cat(sprintf("Maximum missing: %.2f%% (%s)\n",
+              max(miss_cov14), names(which.max(miss_cov14))))
+} else {
+  cat("\nNo missing values among analysis covariates.\n")
+}
+
+# ---- 6c. Imputation method per variable --------------------------------
+meth14 <- make.method(imp14_elsa)
+meth14["idauniq"]  <- ""
+meth14["age_2014"] <- "pmm"
+meth14[intersect("Education", names(imp14_elsa))] <- "polr"
+meth14[intersect(c("Gender", "Race", "Marital_status", "Employment", "Smoking",
+                   "Alcohol", "Physical_activity", "Social_activity"),
+                 names(imp14_elsa))] <- "logreg"
+# Variables with no missing values are not imputed (mice requirement).
+meth14[colSums(is.na(imp14_elsa)) == 0] <- ""
+
+# ---- 6d. Predictor matrix ---------------------------------------------
+pred14 <- make.predictorMatrix(imp14_elsa)
+pred14[, "idauniq"] <- 0
+pred14["idauniq", ] <- 0
+
+# GUARD: no incomplete variable may be used as a predictor without itself
+# being imputed, otherwise NAs leak into every imputation model.
+incomplete14 <- names(imp14_elsa)[colSums(is.na(imp14_elsa)) > 0]
+stopifnot(all(meth14[incomplete14] != ""))
+
+# ---- 6e. Run MICE: 20 imputed datasets, 10 iterations ------------------
 set.seed(3)
-imp_mice14_elsa      <- mice(imp14_elsa, m = 20, maxit = 10,
-                             method = meth, predictorMatrix = pred,
-                             printFlag = TRUE)
-imp14_elsa_complete1 <- complete(imp_mice14_elsa, 1)
+imp_mice14_elsa <- mice(
+  imp14_elsa,
+  m               = 20,
+  maxit           = 10,
+  method          = meth14,
+  predictorMatrix = pred14,
+  printFlag       = TRUE
+)
 
-imputed_vars_w7 <- c("Marital_status", "Employment", "Smoking", "Alcohol",
-                     "Physical_activity", "Social_activity", "age_2014")
+if (!is.null(imp_mice14_elsa$loggedEvents)) {
+  cat("\nMICE logged events (ELSA 2014):\n")
+  print(imp_mice14_elsa$loggedEvents)
+}
+
+# ---- 6f. Merge the completed covariates back ---------------------------
+# Single completion (imputation 1), as in HRS. Only the analysis covariates
+# are replaced; Gender, Race and the primary study variables keep their
+# ORIGINAL values, including NAs.
+imp14_elsa_complete1 <- complete(imp_mice14_elsa, 1)
 
 elsa14_clean <- elsa_2014 %>%
   mutate(idauniq = as.character(idauniq)) %>%
-  dplyr::select(-all_of(imputed_vars_w7)) %>%
+  dplyr::select(-all_of(imputed_vars14)) %>%
   left_join(
     imp14_elsa_complete1 %>%
       mutate(idauniq = as.character(idauniq)) %>%
-      dplyr::select(idauniq, all_of(imputed_vars_w7)),
+      dplyr::select(idauniq, all_of(imputed_vars14)),
     by = "idauniq"
   )
 
 ELSA_2014 <- elsa14_clean
+
+stopifnot(nrow(ELSA_2014) == nrow(elsa_2014))
 
 ```
 
@@ -4193,52 +4683,114 @@ elsa_2016 <- elsa_cov_2016 %>%
   left_join(elsa_fi_2016,     by = c("idauniq", "year"))
 
 
-# 6. Multiple imputation (single completion) -----------------------------
-# Education excluded — all-NA in W8.
+# ==========================================================================
+# 6. Multiple imputation (MICE) — ELSA wave 8 (2016)
+# ==========================================================================
+# Identical specification to waves 1-7 — see the design notes in the 2002
+# block. Education is an all-NA placeholder at W8 and is detected and
+# excluded automatically below.
+
+analysis_covars16 <- c("age_2016", "Education", "Marital_status", "Employment",
+                       "Smoking", "Alcohol", "Physical_activity", "Social_activity")
+
+# ---- 6a. Imputation frame ----------------------------------------------
+# birth_year is not a predictor (near-collinear with age); age is resolved
+# deterministically where a birth year exists and pmm handles the residual
+# cases. Wave 8 fieldwork spanned 2016-2017, so that value can be ±1 year.
 imp16_elsa <- elsa_2016 %>%
-  mutate(idauniq = as.character(idauniq)) %>%
   transmute(
-    idauniq,
+    idauniq    = as.character(idauniq),
+    age_2016   = coalesce(as.numeric(age_2016), 2016 - as.numeric(birth_year)),
     Gender     = factor(Gender, levels = c(1, 2)),
-    age_2016   = as.numeric(age_2016),
-    birth_year = as.numeric(birth_year),            # auxiliary
-    Race       = factor(Race, levels = c(0, 1)),    # auxiliary
+    Race       = factor(Race,   levels = c(0, 1)),
+    Education  = ordered(Education, levels = c(0, 1, 2)),
     across(c(Marital_status, Employment, Smoking, Alcohol,
              Physical_activity, Social_activity),
            ~ factor(.x, levels = c(0, 1)))
   )
 
-meth <- make.method(imp16_elsa)
-meth[c("idauniq", "Gender", "birth_year", "Race")] <- ""
-meth["age_2016"] <- "pmm"
-meth[c("Marital_status", "Employment", "Smoking", "Alcohol",
-       "Physical_activity", "Social_activity")] <- "logreg"
+# Variables with no observed values (Education from W6 onward) cannot be
+# imputed; drop them here and leave them untouched in the analysis data.
+all_missing16 <- names(imp16_elsa)[colSums(!is.na(imp16_elsa)) == 0]
+if (length(all_missing16) > 0) {
+  message("ELSA 2016 — no observed values, excluded from imputation: ",
+          paste(all_missing16, collapse = ", "))
+  imp16_elsa <- imp16_elsa %>% dplyr::select(-all_of(all_missing16))
+}
+imputed_vars16 <- setdiff(analysis_covars16, all_missing16)
 
-pred <- make.predictorMatrix(imp16_elsa)
-pred[, "idauniq"] <- 0
-pred["idauniq", ] <- 0
+# ---- 6b. Quantify missingness (for the Methods text) -------------------
+miss_pct16 <- sapply(imp16_elsa, function(x) mean(is.na(x)) * 100)
+cat("ELSA 2016 — percentage missing per variable:\n")
+print(round(miss_pct16, 2))
 
+miss_cov16 <- miss_pct16[intersect(imputed_vars16, names(miss_pct16))]
+miss_cov16 <- miss_cov16[miss_cov16 > 0]
+if (length(miss_cov16) > 0) {
+  cat(sprintf("\nMean missing across analysis covariates: %.2f%%\n",
+              mean(miss_cov16)))
+  cat(sprintf("Maximum missing: %.2f%% (%s)\n",
+              max(miss_cov16), names(which.max(miss_cov16))))
+} else {
+  cat("\nNo missing values among analysis covariates.\n")
+}
+
+# ---- 6c. Imputation method per variable --------------------------------
+meth16 <- make.method(imp16_elsa)
+meth16["idauniq"]  <- ""
+meth16["age_2016"] <- "pmm"
+meth16[intersect("Education", names(imp16_elsa))] <- "polr"
+meth16[intersect(c("Gender", "Race", "Marital_status", "Employment", "Smoking",
+                   "Alcohol", "Physical_activity", "Social_activity"),
+                 names(imp16_elsa))] <- "logreg"
+# Variables with no missing values are not imputed (mice requirement).
+meth16[colSums(is.na(imp16_elsa)) == 0] <- ""
+
+# ---- 6d. Predictor matrix ---------------------------------------------
+pred16 <- make.predictorMatrix(imp16_elsa)
+pred16[, "idauniq"] <- 0
+pred16["idauniq", ] <- 0
+
+# GUARD: no incomplete variable may be used as a predictor without itself
+# being imputed, otherwise NAs leak into every imputation model.
+incomplete16 <- names(imp16_elsa)[colSums(is.na(imp16_elsa)) > 0]
+stopifnot(all(meth16[incomplete16] != ""))
+
+# ---- 6e. Run MICE: 20 imputed datasets, 10 iterations ------------------
 set.seed(3)
-imp_mice16_elsa      <- mice(imp16_elsa, m = 20, maxit = 10,
-                             method = meth, predictorMatrix = pred,
-                             printFlag = TRUE)
-imp16_elsa_complete1 <- complete(imp_mice16_elsa, 1)
+imp_mice16_elsa <- mice(
+  imp16_elsa,
+  m               = 20,
+  maxit           = 10,
+  method          = meth16,
+  predictorMatrix = pred16,
+  printFlag       = TRUE
+)
 
-imputed_vars_w8 <- c("Marital_status", "Employment", "Smoking", "Alcohol",
-                     "Physical_activity", "Social_activity", "age_2016")
+if (!is.null(imp_mice16_elsa$loggedEvents)) {
+  cat("\nMICE logged events (ELSA 2016):\n")
+  print(imp_mice16_elsa$loggedEvents)
+}
+
+# ---- 6f. Merge the completed covariates back ---------------------------
+# Single completion (imputation 1), as in HRS. Only the analysis covariates
+# are replaced; Gender, Race and the primary study variables keep their
+# ORIGINAL values, including NAs.
+imp16_elsa_complete1 <- complete(imp_mice16_elsa, 1)
 
 elsa16_clean <- elsa_2016 %>%
   mutate(idauniq = as.character(idauniq)) %>%
-  dplyr::select(-all_of(imputed_vars_w8)) %>%
+  dplyr::select(-all_of(imputed_vars16)) %>%
   left_join(
     imp16_elsa_complete1 %>%
       mutate(idauniq = as.character(idauniq)) %>%
-      dplyr::select(idauniq, all_of(imputed_vars_w8)),
+      dplyr::select(idauniq, all_of(imputed_vars16)),
     by = "idauniq"
   )
 
-
 ELSA_2016 <- elsa16_clean
+
+stopifnot(nrow(ELSA_2016) == nrow(elsa_2016))
 
 ```
 
@@ -4688,51 +5240,114 @@ elsa_2018 <- elsa_cov_2018 %>%
   left_join(elsa_fi_2018,     by = c("idauniq", "year"))
 
 
-# 6. Multiple imputation (single completion) -----------------------------
-# Education excluded — all-NA in W9.
+# ==========================================================================
+# 6. Multiple imputation (MICE) — ELSA wave 9 (2018/19)
+# ==========================================================================
+# Identical specification to waves 1-8 — see the design notes in the 2002
+# block. Education is an all-NA placeholder at W9 and is detected and
+# excluded automatically below.
+
+analysis_covars18 <- c("age_2018", "Education", "Marital_status", "Employment",
+                       "Smoking", "Alcohol", "Physical_activity", "Social_activity")
+
+# ---- 6a. Imputation frame ----------------------------------------------
+# birth_year is not a predictor (near-collinear with age); age is resolved
+# deterministically where a birth year exists and pmm handles the residual
+# cases. Wave 9 fieldwork spanned 2018-2019, so that value can be ±1 year.
 imp18_elsa <- elsa_2018 %>%
-  mutate(idauniq = as.character(idauniq)) %>%
   transmute(
-    idauniq,
+    idauniq    = as.character(idauniq),
+    age_2018   = coalesce(as.numeric(age_2018), 2018 - as.numeric(birth_year)),
     Gender     = factor(Gender, levels = c(1, 2)),
-    age_2018   = as.numeric(age_2018),
-    birth_year = as.numeric(birth_year),            # auxiliary
-    Race       = factor(Race, levels = c(0, 1)),    # auxiliary
+    Race       = factor(Race,   levels = c(0, 1)),
+    Education  = ordered(Education, levels = c(0, 1, 2)),
     across(c(Marital_status, Employment, Smoking, Alcohol,
              Physical_activity, Social_activity),
            ~ factor(.x, levels = c(0, 1)))
   )
 
-meth <- make.method(imp18_elsa)
-meth[c("idauniq", "Gender", "birth_year", "Race")] <- ""
-meth["age_2018"] <- "pmm"
-meth[c("Marital_status", "Employment", "Smoking", "Alcohol",
-       "Physical_activity", "Social_activity")] <- "logreg"
+# Variables with no observed values (Education from W6 onward) cannot be
+# imputed; drop them here and leave them untouched in the analysis data.
+all_missing18 <- names(imp18_elsa)[colSums(!is.na(imp18_elsa)) == 0]
+if (length(all_missing18) > 0) {
+  message("ELSA 2018 — no observed values, excluded from imputation: ",
+          paste(all_missing18, collapse = ", "))
+  imp18_elsa <- imp18_elsa %>% dplyr::select(-all_of(all_missing18))
+}
+imputed_vars18 <- setdiff(analysis_covars18, all_missing18)
 
-pred <- make.predictorMatrix(imp18_elsa)
-pred[, "idauniq"] <- 0
-pred["idauniq", ] <- 0
+# ---- 6b. Quantify missingness (for the Methods text) -------------------
+miss_pct18 <- sapply(imp18_elsa, function(x) mean(is.na(x)) * 100)
+cat("ELSA 2018 — percentage missing per variable:\n")
+print(round(miss_pct18, 2))
 
+miss_cov18 <- miss_pct18[intersect(imputed_vars18, names(miss_pct18))]
+miss_cov18 <- miss_cov18[miss_cov18 > 0]
+if (length(miss_cov18) > 0) {
+  cat(sprintf("\nMean missing across analysis covariates: %.2f%%\n",
+              mean(miss_cov18)))
+  cat(sprintf("Maximum missing: %.2f%% (%s)\n",
+              max(miss_cov18), names(which.max(miss_cov18))))
+} else {
+  cat("\nNo missing values among analysis covariates.\n")
+}
+
+# ---- 6c. Imputation method per variable --------------------------------
+meth18 <- make.method(imp18_elsa)
+meth18["idauniq"]  <- ""
+meth18["age_2018"] <- "pmm"
+meth18[intersect("Education", names(imp18_elsa))] <- "polr"
+meth18[intersect(c("Gender", "Race", "Marital_status", "Employment", "Smoking",
+                   "Alcohol", "Physical_activity", "Social_activity"),
+                 names(imp18_elsa))] <- "logreg"
+# Variables with no missing values are not imputed (mice requirement).
+meth18[colSums(is.na(imp18_elsa)) == 0] <- ""
+
+# ---- 6d. Predictor matrix ---------------------------------------------
+pred18 <- make.predictorMatrix(imp18_elsa)
+pred18[, "idauniq"] <- 0
+pred18["idauniq", ] <- 0
+
+# GUARD: no incomplete variable may be used as a predictor without itself
+# being imputed, otherwise NAs leak into every imputation model.
+incomplete18 <- names(imp18_elsa)[colSums(is.na(imp18_elsa)) > 0]
+stopifnot(all(meth18[incomplete18] != ""))
+
+# ---- 6e. Run MICE: 20 imputed datasets, 10 iterations ------------------
 set.seed(3)
-imp_mice18_elsa      <- mice(imp18_elsa, m = 20, maxit = 10,
-                             method = meth, predictorMatrix = pred,
-                             printFlag = TRUE)
-imp18_elsa_complete1 <- complete(imp_mice18_elsa, 1)
+imp_mice18_elsa <- mice(
+  imp18_elsa,
+  m               = 20,
+  maxit           = 10,
+  method          = meth18,
+  predictorMatrix = pred18,
+  printFlag       = TRUE
+)
 
-imputed_vars_w9 <- c("Marital_status", "Employment", "Smoking", "Alcohol",
-                     "Physical_activity", "Social_activity", "age_2018")
+if (!is.null(imp_mice18_elsa$loggedEvents)) {
+  cat("\nMICE logged events (ELSA 2018):\n")
+  print(imp_mice18_elsa$loggedEvents)
+}
+
+# ---- 6f. Merge the completed covariates back ---------------------------
+# Single completion (imputation 1), as in HRS. Only the analysis covariates
+# are replaced; Gender, Race and the primary study variables keep their
+# ORIGINAL values, including NAs.
+imp18_elsa_complete1 <- complete(imp_mice18_elsa, 1)
 
 elsa18_clean <- elsa_2018 %>%
   mutate(idauniq = as.character(idauniq)) %>%
-  dplyr::select(-all_of(imputed_vars_w9)) %>%
+  dplyr::select(-all_of(imputed_vars18)) %>%
   left_join(
     imp18_elsa_complete1 %>%
       mutate(idauniq = as.character(idauniq)) %>%
-      dplyr::select(idauniq, all_of(imputed_vars_w9)),
+      dplyr::select(idauniq, all_of(imputed_vars18)),
     by = "idauniq"
   )
 
-ELSA_2018 <- elsa18_clean 
+ELSA_2018 <- elsa18_clean
+
+stopifnot(nrow(ELSA_2018) == nrow(elsa_2018))
 
 ```
 

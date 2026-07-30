@@ -1,18 +1,7 @@
 ---
-title: "HRS — multi-state & Cox models (sensory impairment, frailty, dementia)"
+title: "R Notebook"
 output: html_notebook
 ---
-
-<!--
-  Analysis code for the manuscript on sensory impairment, frailty, and incident
-  dementia in the HRS (United States) and ELSA (England) cohorts.
-
-  DATA NOT INCLUDED. HRS and ELSA are restricted-access and cannot be
-  redistributed. Obtain the source data from the data providers and place them
-  under data/ (git-ignored) so the relative paths in this notebook resolve.
-  See README.md for setup and run order.
--->
-
 
 ```{r}
 library(haven)
@@ -31,8 +20,9 @@ library(scales)
 
 # Load data
 ```{r}
-hrs_long_path <- "data/hrs_long.csv"
+data_dir <- "data"
 
+hrs_long_path <- file.path(data_dir, "hrs_long.csv")
 hrs_long <- read_csv(
   hrs_long_path,
   col_types = cols(
@@ -42,6 +32,20 @@ hrs_long <- read_csv(
   )
 )
 
+# FIX D: load death tracking persisted by HRS_dataextract.Rmd, so this notebook
+# no longer depends on death_track objects lingering in the R session.
+death_track <- readRDS(file.path(data_dir, "death_track.rds"))
+
+# Integrity check: exactly one row per (hhidpn, year). Catches duplication
+# bugs (e.g. the earlier 2004 x20 MICE-stacking issue) before they propagate.
+dup_check <- hrs_long %>% dplyr::count(hhidpn, year) %>% dplyr::filter(n != 1)
+if (nrow(dup_check) > 0) {
+  stop(sprintf("hrs_long has %d duplicate (hhidpn, year) row(s); fix upstream.",
+               nrow(dup_check)))
+}
+cat("Loaded hrs_long:", nrow(hrs_long), "rows; death_track:",
+    nrow(death_track), "individuals; uniqueness check passed.\n")
+
 baseline_start <- 2004L
 baseline_end   <- 2010L
 
@@ -50,8 +54,15 @@ hrs_long_fixed <- hrs_long %>%
   arrange(hhidpn, year) %>%
   group_by(hhidpn) %>%
   mutate(
-    dementia = as.integer(cummax(coalesce(dementia, 0L)))
+    dementia_observed = dementia,
+    ever_dementia      = cummax(coalesce(dementia_observed, 0L)),
+    dementia = case_when(
+      ever_dementia == 1L       ~ 1L,
+      !is.na(dementia_observed) ~ dementia_observed,
+      TRUE                       ~ NA_integer_
+    )
   ) %>%
+  dplyr::select(-dementia_observed, -ever_dementia) %>%
   ungroup()
 
 revert_check <- hrs_long_fixed %>%
@@ -65,6 +76,16 @@ cat("\nDementia person-waves after cummax:",
     sum(hrs_long_fixed$dementia == 1, na.rm = TRUE), "\n")
 cat("Unique dementia people:",
     n_distinct(hrs_long_fixed$hhidpn[hrs_long_fixed$dementia == 1]), "\n")
+
+cat("\nPerson-waves with unknown dementia status (NA) after fix:",
+    sum(is.na(hrs_long_fixed$dementia)), "\n")
+
+n_never_assessed <- hrs_long_fixed %>%
+  group_by(hhidpn) %>%
+  summarise(all_na = all(is.na(dementia)), .groups = "drop") %>%
+  summarise(n = sum(all_na)) %>%
+  pull(n)
+cat("People never assessed for dementia in any wave:", n_never_assessed, "\n")
 
 # 1) Identify baseline year per person
 #    Require: age >= 50, dementia == 0, hearing_loss, vision_overall, Frailty_status not missing
@@ -231,7 +252,7 @@ incident <- panel_df_eligible %>%
     baseline_year  = first(baseline_year),
     last_year      = max(year),
     ever_dem       = max(dementia, na.rm = TRUE),
-    first_dem_year = if (any(dementia == 1)) min(year[dementia == 1]) else NA_integer_,
+    first_dem_year = if (any(dementia == 1, na.rm = TRUE)) min(year[dementia == 1], na.rm = TRUE) else NA_integer_,  # FIX B: NA-safe now that dementia can be NA
     .groups = "drop"
   ) %>%
   mutate(incident = as.integer(ever_dem == 1 & first_dem_year > baseline_year))
@@ -290,7 +311,7 @@ fu_tbl <- panel_df_eligible %>%
     baseline_year  = first(baseline_year),
     last_year      = max(year),
     ever_dem       = as.integer(any(dementia == 1, na.rm = TRUE)),
-    first_dem_year = if (any(dementia == 1, na.rm = TRUE)) min(year[dementia == 1]) else NA_integer_,
+    first_dem_year = if (any(dementia == 1, na.rm = TRUE)) min(year[dementia == 1], na.rm = TRUE) else NA_integer_,  # FIX B: NA-safe min()
     .groups = "drop"
   ) %>%
   mutate(
@@ -451,7 +472,7 @@ print(table1_df, n = Inf)
 # Table 2: Baseline Year Distribution with Incident Dementia
 # ======================================================================
 
-table2 <- incident_tbl %>%
+table2 <- fu_tbl %>%   # FIX C: was `incident_tbl` (never defined); fu_tbl (built above) has baseline_year + incident
   group_by(baseline_year) %>%
   summarise(
     n_participants = n(),
@@ -562,6 +583,12 @@ death_rows <- death_tbl %>%
   )
 
 # 4) Construct clinical states (1-7) on interview rows
+#
+# NOTE (documented modeling assumption, not a bug -- same decision as the
+# vision model): when hearing_loss or Frailty_status is missing at a
+# specific wave but the person has enough OTHER valid waves to meet
+# eligibility, that wave's state is inferred from the nearest known onset
+# time (t_hl / t_f) rather than marked unknown. Kept as-is by design.
 ms_states <- ms_base %>%
   group_by(hhidpn) %>%
   mutate(
@@ -571,7 +598,6 @@ ms_states <- ms_base %>%
               min(time[Frailty_status == 1], na.rm = TRUE) else NA_real_,
     t_dem = if (any(dementia       == 1, na.rm = TRUE))
               min(time[dementia       == 1], na.rm = TRUE) else NA_real_,
-
     order_type = case_when(
       !is.na(t_hl) & !is.na(t_f) & t_hl <  t_f  ~ "HL_first",
       !is.na(t_hl) & !is.na(t_f) & t_f  <  t_hl ~ "Frail_first",
@@ -601,11 +627,14 @@ ms_states <- ms_base %>%
   ) %>%
   dplyr::select(hhidpn, time, state)
 
-
 # 5) Combine interview states with death rows
 # 6) Truncate follow-up AFTER death (death is absorbing); keep persons with >=2 obs
+#
+# FIX: same issue as the vision pipeline -- ms_states was listed first in
+# bind_rows(), so a stable sort + slice(1) always kept the interview row
+# over a same-day death row. This ranks death (state 8) first on ties.
 ms_dat <- bind_rows(ms_states, death_rows) %>%
-  arrange(hhidpn, time) %>%
+  arrange(hhidpn, time, desc(state == 8L)) %>%   # death wins any same-time tie
   group_by(hhidpn, time) %>%
   slice(1) %>%                                  # collapse duplicates at same t
   ungroup() %>%
@@ -657,11 +686,15 @@ Q[6, 7] <- 0.05; Q[6, 8] <- 0.05
 diag(Q) <- NA
 
 # Fit HEARING model
-fit_hearing <- msm(state ~ time,
-                   subject  = hhidpn, data = ms_dat,
-                   qmatrix  = Q,
-                   gen.inits = TRUE,
-                   control  = list(fnscale = 5000, maxit = 5000))
+fit_hearing <- msm(
+  state ~ time,
+  subject    = hhidpn,
+  data       = ms_dat,
+  qmatrix    = Q,
+  deathexact = 8,     # FIX: state 8 (Death) times are exact, not panel-observed
+  gen.inits  = TRUE,
+  control    = list(fnscale = 5000, maxit = 5000)
+)
 
 # ---- Diagnostics ----
 Q_est <- qmatrix.msm(fit_hearing);                                 print(Q_est)
@@ -870,6 +903,14 @@ death_rows_vis <- death_tbl_vis %>%
   )
 
 # 4) Construct clinical states (1-7) on interview rows
+#
+# NOTE (documented modeling assumption, not a bug): when vision_overall or
+# Frailty_status is missing at a specific wave but the person has enough
+# OTHER valid waves to meet eligibility (>=2 non-missing per measure), that
+# wave's state is inferred from the nearest known onset time (t_vl / t_f)
+# rather than marked unknown. This treats vision impairment and frailty as
+# non-reversible once onset is observed, consistent with how dementia is
+# already handled elsewhere in this pipeline. Kept as-is by design decision.
 ms_states_vis <- ms_base_vis %>%
   group_by(hhidpn) %>%
   mutate(
@@ -879,7 +920,6 @@ ms_states_vis <- ms_base_vis %>%
               min(time[Frailty_status == 1], na.rm = TRUE) else NA_real_,
     t_dem = if (any(dementia       == 1, na.rm = TRUE))
               min(time[dementia       == 1], na.rm = TRUE) else NA_real_,
-
     order_type = case_when(
       !is.na(t_vl) & !is.na(t_f) & t_vl <  t_f  ~ "VL_first",
       !is.na(t_vl) & !is.na(t_f) & t_f  <  t_vl ~ "Frail_first",
@@ -909,12 +949,16 @@ ms_states_vis <- ms_base_vis %>%
   ) %>%
   dplyr::select(hhidpn, time, state)
 
-
 # 5) Combine interview states with death rows
 # 6) Truncate follow-up AFTER death (death is absorbing); keep persons with >=2 obs
-
+#
+# FIX: previously arrange(hhidpn, time) followed by slice(1) relied on a
+# stable sort, and since ms_states_vis was listed first in bind_rows(),
+# an interview row would always win a same-day tie against a death row --
+# silently discarding the death. This explicitly ranks death (state 8)
+# first on any tie before collapsing, so a same-day death is never dropped.
 ms_dat_vis <- bind_rows(ms_states_vis, death_rows_vis) %>%
-  arrange(hhidpn, time) %>%
+  arrange(hhidpn, time, desc(state == 8L)) %>%   # death wins any same-time tie
   group_by(hhidpn, time) %>%
   slice(1) %>%                                  # collapse same-time records
   ungroup() %>%
@@ -985,11 +1029,12 @@ diag(Q_vis) <- NA
 # Fit VISION model
 fit_vision <- msm(
   state ~ time,
-  subject  = hhidpn,
-  data     = ms_dat_vis,
-  qmatrix  = Q_vis,
-  gen.inits = TRUE,
-  control  = list(fnscale = 5000, maxit = 3000)
+  subject    = hhidpn,
+  data       = ms_dat_vis,
+  qmatrix    = Q_vis,
+  deathexact = 8,     
+  gen.inits  = TRUE,
+  control    = list(fnscale = 5000, maxit = 3000)
 )
 
 # ---- Diagnostics ----
@@ -2579,38 +2624,86 @@ write.csv(paf_subgroup_all,  "results/subgroup_HRS_paf.csv",    row.names = FALS
 #   Death is assigned only to the LAST observed interval for individuals
 #   who died without an incident dementia diagnosis.
 # ----------------------------------------------------------------------
-tv_fg <- tv_cc %>%
+
+death_time_tbl <- tv_cc %>%
+  distinct(hhidpn, baseline_year, died, death_date) %>%
+  mutate(
+    baseline_date = ymd(paste0(baseline_year, "-06-15")),
+    death_time = if_else(
+      died == 1 & !is.na(death_date),
+      as.numeric(difftime(death_date, baseline_date, units = "days")) / 365.25,
+      NA_real_
+    )
+  ) %>%
+  dplyr::select(hhidpn, death_time)
+
+tv_fg_observed <- tv_cc %>%
   arrange(hhidpn, tstart) %>%
   group_by(hhidpn) %>%
   mutate(
-    is_last_int   = row_number() == n(),
-    ever_dem      = cumsum(event),
-    death_at_last = as.integer(is_last_int & died == 1 & ever_dem == 0),
-    status_cr = case_when(
-      event == 1         ~ 1L,
-      death_at_last == 1 ~ 2L,
-      TRUE               ~ 0L
-    ),
+    ever_dem  = cumsum(event),
+    status_cr = if_else(event == 1L, 1L, 0L)
+  ) %>%
+  ungroup()
+
+person_summary <- tv_fg_observed %>%
+  group_by(hhidpn) %>%
+  summarise(last_tstop = max(tstop), ever_dem_any = max(ever_dem), .groups = "drop") %>%
+  left_join(death_time_tbl, by = "hhidpn") %>%
+  left_join(tv_cc %>% distinct(hhidpn, died), by = "hhidpn")
+
+decedent_ids <- person_summary %>%
+  filter(died == 1, ever_dem_any == 0, !is.na(death_time))
+
+bad_death_times <- decedent_ids %>% filter(death_time <= last_tstop)
+if (nrow(bad_death_times) > 0) {
+  warning(sprintf(
+    "%d decedent(s) have death_time at/before their last observed interview -- check death_date vs interview dates for hhidpn: %s",
+    nrow(bad_death_times),
+    paste(head(bad_death_times$hhidpn, 10), collapse = ", ")
+  ))
+}
+
+valid_decedents <- decedent_ids %>% filter(death_time > last_tstop)
+
+death_rows <- tv_fg_observed %>%
+  group_by(hhidpn) %>%
+  slice_max(tstop, n = 1, with_ties = FALSE) %>%   # carry forward last known state
+  ungroup() %>%
+  semi_join(valid_decedents, by = "hhidpn") %>%
+  left_join(valid_decedents %>% dplyr::select(hhidpn, death_time), by = "hhidpn") %>%
+  mutate(
+    tstart    = tstop,        # picks up where the last observed interval ended
+    tstop     = death_time,   # ends at the TRUE death time
+    event     = 0L,           # no dementia diagnosis observed in this interval
+    status_cr = 2L
+  ) %>%
+  dplyr::select(-death_time)
+
+tv_fg <- bind_rows(tv_fg_observed, death_rows) %>%
+  arrange(hhidpn, tstart) %>%
+  mutate(
     status_fac = factor(status_cr,
                         levels = c(0, 1, 2),
                         labels = c("censor", "dementia", "death"))
   ) %>%
-  ungroup() %>%
-  dplyr::select(-is_last_int, -ever_dem, -death_at_last)
+  dplyr::select(-ever_dem)
 
-# ----------------------------------------------------------------------
-# Step 1b. Stitch intervals so each subject has contiguous time.
-#   Complete-case filtering in tv_cc can drop interior intervals; this
-#   re-anchors each row's tstart to the previous tstop within subject.
-#   Entry time is 0 (baseline_year anchor).
-# ----------------------------------------------------------------------
-tv_fg <- tv_fg %>%
-  arrange(hhidpn, tstop) %>%
-  group_by(hhidpn) %>%
-  mutate(tstart = lag(tstop, default = 0)) %>%
-  ungroup()
-
-# Sanity: no gaps remain
+# ------------------------------------------------------------------------
+# FIX (removed): the old Step 1b forcibly re-anchored every row's tstart to
+# the previous SURVIVING row's tstop, silently bridging any gap left by
+# complete-case filtering and falsely backdating risk-set entry to 0 for
+# anyone whose first surviving interval wasn't their first wave. tv_cc's
+# tstart/tstop are already correct (built from real consecutive interview
+# times); coxph()/finegray() handle non-contiguous per-subject intervals
+# correctly on their own -- a gap simply means the subject is out of the
+# risk set during that unobserved period, which is the honest treatment
+# of the missingness. No stitching needed.
+#
+# The check below is now purely diagnostic (report, don't enforce): it
+# tells you how many true gaps exist due to interior missing-covariate
+# waves, for your methods write-up -- it is NOT expected to be zero.
+# ------------------------------------------------------------------------
 gap_total <- tv_fg %>%
   arrange(hhidpn, tstop) %>%
   group_by(hhidpn) %>%
@@ -2620,7 +2713,7 @@ gap_total <- tv_fg %>%
   ) %>%
   summarise(total_gaps = sum(n_gaps)) %>%
   pull(total_gaps)
-cat("Interval gaps after stitching:", gap_total, "\n")
+cat("Genuine interval gaps (from missing interior covariate waves, now correctly excluded from the risk set rather than stitched over):", gap_total, "\n")
 
 cat("\nCompeting-risk status across intervals:\n")
 print(table(tv_fg$status_fac))
@@ -2647,7 +2740,6 @@ fg_dat <- finegray(
 cat("\nFG expanded rows:", nrow(fg_dat),
     " | unique persons:", dplyr::n_distinct(fg_dat$hhidpn),
     " | sub-distribution events:", sum(fg_dat$fgstatus), "\n")
-
 cat("Dementia events in tv_fg :", sum(tv_fg$status_cr == 1), "\n")
 cat("Sub-dist events in fg_dat:", sum(fg_dat$fgstatus), "\n")
 
@@ -2655,7 +2747,6 @@ cat("Sub-dist events in fg_dat:", sum(fg_dat$fgstatus), "\n")
 # Fine-Gray models -- same M1-M4 structure as the primary analysis
 # Use fgwt as case weights and cluster() for robust SEs.
 # ======================================================================
-
 # ---------------- M1: Unadjusted ----------------
 fg_m1_hearing <- coxph(
   Surv(fgstart, fgstop, fgstatus) ~ hearing_lag + cluster(hhidpn),
@@ -2729,7 +2820,6 @@ summary(fg_m3_frailty); fit_n(fg_m3_frailty, "FG-M3 frailty")
 # Hearing row: + frailty as covariate
 # Vision  row: + frailty as covariate
 # Frailty row: mutually adjusted (hearing + vision + frailty)
-
 fg_m4_hearing <- coxph(
   Surv(fgstart, fgstop, fgstatus) ~ hearing_lag +
     baseline_age + Gender + Race + Education + Marital_status +
@@ -2765,15 +2855,12 @@ fg_hr_table <- bind_rows(
   tidy_hr(fg_m1_hearing, "hearing_lag",  "FG-M1: Unadjusted"),
   tidy_hr(fg_m1_vision,  "vision_lag",   "FG-M1: Unadjusted"),
   tidy_hr(fg_m1_frailty, "frailty_lag",  "FG-M1: Unadjusted"),
-
   tidy_hr(fg_m2_hearing, "hearing_lag",  "FG-M2: + age"),
   tidy_hr(fg_m2_vision,  "vision_lag",   "FG-M2: + age"),
   tidy_hr(fg_m2_frailty, "frailty_lag",  "FG-M2: + age"),
-
   tidy_hr(fg_m3_hearing, "hearing_lag",  "FG-M3: + demographics + lifestyle"),
   tidy_hr(fg_m3_vision,  "vision_lag",   "FG-M3: + demographics + lifestyle"),
   tidy_hr(fg_m3_frailty, "frailty_lag",  "FG-M3: + demographics + lifestyle"),
-
   tidy_hr(fg_m4_hearing, "hearing_lag",  "FG-M4: hybrid (primary)"),
   tidy_hr(fg_m4_vision,  "vision_lag",   "FG-M4: hybrid (primary)"),
   tidy_hr(fg_m4_frailty, c("hearing_lag","vision_lag","frailty_lag"),
@@ -2782,7 +2869,6 @@ fg_hr_table <- bind_rows(
   rename(sHR = HR) %>%
   mutate(sHR_CI = sprintf("%.2f (%.2f-%.2f)", sHR, conf.low, conf.high)) %>%
   dplyr::select(model, term, sHR, conf.low, conf.high, sHR_CI, p.value)
-
 print(fg_hr_table)
 
 ```
@@ -2818,7 +2904,6 @@ stopifnot("hhidpn" %in% names(panel_df_eligible),
 build_m5_dataset <- function(panel_df, baseline_df,
                              sensory_var, sensory_label,
                              death_track = death_track_clean) {
-
   df_tv <- panel_df %>%
     mutate(
       hhidpn        = as.character(hhidpn),
@@ -2947,35 +3032,89 @@ cat("  df_tv_vision  - hhidpn:", "hhidpn" %in% names(df_tv_vision),
 # --------------------------------------------------------------------------
 build_m5_fg_dataset <- function(m5_dat, label) {
   cat("\n--- Building FG dataset:", label, "---\n")
-  stopifnot("hhidpn" %in% names(m5_dat), "died" %in% names(m5_dat))
+  stopifnot("hhidpn"     %in% names(m5_dat),
+            "died"       %in% names(m5_dat),
+            "death_date" %in% names(m5_dat),
+            "baseline_date" %in% names(m5_dat))
 
-  # 3-level competing-risk status
-  tv_fg <- m5_dat %>%
+  # ---- Observed intervals: status = dementia (1) or censored (0).
+  #      FIX: nothing is overwritten here. Previously death_at_last stamped
+  #      death onto the LAST RETAINED interview interval instead of the true
+  #      death_date; that is removed.
+  tv_fg_observed <- m5_dat %>%
     arrange(hhidpn, start) %>%
     group_by(hhidpn) %>%
     mutate(
-      is_last_int   = row_number() == n(),
-      ever_dem      = cumsum(dementia_event),
-      death_at_last = as.integer(is_last_int & died == 1 & ever_dem == 0),
-      status_cr = case_when(
-        dementia_event == 1 ~ 1L,
-        death_at_last == 1  ~ 2L,
-        TRUE                ~ 0L
-      ),
+      ever_dem  = cumsum(dementia_event),
+      status_cr = dplyr::if_else(dementia_event == 1L, 1L, 0L)
+    ) %>%
+    ungroup()
+
+  # ---- True death time (years since baseline) per person ----
+  death_time_tbl <- tv_fg_observed %>%
+    group_by(hhidpn) %>%
+    summarise(
+      baseline_date = dplyr::first(baseline_date),
+      death_date    = dplyr::first(death_date),
+      died          = dplyr::first(died),
+      last_stop     = max(stop),
+      ever_dem_any  = max(ever_dem),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      death_time = dplyr::if_else(
+        died == 1 & !is.na(death_date),
+        as.numeric(difftime(death_date, baseline_date, units = "days")) / 365.25,
+        NA_real_
+      )
+    )
+
+  # decedents with NO observed dementia (dementia is the event otherwise)
+  decedents <- death_time_tbl %>%
+    filter(died == 1, ever_dem_any == 0, !is.na(death_time))
+
+  # data-quality flag: death recorded at/before last interview
+  bad_dt <- decedents %>% filter(death_time <= last_stop)
+  if (nrow(bad_dt) > 0) {
+    warning(sprintf(
+      "[%s] %d decedent(s) have death_time <= last observed stop; left censored at last obs (hhidpn: %s)",
+      label, nrow(bad_dt), paste(head(bad_dt$hhidpn, 10), collapse = ", ")
+    ))
+  }
+  valid_dec <- decedents %>% filter(death_time > last_stop)
+
+  # ---- Append ONE terminal death interval per valid decedent, running from
+  #      their last observed stop to their TRUE death time. Covariates are the
+  #      last observed values carried forward (no interview occurred in between).
+  death_rows <- tv_fg_observed %>%
+    group_by(hhidpn) %>%
+    slice_max(stop, n = 1, with_ties = FALSE) %>%
+    ungroup() %>%
+    semi_join(valid_dec, by = "hhidpn") %>%
+    left_join(valid_dec %>% dplyr::select(hhidpn, death_time), by = "hhidpn") %>%
+    mutate(
+      start          = stop,          # continue from last observed stop
+      stop           = death_time,    # end at the TRUE death time
+      dementia_event = 0L,
+      status_cr      = 2L
+    ) %>%
+    dplyr::select(-death_time)
+
+  tv_fg <- bind_rows(tv_fg_observed, death_rows) %>%
+    arrange(hhidpn, start) %>%
+    mutate(
       status_fac = factor(status_cr,
                           levels = c(0, 1, 2),
                           labels = c("censor", "dementia", "death"))
     ) %>%
-    ungroup() %>%
-    dplyr::select(-is_last_int, -ever_dem, -death_at_last)
+    dplyr::select(-ever_dem)
 
-  # Stitch gaps so finegray() accepts (start, stop] intervals
-  tv_fg <- tv_fg %>%
-    arrange(hhidpn, stop) %>%
-    group_by(hhidpn) %>%
-    mutate(start = lag(stop, default = 0)) %>%
-    ungroup()
-
+  # ---- FIX: stitching removed. build_m5_dataset() already sets start/stop from
+  #      real consecutive interview times, so a gap left by the complete-case
+  #      (!is.na(ctx_lag)) filter is a genuine unobserved period -- the person is
+  #      correctly OUT of the risk set there. finegray()/coxph() handle
+  #      non-contiguous (start, stop] intervals. The check below is now purely
+  #      diagnostic (report, don't force to zero).
   gap_total <- tv_fg %>%
     arrange(hhidpn, stop) %>%
     group_by(hhidpn) %>%
@@ -2985,7 +3124,8 @@ build_m5_fg_dataset <- function(m5_dat, label) {
     ) %>%
     summarise(total_gaps = sum(n_gaps)) %>%
     pull(total_gaps)
-  cat("Interval gaps after stitching:", gap_total, "\n")
+  cat("Genuine interval gaps (dropped incomplete waves; NOT stitched, correctly out of risk set):",
+      gap_total, "\n")
 
   cat("Competing-risk status across intervals:\n")
   print(table(tv_fg$status_fac))
@@ -3009,7 +3149,6 @@ build_m5_fg_dataset <- function(m5_dat, label) {
       " | unique persons:", dplyr::n_distinct(fg_dat$hhidpn),
       " | sub-distribution events:", sum(fg_dat$fgstatus), "\n")
   cat("Dementia events in tv_fg :", sum(tv_fg$status_cr == 1), "\n")
-
   fg_dat
 }
 
@@ -3045,16 +3184,13 @@ contrast_frailty_vs_no_frailty_fg <- function(fit, label) {
   vc <- vcov(fit)
   i_no_fr  <- grep("no frailty yet",  names(co))
   i_fr_yes <- grep("frailty present", names(co))
-
   L <- numeric(length(co))
   L[i_fr_yes] <-  1
   L[i_no_fr]  <- -1
-
   est <- sum(L * co)
   se  <- sqrt(t(L) %*% vc %*% L)[1, 1]
   z   <- est / se
   p   <- 2 * pnorm(-abs(z))
-
   cat(sprintf(
     "\n[%s | FG] log-sHR(frailty present) - log-sHR(no frailty yet) = %.3f (SE %.3f), z = %.2f, p = %.4f\n",
     label, est, se, z, p
@@ -3101,7 +3237,6 @@ m5_fg_table <- bind_rows(
   rename(sHR = HR) %>%
   mutate(sHR_CI = sprintf("%.2f (%.2f-%.2f)", sHR, conf.low, conf.high)) %>%
   dplyr::select(model, term, sHR, conf.low, conf.high, sHR_CI, p.value)
-
 print(m5_fg_table)
 
 ```

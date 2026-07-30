@@ -71,12 +71,13 @@ stateDiagram-v2
 | Step | What the code does |
 |------|--------------------|
 | **Cohort construction** | Harmonises demographics, lifestyle, sensory, and cognition variables into one person-wave table per cohort; applies the eligibility flow (age ≥ 50, dementia-free at baseline, ≥ 2 valid waves, has follow-up). |
-| **Frailty index** | Rockwood-style deficit-accumulation index (49 items in ELSA; a comparable index in HRS), requiring ≥ 80% item completeness, with a ≥ 0.25 cut-off for frailty. A sensitivity index removing (I)ADL items is also computed. |
-| **Dementia ascertainment** | HRS: Langa–Weir cognitive classification. ELSA: physician diagnosis combined with the 16-item IQCODE (≥ 3.4). Dementia is made irreversible (`cummax`). |
-| **Missing data** | Multiple imputation of lifestyle/demographic covariates (`mice`, 20 imputations). |
-| **Multi-state models** | 8-state continuous-time Markov models (`msm`) with death as a competing absorbing state; transition-rate ratios and 5- and 10-year transition-probability matrices. |
-| **Survival models** | Time-varying Cox proportional-hazards models (counting-process format), models 1–4 with progressive adjustment. |
-| **Attributable burden** | Population attributable fractions (PAF). |
+| **Frailty index** | Rockwood-style deficit-accumulation index (37 candidate deficits in HRS, 49 in ELSA), computed as accumulated deficits over non-missing items and requiring ≥ 80% item completeness, with a ≥ 0.25 cut-off for frailty. Self-rated health is graded on a five-level scale (0, 0.25, 0.50, 0.75, 1); other deficits are binary. A sensitivity index removing all ADL and IADL items is computed alongside it. |
+| **Dementia ascertainment** | HRS: Langa–Weir cognitive classification. ELSA: physician diagnosis combined with the 16-item IQCODE (mean ≥ 3.4, from ≥ 10 valid items). Dementia is made irreversible (`cummax`). |
+| **Missing data** | Multiple imputation by chained equations (`mice`, `m = 20`, 10 iterations), fitted separately at each wave of each cohort — predictive mean matching for continuous variables, proportional-odds regression for education, logistic regression for binary variables. Sex and race/ethnicity are imputed inside the fully conditional specification so no predictor carries missing values into the design matrix, but are not written back to the analysis data. The primary study variables (frailty index, sensory impairment, dementia) are neither imputed nor used as predictors. A single completed dataset is carried forward; the `mids` objects are retained for optional pooled inference. |
+| **Multi-state models** | 8-state continuous-time, time-homogeneous Markov models (`msm`) with dementia and death as absorbing states (7 states in ELSA, where mortality follow-up is incomplete); reversals and transitions bypassing the single-condition intermediate states are fixed at zero. Yields transition-rate ratios and 5- and 10-year transition-probability matrices. |
+| **Survival models** | Time-varying Cox proportional-hazards models in counting-process format with one-wave lagged exposures, Efron ties, and cluster-robust standard errors. Models 1–4 apply progressive adjustment on a common complete-case sample; Model 5 replaces the binary sensory exposure with a three-level term contrasting person-time before frailty onset against person-time with concurrent or prior frailty. |
+| **Attributable burden** | Population attributable fractions (Levin's formula) using person-time-weighted exposure prevalence, with Monte Carlo confidence intervals (10,000 draws; multivariate-normal for the three-level exposure so the correlation among stratum coefficients is preserved). |
+| **Sensitivity analyses** | Age (< 65 / ≥ 65) and sex subgroups with interaction tests; the (I)ADL-removed frailty index; Fine–Gray sub-distribution hazards with death as the competing event (HRS only); and exclusion of dementia ascertained within the first two waves. |
 | **Figures** | Forest plots, PAF plots, and transition-probability heatmaps for the main text and supplement. |
 
 ## Repository structure
@@ -99,15 +100,21 @@ stateDiagram-v2
 
 ## Reproducing the analysis
 
-**1. Requirements** — R ≥ 4.2 and the following packages:
+**1. Requirements** — R ≥ 4.2 (analyses were run under R 4.4.0) and the
+following packages:
 
 ```r
 install.packages(c(
   "haven", "dplyr", "tidyverse", "labelled", "stringr", "mice", "lubridate",
   "msm", "survival", "survminer", "scales", "patchwork", "ggalluvial",
-  "forestploter", "broom", "car"
+  "forestploter", "broom", "car", "MASS", "ragg"
 ))
 ```
+
+`MASS` supplies the multivariate-normal draws behind the disaggregated PAF
+confidence intervals, and `ragg` the figure device. Both `MASS` and
+`lattice`/`grid` (imputation diagnostics) ship with R as recommended packages,
+but are listed here because they are load-bearing rather than incidental.
 
 **2. Obtain the data** — HRS and ELSA are restricted-access but free for
 approved researchers. Follow [`DATA_AVAILABILITY.md`](DATA_AVAILABILITY.md) and
@@ -127,12 +134,17 @@ data/
 **3. Run in order** — later notebooks read files written by earlier ones:
 
 ```
-1. code/HRS_dataextract.Rmd    →  data/hrs_long.csv
+1. code/HRS_dataextract.Rmd    →  data/hrs_long.csv, data/death_track.rds
 2. code/ELSA_extractdata.Rmd   →  data/elsa_long.csv
 3. code/HRS_analysis.Rmd       →  models + tables (HRS)
 4. code/ELSA_analysis.Rmd      →  models + tables (ELSA)
 5. code/Plot.Rmd               →  figures
 ```
+
+`HRS_analysis.Rmd` reads `data/death_track.rds` from disk rather than relying on
+objects left in the session by step 1, and asserts one row per participant-wave
+before proceeding, so the notebooks can be run independently and in separate
+sessions.
 
 ## Data availability
 
