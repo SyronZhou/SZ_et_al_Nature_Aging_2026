@@ -26,7 +26,12 @@ N_ELSA  <- 600L
 HRS_WAVES  <- seq(2004L, 2020L, by = 2L)
 ELSA_WAVES <- seq(2002L, 2018L, by = 2L)
 
-dir.create("data", showWarnings = FALSE, recursive = TRUE)
+# Paths are relative to the REPOSITORY ROOT, matching the analysis notebooks,
+# so the script writes where the notebooks look no matter where it is run from.
+repo_root <- if (basename(getwd()) %in% c("code", "demo")) normalizePath("..") else normalizePath(".")
+data_dir  <- file.path(repo_root, "data")
+dir.create(data_dir, showWarnings = FALSE, recursive = TRUE)
+cat("Repository root:", repo_root, "\n")
 
 # ---------------------------------------------------------------------------
 # Helper: build one cohort's person-wave panel
@@ -159,7 +164,7 @@ hrs_long <- simulate_cohort(
   baseline_fi_mean = 0.18
 )
 
-readr::write_csv(hrs_long, "data/hrs_long.csv")
+readr::write_csv(hrs_long, file.path(data_dir, "hrs_long.csv"))
 
 # Death tracker: ~28% die, always strictly after their last simulated interview
 # (HRS_analysis.Rmd only accepts a competing-risk death after the last interval)
@@ -178,7 +183,7 @@ death_track <- last_year %>%
   transmute(hhidpn, death_year, death_month,
             lastalive_year, lastalive_month, died)
 
-saveRDS(death_track, "data/death_track.rds")
+saveRDS(death_track, file.path(data_dir, "death_track.rds"))
 
 # ---------------------------------------------------------------------------
 # ELSA: lowercase FI column names, no mortality file
@@ -190,7 +195,7 @@ elsa_long <- simulate_cohort(
   baseline_fi_mean = 0.12
 )
 
-readr::write_csv(elsa_long, "data/elsa_long.csv")
+readr::write_csv(elsa_long, file.path(data_dir, "elsa_long.csv"))
 
 # ---------------------------------------------------------------------------
 # Report

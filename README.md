@@ -112,7 +112,7 @@ the order they arose:
 ├── demo/
 │   ├── simulate_demo_data.R   # Generates the simulated demo dataset
 │   ├── hrs_long.csv           # Pre-generated simulated HRS panel (600 people)
-│   ├── elsa_long.csv          # Pre-generated simulated ELSA panel (500 people)
+│   ├── elsa_long.csv          # Pre-generated simulated ELSA panel (600 people)
 │   └── death_track.rds        # Pre-generated simulated mortality table
 ├── DATA_AVAILABILITY.md       # How to obtain HRS and ELSA data
 ├── LICENSE                    # MIT
