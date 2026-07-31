@@ -6,8 +6,8 @@
 
 Reproducible `R` code accompanying the manuscript. The analysis traces how
 **hearing and vision loss** and **frailty** accumulate — and in **what order** —
-on the path to **incident dementia** and **death** in two large longitudinal
-studies of older adults.
+on the path to **incident dementia** in two large longitudinal studies of older
+adults.
 
 <br>
 
@@ -40,6 +40,10 @@ Each person occupies one of eight mutually exclusive states. Dementia and death
 are absorbing. The "both" state is split by **which deficit came first** — the
 question at the heart of the paper.
 
+> **Note:** data on death were not available in ELSA due to data limitations, so
+> the ELSA model has seven states with dementia as the sole absorbing state. The
+> eight-state model with death shown below is the HRS specification.
+
 ```mermaid
 stateDiagram-v2
     direction LR
@@ -66,13 +70,28 @@ stateDiagram-v2
     Death --> [*]
 ```
 
+**State abbreviations.** Each "both" state is named for the two conditions in
+the order they arose:
+
+| Label | Meaning |
+|-------|---------|
+| `Healthy` | No sensory impairment and no frailty |
+| `Sensory` | Sensory impairment only |
+| `Frailty` | Frailty only |
+| `BothSF` | Both present, **S**ensory impairment first, then **F**railty |
+| `BothFS` | Both present, **F**railty first, then **S**ensory impairment |
+| `BothSim` | Both arose **sim**ultaneously, i.e. within the same study wave |
+| `Dementia` | Incident dementia (absorbing) |
+| `Death` | Death from any cause (absorbing; HRS only) |
+
+
 ## Methods implemented
 
 | Step | What the code does |
 |------|--------------------|
 | **Cohort construction** | Harmonises demographics, lifestyle, sensory, and cognition variables into one person-wave table per cohort; applies the eligibility flow (age ≥ 50, dementia-free at baseline, ≥ 2 valid waves, has follow-up). |
 | **Frailty index** | Rockwood-style deficit-accumulation index (37 candidate deficits in HRS, 49 in ELSA), computed as accumulated deficits over non-missing items and requiring ≥ 80% item completeness, with a ≥ 0.25 cut-off for frailty. Self-rated health is graded on a five-level scale (0, 0.25, 0.50, 0.75, 1); other deficits are binary. A sensitivity index removing all ADL and IADL items is computed alongside it. |
-| **Dementia ascertainment** | HRS: Langa–Weir cognitive classification. ELSA: physician diagnosis combined with the 16-item IQCODE (mean ≥ 3.4, from ≥ 10 valid items). Dementia is made irreversible (`cummax`). |
+| **Dementia ascertainment** | HRS: Langa–Weir cognitive classification. ELSA: self-reported physician diagnosis combined with the 16-item IQCODE (mean ≥ 3.4, from ≥ 10 valid items). Dementia is made irreversible (`cummax`). |
 | **Missing data** | Multiple imputation by chained equations (`mice`, `m = 20`, 10 iterations), fitted separately at each wave of each cohort — predictive mean matching for continuous variables, proportional-odds regression for education, logistic regression for binary variables. Sex and race/ethnicity are imputed inside the fully conditional specification so no predictor carries missing values into the design matrix, but are not written back to the analysis data. The primary study variables (frailty index, sensory impairment, dementia) are neither imputed nor used as predictors. A single completed dataset is carried forward; the `mids` objects are retained for optional pooled inference. |
 | **Multi-state models** | 8-state continuous-time, time-homogeneous Markov models (`msm`) with dementia and death as absorbing states (7 states in ELSA, where mortality follow-up is incomplete); reversals and transitions bypassing the single-condition intermediate states are fixed at zero. Yields transition-rate ratios and 5- and 10-year transition-probability matrices. |
 | **Survival models** | Time-varying Cox proportional-hazards models in counting-process format with one-wave lagged exposures, Efron ties, and cluster-robust standard errors. Models 1–4 apply progressive adjustment on a common complete-case sample; Model 5 replaces the binary sensory exposure with a three-level term contrasting person-time before frailty onset against person-time with concurrent or prior frailty. |
@@ -161,7 +180,8 @@ install.packages(c(
 
 # 3. Clone or download this repository, then set the repository root as the
 #    working directory. All paths in the code are relative to it.
-setwd("/path/to/SZ_et_al_Nature_Aging_2026")
+setwd("/path/to/SZ_et_al_Nature_Aging_2026-main")   # the folder name after
+#   downloading the ZIP from GitHub; a git clone gives "SZ_et_al_Nature_Aging_2026"
 ```
 
 **Typical install time on a normal desktop computer: 5–10 minutes** on macOS or
@@ -189,33 +209,40 @@ running anything, and `demo/simulate_demo_data.R` regenerates them from a fixed
 seed. Values are entirely synthetic: no value derives from any real participant,
 and the data are **not** calibrated to reproduce the published effect sizes.
 
+Both simulated cohorts contain 600 people. The size is chosen to be large enough
+that every model in the notebooks — including the eight-state Markov model,
+which needs each of its states to be populated — converges and returns finite
+estimates, while keeping the whole demo under a minute. It carries no
+relationship to the real cohort sizes.
+
 ### Run the demo
 
-```bash
-# from the repository root — regenerates demo/ into data/ where the notebooks look
-Rscript demo/simulate_demo_data.R
+**Step 1 — generate the simulated data.** In R or RStudio, set the working
+directory to the repository root and run:
+
+```r
+setwd("/path/to/SZ_et_al_Nature_Aging_2026-main")   # folder name from the GitHub ZIP
+source("demo/simulate_demo_data.R")
 ```
 
-Or, to use the committed copies without regenerating them:
+This writes the three files into `data/`, where the notebooks look for them.
+(If you prefer the command line, `Rscript demo/simulate_demo_data.R` from the
+repository root does the same thing.)
 
-```bash
-mkdir -p data && cp demo/hrs_long.csv demo/elsa_long.csv demo/death_track.rds data/
+**Step 2 — run an analysis notebook.** Open `code/HRS_analysis.Rmd` and/or
+`code/ELSA_analysis.Rmd` in RStudio and run all chunks (Run ▸ Run All), or
+knit the notebook.
+
+You do **not** need to change the working directory for the notebooks. RStudio
+runs `.Rmd` chunks from the notebook's own folder (`code/`), so each notebook
+resolves the repository root itself in its first chunk and prints it:
+
+```
+Repository root: /path/to/SZ_et_al_Nature_Aging_2026-main
 ```
 
-Then open `code/HRS_analysis.Rmd` (and/or `code/ELSA_analysis.Rmd`) and run the
-chunks, or from the command line:
-
-```bash
-Rscript -e 'rmarkdown::render("code/HRS_analysis.Rmd")'
-```
-
-**Chunk order.** The two composite-figure chunks that assemble the hearing and
-vision panels side by side (`panel_A`, `P5_vis`, `P10_vis`) depend on the vision
-multi-state model, which is fitted in a later chunk. Run the vision multi-state
-chunks before those figure chunks, or run the notebook's statistical chunks
-first and the figure chunks last. All model output — Table 1, the multi-state
-estimates, Cox Models 1–5, PAFs, subgroups, and the sensitivity analyses — is
-independent of the figure chunks.
+All later paths are built from that, so `data/` is found whether you run the
+notebook from the repository root, from `code/`, or by knitting.
 
 ### Expected output
 
@@ -224,11 +251,11 @@ independent of the figure chunks.
 ```
 Simulated demo data written to data/
   data/hrs_long.csv       5400 rows, 600 people,  9 waves (2004-2020)
-  data/death_track.rds     600 people, 186 deaths
-  data/elsa_long.csv      4489 rows, 500 people,  9 waves (2002-2018)
+  data/death_track.rds     600 people, 158 deaths
+  data/elsa_long.csv      5391 rows, 600 people,  9 waves (2002-2018)
 
-  HRS  person-waves with dementia: 416 (17.8% of people ever affected)
-  ELSA person-waves with dementia: 312 (16.4% of people ever affected)
+  HRS  person-waves with dementia: 386 (17.5% of people ever affected)
+  ELSA person-waves with dementia: 317 (13.3% of people ever affected)
 ```
 
 The generator is seeded (`set.seed(2026)`), so these counts are reproducible
@@ -263,8 +290,8 @@ macOS 15.6.1, R 4.4.0):
 | Step | Time |
 |------|------|
 | `demo/simulate_demo_data.R` | ~1 second |
-| `code/HRS_analysis.Rmd` (all models) | ~22 seconds |
-| `code/ELSA_analysis.Rmd` (all models) | ~8 seconds |
+| `code/HRS_analysis.Rmd` (all 35 chunks) | ~31 seconds |
+| `code/ELSA_analysis.Rmd` (all 26 chunks) | ~9 seconds |
 
 **Total demo run time: under 1 minute.** Expect roughly 2–3× these times on an
 older x86 laptop.

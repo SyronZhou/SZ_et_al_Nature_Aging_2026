@@ -21,7 +21,18 @@ library(scales)
 
 
 ```{r}
-data_dir <- "data/ELSA/UKDA-5050-stata/stata/stata13_se"
+# ---------------------------------------------------------------------------
+# Paths are relative to the REPOSITORY ROOT, not to code/.
+#
+# RStudio runs .Rmd chunks with the working directory set to the notebook's own
+# folder, so without this the code would look for code/data/ instead of data/.
+# The root is resolved into a variable rather than with setwd(), because a
+# setwd() inside a chunk does not persist to the next chunk.
+# ---------------------------------------------------------------------------
+repo_root <- if (basename(getwd()) == "code") normalizePath("..") else normalizePath(".")
+cat("Repository root:", repo_root, "\n")
+
+data_dir <- file.path(repo_root, "data/ELSA/UKDA-5050-stata/stata/stata13_se")
 
 ```
 

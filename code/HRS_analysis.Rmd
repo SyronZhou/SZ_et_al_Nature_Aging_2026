@@ -20,7 +20,17 @@ library(scales)
 
 # Load data
 ```{r}
-data_dir <- "data"
+# ---------------------------------------------------------------------------
+# Paths are relative to the REPOSITORY ROOT, not to code/.
+#
+# RStudio runs .Rmd chunks with the working directory set to the notebook's own
+# folder, so without this the code would look for code/data/ instead of data/.
+# The root is resolved into a variable rather than with setwd(), because a
+# setwd() inside a chunk does not persist to the next chunk.
+# ---------------------------------------------------------------------------
+repo_root <- if (basename(getwd()) == "code") normalizePath("..") else normalizePath(".")
+data_dir  <- file.path(repo_root, "data")
+cat("Repository root:", repo_root, "\n")
 
 hrs_long_path <- file.path(data_dir, "hrs_long.csv")
 hrs_long <- read_csv(
@@ -32,12 +42,12 @@ hrs_long <- read_csv(
   )
 )
 
-# FIX D: load death tracking persisted by HRS_dataextract.Rmd, so this notebook
-# no longer depends on death_track objects lingering in the R session.
+# Mortality table written by HRS_dataextract.Rmd. Loading it from disk (rather
+# than relying on a death_track object left in the session) lets this notebook
+# be run independently, and is what makes the simulated demo work.
 death_track <- readRDS(file.path(data_dir, "death_track.rds"))
 
-# Integrity check: exactly one row per (hhidpn, year). Catches duplication
-# bugs (e.g. the earlier 2004 x20 MICE-stacking issue) before they propagate.
+# Integrity check: exactly one row per (hhidpn, year).
 dup_check <- hrs_long %>% dplyr::count(hhidpn, year) %>% dplyr::filter(n != 1)
 if (nrow(dup_check) > 0) {
   stop(sprintf("hrs_long has %d duplicate (hhidpn, year) row(s); fix upstream.",
@@ -147,7 +157,7 @@ cat("Final person-waves:", nrow(panel_df_eligible), "\n")
 death_track_clean <- death_track %>%
   mutate(
     hhidpn      = as.character(hhidpn),
-    death_month = if_else(death_month == 98, NA_real_, as.numeric(death_month)),
+    death_month = as.numeric(death_month),
     death_month = if_else(died == 1 & is.na(death_month), 6, death_month),
     death_date  = if_else(
       died == 1 & !is.na(death_year) & !is.na(death_month),
@@ -726,130 +736,10 @@ cat("\n=== Transition probabilities at t = 10 years ===\n"); print(P10)
 
 
 
-```{r}
-library(patchwork)
-library(ggalluvial)
-
-# PANEL A — Heatmap
-# Drop ABSORBING origin rows (Dementia, Death). Keep them as destination cols.
-# ============================================================================
-make_state_levels <- function(sense_word) {
-  c(
-    "Healthy",
-    paste(sense_word, "impairment only"),
-    "Frailty only",
-    paste0("Both (", sense_word, "-first)"),
-    "Both (Frail-first)",
-    "Both (Simultaneous)",
-    "Dementia",
-    "Death"
-  )
-}
-
-mat_to_long_local <- function(P, time_label, state_levels_local) {
-  P <- as.matrix(P)
-  dimnames(P) <- list(state_levels_local, state_levels_local)
-  df <- as.data.frame.table(P, responseName = "prob")
-  names(df)[1:2] <- c("from", "to")
-  df %>%
-    mutate(
-      time = factor(time_label, levels = c("5 years", "10 years")),
-      from = factor(from, levels = state_levels_local),
-      to   = factor(to,   levels = state_levels_local)
-    )
-}
-
-build_heatmap <- function(P5_mat, P10_mat, model_label, sense_word) {
-  state_lvl   <- make_state_levels(sense_word)
-  absorb_lvls <- state_lvl[7:8]                # Dementia + Death
-  data <- bind_rows(
-    mat_to_long_local(P5_mat,  "5 years",  state_lvl),
-    mat_to_long_local(P10_mat, "10 years", state_lvl)
-  ) %>%
-    filter(!from %in% absorb_lvls) %>%         # <-- drop trivial absorbing rows
-    mutate(
-      from  = droplevels(from),                # keep y-axis tidy
-      model = factor(model_label, levels = model_label)
-    )
-
-  # --- position of the Dementia column + number of origin rows (for the highlight) ---
-  dem_x  <- which(levels(data$to) == "Dementia")
-  n_from <- nlevels(droplevels(data$from))
-
-  ggplot(data, aes(x = to, y = fct_rev(from), fill = prob)) +
-    geom_tile(colour = "white", linewidth = 0.5) +
-    geom_text(aes(label  = ifelse(prob >= 0.005, sprintf("%.2f", prob), ""),
-                  colour = prob > 0.5),
-              size = 3.4) +
-    scale_colour_manual(values = c(`TRUE` = "white", `FALSE` = "grey15"),
-                        guide  = "none") +
-    # --- highlight the Dementia destination column ---
-    annotate("rect",
-             xmin = dem_x - 0.5, xmax = dem_x + 0.5,
-             ymin = 0.5,         ymax = n_from + 0.5,
-             fill = NA, colour = "#D55E00", linewidth = 1.1) +
-    facet_grid(model ~ time, switch = "y") +
-    scale_fill_gradientn(
-      colours = c("#FFFFFF", "#DEEBF7", "#9ECAE1",
-                  "#4292C6", "#08519C", "#08306B"),
-      limits  = c(0, 1),
-      breaks  = c(0, 0.25, 0.5, 0.75, 1),
-      name    = "Transition\nprobability",
-      guide   = guide_colorbar(barwidth = 0.8, barheight = 11,
-                               frame.colour = "grey40",
-                               ticks.colour = "grey40")
-    ) +
-    scale_x_discrete(position = "top") +
-    labs(x = "Destination state", y = "Starting state") +
-    theme_minimal(base_family = "Helvetica", base_size = 13) +
-    theme(
-      panel.grid       = element_blank(),
-      axis.text.x      = element_text(angle = 45, hjust = 0, vjust = 0, size = 11),
-      axis.text.y      = element_text(size = 11),
-      axis.title       = element_text(size = 15, face = "bold"),
-      strip.text       = element_text(size = 14, face = "bold"),
-      strip.placement  = "outside",
-      strip.background = element_rect(fill = "grey95", colour = NA),
-      panel.spacing    = unit(0.6, "cm"),
-      legend.title     = element_text(size = 11),
-      legend.text      = element_text(size = 10)
-    )
-}
-
-# ----------------------------------------------------------------------------
-# Compose Panel A (hearing + vision)
-# Requires: fit_vision, P5_vis, P10_vis from the parallel vision pipeline
-# (same code as above with vision_loss replacing hearing_loss).
-# ----------------------------------------------------------------------------
-panel_A_hearing <- build_heatmap(P5,     P10,     "Hearing model", "Hearing")
-panel_A_vision  <- build_heatmap(P5_vis, P10_vis, "Vision model",  "Vision")
-
-panel_A <- panel_A_hearing / panel_A_vision +
-  plot_layout(guides = "collect") +
-  plot_annotation(
-    title = "a.",
-    theme = theme(
-      plot.title          = element_text(face = "bold", size = 18, hjust = 0),
-      plot.title.position = "plot"            # anchor "a." to the far-left edge
-    )
-  ) &
-  theme(legend.position = "right")
-
-```
 
 
 
 
-```{r}
-# COMPOSITE FIGURE — patchwork layout
-ggsave("HRS_panelA_heatmap.tiff",
-       plot   = panel_A,
-       width  = 14, height = 12, units = "in",          # 8 origin rows
-       dpi    = 300,
-       device = "tiff",
-       compression = "lzw")
-
-```
 
 
 
@@ -1086,6 +976,135 @@ cat("\n=== Vision: Transition probabilities at t = 5 years ===\n");  print(P5_vi
 cat("\n=== Vision: Transition probabilities at t = 10 years ===\n"); print(P10_vis)
 
 ```
+
+
+<!-- Composite figure panels: moved here so that the vision multi-state
+     model (fitted above) already exists when these chunks run. -->
+
+```{r}
+library(patchwork)
+library(ggalluvial)
+
+# PANEL A — Heatmap
+# Drop ABSORBING origin rows (Dementia, Death). Keep them as destination cols.
+# ============================================================================
+make_state_levels <- function(sense_word) {
+  c(
+    "Healthy",
+    paste(sense_word, "impairment only"),
+    "Frailty only",
+    paste0("Both (", sense_word, "-first)"),
+    "Both (Frail-first)",
+    "Both (Simultaneous)",
+    "Dementia",
+    "Death"
+  )
+}
+
+mat_to_long_local <- function(P, time_label, state_levels_local) {
+  P <- as.matrix(P)
+  dimnames(P) <- list(state_levels_local, state_levels_local)
+  df <- as.data.frame.table(P, responseName = "prob")
+  names(df)[1:2] <- c("from", "to")
+  df %>%
+    mutate(
+      time = factor(time_label, levels = c("5 years", "10 years")),
+      from = factor(from, levels = state_levels_local),
+      to   = factor(to,   levels = state_levels_local)
+    )
+}
+
+build_heatmap <- function(P5_mat, P10_mat, model_label, sense_word) {
+  state_lvl   <- make_state_levels(sense_word)
+  absorb_lvls <- state_lvl[7:8]                # Dementia + Death
+  data <- bind_rows(
+    mat_to_long_local(P5_mat,  "5 years",  state_lvl),
+    mat_to_long_local(P10_mat, "10 years", state_lvl)
+  ) %>%
+    filter(!from %in% absorb_lvls) %>%         # <-- drop trivial absorbing rows
+    mutate(
+      from  = droplevels(from),                # keep y-axis tidy
+      model = factor(model_label, levels = model_label)
+    )
+
+  # --- position of the Dementia column + number of origin rows (for the highlight) ---
+  dem_x  <- which(levels(data$to) == "Dementia")
+  n_from <- nlevels(droplevels(data$from))
+
+  ggplot(data, aes(x = to, y = fct_rev(from), fill = prob)) +
+    geom_tile(colour = "white", linewidth = 0.5) +
+    geom_text(aes(label  = ifelse(prob >= 0.005, sprintf("%.2f", prob), ""),
+                  colour = prob > 0.5),
+              size = 3.4) +
+    scale_colour_manual(values = c(`TRUE` = "white", `FALSE` = "grey15"),
+                        guide  = "none") +
+    # --- highlight the Dementia destination column ---
+    annotate("rect",
+             xmin = dem_x - 0.5, xmax = dem_x + 0.5,
+             ymin = 0.5,         ymax = n_from + 0.5,
+             fill = NA, colour = "#D55E00", linewidth = 1.1) +
+    facet_grid(model ~ time, switch = "y") +
+    scale_fill_gradientn(
+      colours = c("#FFFFFF", "#DEEBF7", "#9ECAE1",
+                  "#4292C6", "#08519C", "#08306B"),
+      limits  = c(0, 1),
+      breaks  = c(0, 0.25, 0.5, 0.75, 1),
+      name    = "Transition\nprobability",
+      guide   = guide_colorbar(barwidth = 0.8, barheight = 11,
+                               frame.colour = "grey40",
+                               ticks.colour = "grey40")
+    ) +
+    scale_x_discrete(position = "top") +
+    labs(x = "Destination state", y = "Starting state") +
+    theme_minimal(base_family = "Helvetica", base_size = 13) +
+    theme(
+      panel.grid       = element_blank(),
+      axis.text.x      = element_text(angle = 45, hjust = 0, vjust = 0, size = 11),
+      axis.text.y      = element_text(size = 11),
+      axis.title       = element_text(size = 15, face = "bold"),
+      strip.text       = element_text(size = 14, face = "bold"),
+      strip.placement  = "outside",
+      strip.background = element_rect(fill = "grey95", colour = NA),
+      panel.spacing    = unit(0.6, "cm"),
+      legend.title     = element_text(size = 11),
+      legend.text      = element_text(size = 10)
+    )
+}
+
+# ----------------------------------------------------------------------------
+# Compose Panel A (hearing + vision)
+# Requires: fit_vision, P5_vis, P10_vis from the parallel vision pipeline
+# (same code as above with vision_loss replacing hearing_loss).
+# ----------------------------------------------------------------------------
+panel_A_hearing <- build_heatmap(P5,     P10,     "Hearing model", "Hearing")
+panel_A_vision  <- build_heatmap(P5_vis, P10_vis, "Vision model",  "Vision")
+
+panel_A <- panel_A_hearing / panel_A_vision +
+  plot_layout(guides = "collect") +
+  plot_annotation(
+    title = "a.",
+    theme = theme(
+      plot.title          = element_text(face = "bold", size = 18, hjust = 0),
+      plot.title.position = "plot"            # anchor "a." to the far-left edge
+    )
+  ) &
+  theme(legend.position = "right")
+
+```
+
+
+```{r}
+# COMPOSITE FIGURE — patchwork layout
+ggsave("HRS_panelA_heatmap.tiff",
+       plot   = panel_A,
+       width  = 14, height = 12, units = "in",          # 8 origin rows
+       dpi    = 300,
+       device = "tiff",
+       compression = "lzw")
+
+```
+
+
 
 
 
@@ -2619,13 +2638,136 @@ write.csv(paf_subgroup_all,  "results/subgroup_HRS_paf.csv",    row.names = FALS
 # Sensitivity analysis 3: Fine-Gray sub-distribution hazard
 # Competing event = death from any cause before dementia
 ```{r}
+# ======================================================================
+# Step 0. Rebuild the interval dataset FOR THE FINE-GRAY SENSITIVITY
+#         ANALYSIS ONLY. Mirrors the primary tv_cc build exactly, then
+#         applies a gap policy, because finegray() -- unlike coxph() --
+#         rejects subjects with non-contiguous follow-up.
+#         The primary tv_cc is left untouched.
+# ======================================================================
+
+fg_gap_policy <- "bridge"   # "bridge" (keep everyone) or "truncate" (strict)
+
+baseline_invariant_fg <- baseline_df_eligible %>%
+  mutate(hhidpn = as.character(hhidpn)) %>%
+  dplyr::select(hhidpn, Gender, Race, Education, Marital_status, age) %>%
+  rename(baseline_age = age)
+
+df0_fg <- panel_df_eligible %>%
+  mutate(hhidpn = as.character(hhidpn)) %>%
+  dplyr::select(-Gender, -Race, -Education, -Marital_status) %>%
+  left_join(baseline_invariant_fg, by = "hhidpn") %>%
+  mutate(
+    year          = as.integer(year),
+    baseline_year = as.integer(baseline_year),
+    time          = as.numeric(year - baseline_year),
+
+    dementia       = as.integer(dementia),
+
+    hearing_loss   = as.integer(hearing_loss),
+    vision_overall = as.integer(vision_overall),
+    Frailty_status = as.integer(Frailty_status),
+
+    Employment     = factor(Employment),
+    Smoking        = factor(Smoking),
+    Alcohol        = factor(Alcohol),
+    Gender         = factor(Gender),
+    Race           = factor(Race),
+    Education      = factor(Education),
+    Marital_status = factor(Marital_status),
+
+    baseline_age   = as.numeric(baseline_age)
+  ) %>%
+  arrange(hhidpn, time)
+
+tv_dat_fg <- df0_fg %>%
+  group_by(hhidpn) %>%
+  mutate(
+    tstart      = lag(time),
+    tstop       = time,
+    event       = dementia,
+
+    hearing_lag = lag(hearing_loss),
+    vision_lag  = lag(vision_overall),
+    frailty_lag = lag(Frailty_status),
+
+    emp_lag     = lag(Employment),
+    smoke_lag   = lag(Smoking),
+    alcohol_lag = lag(Alcohol)
+  ) %>%
+  ungroup() %>%
+  filter(!is.na(tstart), tstop > tstart)
+
+# keep intervals up to first dementia event
+tv_dat_fg <- tv_dat_fg %>%
+  group_by(hhidpn) %>%
+  mutate(event_cum = cumsum(event)) %>%
+  filter(event_cum <= 1) %>%
+  ungroup() %>%
+  dplyr::select(-event_cum)
+
+# same complete-case rule as the primary analysis
+tv_cc_fg_raw <- tv_dat_fg %>%
+  filter(
+    !is.na(hearing_lag), !is.na(vision_lag), !is.na(frailty_lag),
+    !is.na(emp_lag),    !is.na(smoke_lag),  !is.na(alcohol_lag),
+    !is.na(baseline_age),
+    !is.na(Gender), !is.na(Race), !is.na(Education), !is.na(Marital_status)
+  )
+
+# ---- how much of the sample has gaps, before we do anything about it ----
+gap_report <- tv_cc_fg_raw %>%
+  arrange(hhidpn, tstart) %>%
+  group_by(hhidpn) %>%
+  summarise(has_gap = any(tstart != lag(tstop, default = first(tstart))),
+            .groups = "drop")
+
+cat("Persons in FG build          :", nrow(gap_report), "\n")
+cat("Persons with >=1 interval gap:", sum(gap_report$has_gap),
+    sprintf("(%.1f%%)\n", 100 * mean(gap_report$has_gap)))
+
+# ---- apply the gap policy -----------------------------------------------
+if (fg_gap_policy == "bridge") {
+  # Extend each interval forward to meet the next one. This carries the
+  # earlier wave's lagged exposures across the dropped wave (LOCF).
+  # The FIRST tstart is never touched, so subjects whose baseline wave was
+  # dropped still enter the risk set late rather than being backdated to 0.
+  tv_cc_fg <- tv_cc_fg_raw %>%
+    arrange(hhidpn, tstart) %>%
+    group_by(hhidpn) %>%
+    mutate(tstop = if_else(!is.na(lead(tstart)) & lead(tstart) > tstop,
+                           lead(tstart), tstop)) %>%
+    ungroup()
+} else if (fg_gap_policy == "truncate") {
+  # Keep only each subject's first contiguous run; censor at the first gap.
+  # No LOCF assumption, but post-gap events are lost.
+  tv_cc_fg <- tv_cc_fg_raw %>%
+    arrange(hhidpn, tstart) %>%
+    group_by(hhidpn) %>%
+    mutate(run = cumsum(tstart != lag(tstop, default = first(tstart)))) %>%
+    filter(run == 0) %>%
+    dplyr::select(-run) %>%
+    ungroup()
+} else {
+  stop("fg_gap_policy must be 'bridge' or 'truncate'")
+}
+
+cat("\nFG analytic set (policy =", fg_gap_policy, ")\n")
+cat("  intervals:", nrow(tv_cc_fg),
+    " | persons:", dplyr::n_distinct(tv_cc_fg$hhidpn),
+    " | events:",  sum(tv_cc_fg$event), "\n")
+cat("  vs primary tv_cc: intervals", nrow(tv_cc),
+    "| persons", dplyr::n_distinct(tv_cc$hhidpn),
+    "| events", sum(tv_cc$event), "\n")
+
+# ----------------------------------------------------------------------
 # Step 1. Build a 3-level competing-risk status on the interval data
 #   0 = censored, 1 = dementia, 2 = death (before dementia)
 #   Death is assigned only to the LAST observed interval for individuals
 #   who died without an incident dementia diagnosis.
 # ----------------------------------------------------------------------
 
-death_time_tbl <- tv_cc %>%
+death_time_tbl <- tv_cc_fg %>%
   distinct(hhidpn, baseline_year, died, death_date) %>%
   mutate(
     baseline_date = ymd(paste0(baseline_year, "-06-15")),
@@ -2637,7 +2779,7 @@ death_time_tbl <- tv_cc %>%
   ) %>%
   dplyr::select(hhidpn, death_time)
 
-tv_fg_observed <- tv_cc %>%
+tv_fg_observed <- tv_cc_fg %>%
   arrange(hhidpn, tstart) %>%
   group_by(hhidpn) %>%
   mutate(
@@ -2650,7 +2792,7 @@ person_summary <- tv_fg_observed %>%
   group_by(hhidpn) %>%
   summarise(last_tstop = max(tstop), ever_dem_any = max(ever_dem), .groups = "drop") %>%
   left_join(death_time_tbl, by = "hhidpn") %>%
-  left_join(tv_cc %>% distinct(hhidpn, died), by = "hhidpn")
+  left_join(tv_cc_fg %>% distinct(hhidpn, died), by = "hhidpn")
 
 decedent_ids <- person_summary %>%
   filter(died == 1, ever_dem_any == 0, !is.na(death_time))
@@ -2687,33 +2829,23 @@ tv_fg <- bind_rows(tv_fg_observed, death_rows) %>%
                         levels = c(0, 1, 2),
                         labels = c("censor", "dementia", "death"))
   ) %>%
-  dplyr::select(-ever_dem)
+  dplyr::select(-ever_dem) %>%
+  # Date columns serve no purpose downstream (death timing is already in
+  # tstop) and `~ .` would drag them into the model frame.
+  dplyr::select(-any_of(c("death_date", "baseline_date")))
 
-# ------------------------------------------------------------------------
-# FIX (removed): the old Step 1b forcibly re-anchored every row's tstart to
-# the previous SURVIVING row's tstop, silently bridging any gap left by
-# complete-case filtering and falsely backdating risk-set entry to 0 for
-# anyone whose first surviving interval wasn't their first wave. tv_cc's
-# tstart/tstop are already correct (built from real consecutive interview
-# times); coxph()/finegray() handle non-contiguous per-subject intervals
-# correctly on their own -- a gap simply means the subject is out of the
-# risk set during that unobserved period, which is the honest treatment
-# of the missingness. No stitching needed.
-#
-# The check below is now purely diagnostic (report, don't enforce): it
-# tells you how many true gaps exist due to interior missing-covariate
-# waves, for your methods write-up -- it is NOT expected to be zero.
-# ------------------------------------------------------------------------
+# ---- contiguity must now hold, or finegray() will refuse ----------------
 gap_total <- tv_fg %>%
-  arrange(hhidpn, tstop) %>%
+  arrange(hhidpn, tstart) %>%
   group_by(hhidpn) %>%
   summarise(
-    n_gaps = sum(tstart != lag(tstop, default = first(tstart))),
+    n_gaps = sum(abs(tstart - lag(tstop, default = first(tstart))) > 1e-8),
     .groups = "drop"
   ) %>%
   summarise(total_gaps = sum(n_gaps)) %>%
   pull(total_gaps)
-cat("Genuine interval gaps (from missing interior covariate waves, now correctly excluded from the risk set rather than stitched over):", gap_total, "\n")
+cat("\nRemaining interval gaps (must be 0 for finegray):", gap_total, "\n")
+stopifnot(gap_total == 0)
 
 cat("\nCompeting-risk status across intervals:\n")
 print(table(tv_fg$status_fac))
@@ -2883,6 +3015,25 @@ print(fg_hr_table)
 # ==========================================================================
 library(survival)
 
+# Helpers defined earlier in the notebook -- redefined here so this
+# section runs standalone (lines 1342, 1173, 1186 of the Rmd).
+make_midyear_date <- function(y) ymd(paste0(as.integer(y), "-06-15"))
+
+tidy_hr <- function(fit, terms = NULL, model_label = NA_character_) {
+  out <- broom::tidy(fit, exponentiate = TRUE, conf.int = TRUE) %>%
+    dplyr::select(term, HR = estimate, conf.low, conf.high, p.value) %>%
+    mutate(
+      HR_CI = sprintf("%.2f (%.2f-%.2f)", HR, conf.low, conf.high),
+      model = model_label
+    )
+  if (!is.null(terms)) out <- out %>% filter(term %in% terms)
+  out
+}
+
+fit_n <- function(fit, label) {
+  cat(sprintf("[%s]  n = %d   events = %d\n", label, fit$n, fit$nevent))
+}
+
 # --------------------------------------------------------------------------
 # 0) Ensure panel_df_eligible has death tracking attached
 # --------------------------------------------------------------------------
@@ -3030,17 +3181,37 @@ cat("  df_tv_vision  - hhidpn:", "hhidpn" %in% names(df_tv_vision),
 # --------------------------------------------------------------------------
 # 3) Fine-Gray helpers
 # --------------------------------------------------------------------------
-build_m5_fg_dataset <- function(m5_dat, label) {
+build_m5_fg_dataset <- function(m5_dat, label, gap_policy = "bridge") {
   cat("\n--- Building FG dataset:", label, "---\n")
-  stopifnot("hhidpn"     %in% names(m5_dat),
-            "died"       %in% names(m5_dat),
-            "death_date" %in% names(m5_dat),
+  stopifnot("hhidpn"        %in% names(m5_dat),
+            "died"          %in% names(m5_dat),
+            "death_date"    %in% names(m5_dat),
             "baseline_date" %in% names(m5_dat))
 
-  # ---- Observed intervals: status = dementia (1) or censored (0).
-  #      FIX: nothing is overwritten here. Previously death_at_last stamped
-  #      death onto the LAST RETAINED interview interval instead of the true
-  #      death_date; that is removed.
+  # ---- Gap policy. finegray() requires contiguous per-subject follow-up;
+  #      the !is.na(ctx_lag) complete-case filter in build_m5_dataset()
+  #      leaves holes. Applied BEFORE death rows so last_stop is correct.
+  gap_report <- m5_dat %>%
+    arrange(hhidpn, start) %>% group_by(hhidpn) %>%
+    summarise(has_gap = any(abs(start - lag(stop, default = first(start))) > 1e-8),
+              .groups = "drop")
+  cat(sprintf("Persons: %d | with >=1 gap: %d (%.1f%%)\n",
+              nrow(gap_report), sum(gap_report$has_gap),
+              100 * mean(gap_report$has_gap)))
+
+  if (gap_policy == "bridge") {
+    m5_dat <- m5_dat %>%
+      arrange(hhidpn, start) %>% group_by(hhidpn) %>%
+      mutate(stop = if_else(!is.na(lead(start)) & lead(start) > stop,
+                            lead(start), stop)) %>%
+      ungroup()
+  } else if (gap_policy == "truncate") {
+    m5_dat <- m5_dat %>%
+      arrange(hhidpn, start) %>% group_by(hhidpn) %>%
+      mutate(run = cumsum(abs(start - lag(stop, default = first(start))) > 1e-8)) %>%
+      filter(run == 0) %>% dplyr::select(-run) %>% ungroup()
+  } else stop("gap_policy must be 'bridge' or 'truncate'")
+
   tv_fg_observed <- m5_dat %>%
     arrange(hhidpn, start) %>%
     group_by(hhidpn) %>%
@@ -3050,7 +3221,6 @@ build_m5_fg_dataset <- function(m5_dat, label) {
     ) %>%
     ungroup()
 
-  # ---- True death time (years since baseline) per person ----
   death_time_tbl <- tv_fg_observed %>%
     group_by(hhidpn) %>%
     summarise(
@@ -3069,23 +3239,18 @@ build_m5_fg_dataset <- function(m5_dat, label) {
       )
     )
 
-  # decedents with NO observed dementia (dementia is the event otherwise)
   decedents <- death_time_tbl %>%
     filter(died == 1, ever_dem_any == 0, !is.na(death_time))
 
-  # data-quality flag: death recorded at/before last interview
   bad_dt <- decedents %>% filter(death_time <= last_stop)
   if (nrow(bad_dt) > 0) {
     warning(sprintf(
-      "[%s] %d decedent(s) have death_time <= last observed stop; left censored at last obs (hhidpn: %s)",
+      "[%s] %d decedent(s) have death_time <= last observed stop; right-censored at last obs (hhidpn: %s)",
       label, nrow(bad_dt), paste(head(bad_dt$hhidpn, 10), collapse = ", ")
     ))
   }
   valid_dec <- decedents %>% filter(death_time > last_stop)
 
-  # ---- Append ONE terminal death interval per valid decedent, running from
-  #      their last observed stop to their TRUE death time. Covariates are the
-  #      last observed values carried forward (no interview occurred in between).
   death_rows <- tv_fg_observed %>%
     group_by(hhidpn) %>%
     slice_max(stop, n = 1, with_ties = FALSE) %>%
@@ -3093,8 +3258,8 @@ build_m5_fg_dataset <- function(m5_dat, label) {
     semi_join(valid_dec, by = "hhidpn") %>%
     left_join(valid_dec %>% dplyr::select(hhidpn, death_time), by = "hhidpn") %>%
     mutate(
-      start          = stop,          # continue from last observed stop
-      stop           = death_time,    # end at the TRUE death time
+      start          = stop,        # continue from last observed stop
+      stop           = death_time,  # end at the TRUE death time
       dementia_event = 0L,
       status_cr      = 2L
     ) %>%
@@ -3107,25 +3272,22 @@ build_m5_fg_dataset <- function(m5_dat, label) {
                           levels = c(0, 1, 2),
                           labels = c("censor", "dementia", "death"))
     ) %>%
-    dplyr::select(-ever_dem)
+    dplyr::select(-ever_dem) %>%
+    dplyr::select(-any_of(c(".sensory", "int_date", "baseline_date",
+                            "death_date", "dem_time", "sensory_onset_time",
+                            "frailty_onset_time", "frailty_by_stop",
+                            "sensory_tv", "ctx_tv", "death_year",
+                            "death_month")))
 
-  # ---- FIX: stitching removed. build_m5_dataset() already sets start/stop from
-  #      real consecutive interview times, so a gap left by the complete-case
-  #      (!is.na(ctx_lag)) filter is a genuine unobserved period -- the person is
-  #      correctly OUT of the risk set there. finegray()/coxph() handle
-  #      non-contiguous (start, stop] intervals. The check below is now purely
-  #      diagnostic (report, don't force to zero).
   gap_total <- tv_fg %>%
-    arrange(hhidpn, stop) %>%
+    arrange(hhidpn, start) %>%
     group_by(hhidpn) %>%
-    summarise(
-      n_gaps = sum(start != lag(stop, default = first(start))),
-      .groups = "drop"
-    ) %>%
+    summarise(n_gaps = sum(abs(start - lag(stop, default = first(start))) > 1e-8),
+              .groups = "drop") %>%
     summarise(total_gaps = sum(n_gaps)) %>%
     pull(total_gaps)
-  cat("Genuine interval gaps (dropped incomplete waves; NOT stitched, correctly out of risk set):",
-      gap_total, "\n")
+  cat("Remaining gaps (must be 0 for finegray):", gap_total, "\n")
+  stopifnot(gap_total == 0)
 
   cat("Competing-risk status across intervals:\n")
   print(table(tv_fg$status_fac))
@@ -3137,7 +3299,6 @@ build_m5_fg_dataset <- function(m5_dat, label) {
     count(final_status) %>%
     print()
 
-  # Fine-Gray expansion
   fg_dat <- finegray(
     Surv(start, stop, status_fac) ~ .,
     data  = tv_fg,
@@ -3207,8 +3368,10 @@ contrast_frailty_vs_no_frailty_fg <- function(fit, label) {
 # --------------------------------------------------------------------------
 # 4) Run the Fine-Gray sensitivity analysis
 # --------------------------------------------------------------------------
-fg_dat_hearing_m5 <- build_m5_fg_dataset(df_tv_hearing, "HEARING")
-fg_dat_vision_m5  <- build_m5_fg_dataset(df_tv_vision,  "VISION")
+fg_dat_hearing_m5 <- build_m5_fg_dataset(df_tv_hearing, "HEARING",
+                                         gap_policy = "bridge")
+fg_dat_vision_m5  <- build_m5_fg_dataset(df_tv_vision,  "VISION",
+                                         gap_policy = "bridge")
 
 fit_m5_fg_hearing <- fit_m5_fg(fg_dat_hearing_m5, "HEARING")
 fit_m5_fg_vision  <- fit_m5_fg(fg_dat_vision_m5,  "VISION")
@@ -3237,7 +3400,23 @@ m5_fg_table <- bind_rows(
   rename(sHR = HR) %>%
   mutate(sHR_CI = sprintf("%.2f (%.2f-%.2f)", sHR, conf.low, conf.high)) %>%
   dplyr::select(model, term, sHR, conf.low, conf.high, sHR_CI, p.value)
-print(m5_fg_table)
+
+# --------------------------------------------------------------------------
+# 7) Final summary — confirms the section ran end to end
+# --------------------------------------------------------------------------
+cat("\n\n==========================================================\n")
+cat("MODEL 5 FINE-GRAY SENSITIVITY ANALYSIS -- SUMMARY\n")
+cat("==========================================================\n")
+
+fit_n(fit_m5_fg_hearing, "FG-M5 hearing")
+fit_n(fit_m5_fg_vision,  "FG-M5 vision")
+
+cat("\nSub-distribution hazard ratios:\n")
+print(as.data.frame(m5_fg_table), row.names = FALSE)
+
+cat("\nM5 Fine-Gray complete:", nrow(m5_fg_table), "sHR rows produced.\n")
+
+
 
 ```
 
@@ -3245,17 +3424,40 @@ print(m5_fg_table)
 
 # Population Attributable Fraction (PAF) for Fine-Gray models (M1-M5)
 ```{r}
-# PAF derived from sub-distribution HRs via Levin's formula.
-# Prevalence weighted by fgwt (sub-distribution risk-set).
-# 95% CIs by subject-level cluster bootstrap.
+# ======================================================================
+# PAF from Fine-Gray sub-distribution HRs
+#   - Levin's formula (marginal prevalence) OR Miettinen's (case-based)
+#   - Prevalence weighted by fgwt (sub-distribution risk set)
+#   - 95% CIs by subject-level cluster bootstrap
+#
+# NOTE ON METHOD: Levin's formula assumes a CRUDE risk ratio with marginal
+# prevalence. Pairing it with confounder-adjusted sHRs (M2-M5) is the known-
+# biased combination. Miettinen's formula, which uses exposure prevalence
+# among cases, is the standard choice for adjusted estimates. Set paf_method
+# below; run it both ways and report which you used.
+#
+# LIMITATION: the bootstrap resamples subjects but reuses the fgwt weights
+# estimated from the original sample, so CIs condition on the estimated
+# sub-distribution weights rather than re-deriving them per replicate.
 # ======================================================================
 library(survival)
 library(dplyr)
 library(tibble)
 
+paf_method <- "miettinen"     # "miettinen" (adjusted) or "levin" (crude)
+R_boot     <- 25              # RAISE TO 500 for the final run
+
+# The M5 model formula, matching fit_m5_fg() minus cluster() -- the
+# bootstrap supplies the variance, so the cluster term is not needed.
+m5_formula <- Surv(fgstart, fgstop, fgstatus) ~
+  ctx_lag + baseline_age +
+  Gender + Race + Education + Marital_status +
+  emp_lag + smoke_lag + alcohol_lag
+
 # ---- helpers ----------------------------------------------------------
 
-# fgwt-weighted prevalence of exposure level(s) in the FG-expanded data
+# fgwt-weighted exposure prevalence over ALL intervals (person-time weighted;
+# not a population prevalence -- state this in the methods)
 fg_prev <- function(fg_data, var_name) {
   x  <- fg_data[[var_name]]
   w  <- fg_data$fgwt
@@ -3270,29 +3472,78 @@ fg_prev <- function(fg_data, var_name) {
   }
 }
 
-# Levin's PAF — accepts scalars or matched vectors
-paf_levin <- function(sHR, p_e) {
-  num <- sum(p_e * (sHR - 1))
-  num / (1 + num)
+# fgwt-weighted exposure prevalence among SUB-DISTRIBUTION CASES
+fg_prev_cases <- function(fg_data, var_name) {
+  d  <- fg_data[fg_data$fgstatus == 1, , drop = FALSE]
+  x  <- d[[var_name]]
+  w  <- d$fgwt
+  ok <- !is.na(x) & !is.na(w)
+  x  <- x[ok]; w <- w[ok]
+  if (length(x) == 0) {
+    if (is.factor(fg_data[[var_name]])) {
+      lv <- levels(fg_data[[var_name]])[-1]
+      return(setNames(rep(NA_real_, length(lv)), lv))
+    }
+    return(NA_real_)
+  }
+  if (is.factor(x)) {
+    lv <- levels(x)[-1]
+    setNames(vapply(lv, function(l)
+      sum(w * (x == l)) / sum(w), numeric(1)), lv)
+  } else {
+    sum(w * (x == 1)) / sum(w)
+  }
 }
 
-# Point PAF from a fitted FG model + its dataset
-paf_point <- function(fit, fg_data, exposure_var) {
+# Combine sHRs and prevalences into a single PAF
+paf_combine <- function(sHR, p, method = paf_method) {
+  if (method == "levin") {
+    num <- sum(p * (sHR - 1))
+    num / (1 + num)
+  } else if (method == "miettinen") {
+    sum(p * (1 - 1 / sHR))
+  } else stop("paf_method must be 'levin' or 'miettinen'")
+}
+
+# Pull sHRs and the matching prevalence vector for one exposure
+paf_parts <- function(fit, fg_data, exposure_var, method = paf_method) {
   co  <- coef(fit)
   idx <- grep(paste0("^", exposure_var), names(co))
-  if (length(idx) == 0) return(NA_real_)
+  if (length(idx) == 0) return(NULL)
   sHR <- exp(co[idx])
-  p_e <- fg_prev(fg_data, exposure_var)
+  p   <- if (method == "miettinen") fg_prev_cases(fg_data, exposure_var)
+         else                       fg_prev(fg_data, exposure_var)
   if (is.factor(fg_data[[exposure_var]])) {
-    coef_lv <- sub(paste0("^", exposure_var), "", names(co)[idx])
-    p_e     <- p_e[coef_lv]                            # align order
+    coef_lv    <- sub(paste0("^", exposure_var), "", names(co)[idx])
+    p          <- p[coef_lv]                           # align order
+    names(sHR) <- coef_lv
   }
-  paf_levin(sHR, p_e)
+  list(sHR = sHR, p = p)
 }
 
-# Cluster bootstrap CI — resample subjects, refit FG, recompute PAF
+# Point PAF (joint across levels for a factor exposure)
+paf_point <- function(fit, fg_data, exposure_var, method = paf_method) {
+  pp <- paf_parts(fit, fg_data, exposure_var, method)
+  if (is.null(pp)) return(NA_real_)
+  paf_combine(pp$sHR, pp$p, method)
+}
+
+# Level-specific partial PAFs; these sum exactly to the joint PAF
+paf_point_by_level <- function(fit, fg_data, exposure_var, method = paf_method) {
+  pp <- paf_parts(fit, fg_data, exposure_var, method)
+  if (is.null(pp)) return(setNames(numeric(0), character(0)))
+  if (method == "levin") {
+    denom <- 1 + sum(pp$p * (pp$sHR - 1))
+    (pp$p * (pp$sHR - 1)) / denom
+  } else {
+    pp$p * (1 - 1 / pp$sHR)
+  }
+}
+
+# Cluster bootstrap CI -- resample subjects, refit FG, recompute PAF
 paf_bootstrap_ci <- function(fg_data, formula, exposure_var,
-                             R = 500, seed = 1, verbose = TRUE) {
+                             R = R_boot, seed = 1, verbose = TRUE,
+                             method = paf_method) {
   set.seed(seed)
   ids     <- unique(as.character(fg_data$hhidpn))
   n       <- length(ids)
@@ -3303,26 +3554,35 @@ paf_bootstrap_ci <- function(fg_data, formula, exposure_var,
     samp <- sample(ids, n, replace = TRUE)
     rows <- unlist(row_idx[samp], use.names = FALSE)
     db   <- fg_data[rows, , drop = FALSE]
+    # catch ERRORS only -- coxph warns routinely (e.g. "Loglik converged
+    # before variable 1"), and discarding those replicates would bias the
+    # quantiles toward the well-behaved subset
     fit_b <- tryCatch(
-      coxph(formula, data = db, weights = fgwt, ties = "efron"),
-      error = function(e) NULL, warning = function(w) NULL
+      suppressWarnings(coxph(formula, data = db, weights = fgwt, ties = "efron")),
+      error = function(e) NULL
     )
-    ests[b] <- if (is.null(fit_b)) NA_real_ else paf_point(fit_b, db, exposure_var)
+    ests[b] <- if (is.null(fit_b)) NA_real_
+               else paf_point(fit_b, db, exposure_var, method)
     if (verbose && b %% 50 == 0) cat("  boot rep", b, "/", R, "\n")
   }
   ests <- ests[is.finite(ests)]
+  if (length(ests) < 2) {
+    return(list(n_valid = length(ests), ci = c(NA_real_, NA_real_)))
+  }
   list(n_valid = length(ests),
        ci      = unname(quantile(ests, c(0.025, 0.975), na.rm = TRUE)))
 }
 
-# One-row tibble per (model, exposure)
+# One row per (model, exposure)
 paf_row <- function(fit, fg_data, formula, exposure_var, label,
-                    R = 500, seed = 1) {
-  pt <- paf_point(fit, fg_data, exposure_var)
-  bs <- paf_bootstrap_ci(fg_data, formula, exposure_var, R = R, seed = seed)
+                    R = R_boot, seed = 1, method = paf_method) {
+  pt <- paf_point(fit, fg_data, exposure_var, method)
+  bs <- paf_bootstrap_ci(fg_data, formula, exposure_var,
+                         R = R, seed = seed, method = method)
   tibble(
     model     = label,
     exposure  = exposure_var,
+    level     = NA_character_,
     PAF       = pt,
     lower     = bs$ci[1],
     upper     = bs$ci[2],
@@ -3332,53 +3592,61 @@ paf_row <- function(fit, fg_data, formula, exposure_var, label,
   )
 }
 
+# ---- pilot timing -----------------------------------------------------
+# One fit x total number of bootstrap fits gives the projected runtime.
+t1 <- system.time(
+  suppressWarnings(coxph(Surv(fgstart, fgstop, fgstatus) ~ hearing_lag + baseline_age,
+                         data = fg_dat, weights = fgwt, ties = "efron"))
+)[["elapsed"]]
+cat(sprintf("\nOne Cox fit: %.2f s | 16 PAF rows x %d reps ~= %.1f min\n",
+            t1, R_boot, t1 * 16 * R_boot / 60))
+
 # ---- M1-M4 (use fg_dat) ----------------------------------------------
-R_boot <- 500                                          # use 50-100 for testing
 
 # M1: unadjusted
 paf_m1_hearing <- paf_row(fg_m1_hearing, fg_dat,
   Surv(fgstart, fgstop, fgstatus) ~ hearing_lag,
-  "hearing_lag", "FG-M1 hearing", R = R_boot, seed = 11)
+  "hearing_lag", "FG-M1 hearing", seed = 11)
 paf_m1_vision  <- paf_row(fg_m1_vision, fg_dat,
   Surv(fgstart, fgstop, fgstatus) ~ vision_lag,
-  "vision_lag",  "FG-M1 vision",  R = R_boot, seed = 12)
+  "vision_lag",  "FG-M1 vision",  seed = 12)
 paf_m1_frailty <- paf_row(fg_m1_frailty, fg_dat,
   Surv(fgstart, fgstop, fgstatus) ~ frailty_lag,
-  "frailty_lag", "FG-M1 frailty", R = R_boot, seed = 13)
+  "frailty_lag", "FG-M1 frailty", seed = 13)
 
 # M2: + baseline age
 paf_m2_hearing <- paf_row(fg_m2_hearing, fg_dat,
   Surv(fgstart, fgstop, fgstatus) ~ hearing_lag + baseline_age,
-  "hearing_lag", "FG-M2 hearing", R = R_boot, seed = 21)
+  "hearing_lag", "FG-M2 hearing", seed = 21)
 paf_m2_vision  <- paf_row(fg_m2_vision, fg_dat,
   Surv(fgstart, fgstop, fgstatus) ~ vision_lag  + baseline_age,
-  "vision_lag",  "FG-M2 vision",  R = R_boot, seed = 22)
+  "vision_lag",  "FG-M2 vision",  seed = 22)
 paf_m2_frailty <- paf_row(fg_m2_frailty, fg_dat,
   Surv(fgstart, fgstop, fgstatus) ~ frailty_lag + baseline_age,
-  "frailty_lag", "FG-M2 frailty", R = R_boot, seed = 23)
+  "frailty_lag", "FG-M2 frailty", seed = 23)
 
 # M3: + demographics + lifestyle
 m3_cov <- ~ baseline_age + Gender + Race + Education + Marital_status +
               emp_lag + smoke_lag + alcohol_lag
 paf_m3_hearing <- paf_row(fg_m3_hearing, fg_dat,
   update(m3_cov, Surv(fgstart, fgstop, fgstatus) ~ hearing_lag + .),
-  "hearing_lag", "FG-M3 hearing", R = R_boot, seed = 31)
+  "hearing_lag", "FG-M3 hearing", seed = 31)
 paf_m3_vision  <- paf_row(fg_m3_vision,  fg_dat,
   update(m3_cov, Surv(fgstart, fgstop, fgstatus) ~ vision_lag  + .),
-  "vision_lag",  "FG-M3 vision",  R = R_boot, seed = 32)
+  "vision_lag",  "FG-M3 vision",  seed = 32)
 paf_m3_frailty <- paf_row(fg_m3_frailty, fg_dat,
   update(m3_cov, Surv(fgstart, fgstop, fgstatus) ~ frailty_lag + .),
-  "frailty_lag", "FG-M3 frailty", R = R_boot, seed = 33)
+  "frailty_lag", "FG-M3 frailty", seed = 33)
 
 # M4 hybrid: hearing & vision rows include frailty_lag as a covariate
 m4_cov_hv <- ~ baseline_age + Gender + Race + Education + Marital_status +
                   emp_lag + smoke_lag + alcohol_lag + frailty_lag
 paf_m4_hearing <- paf_row(fg_m4_hearing, fg_dat,
   update(m4_cov_hv, Surv(fgstart, fgstop, fgstatus) ~ hearing_lag + .),
-  "hearing_lag", "FG-M4 hearing", R = R_boot, seed = 41)
+  "hearing_lag", "FG-M4 hearing", seed = 41)
 paf_m4_vision  <- paf_row(fg_m4_vision,  fg_dat,
   update(m4_cov_hv, Surv(fgstart, fgstop, fgstatus) ~ vision_lag  + .),
-  "vision_lag",  "FG-M4 vision",  R = R_boot, seed = 42)
+  "vision_lag",  "FG-M4 vision",  seed = 42)
 
 # M4 frailty row: mutually adjusted (hearing + vision + frailty in one fit)
 m4_fr_formula <- Surv(fgstart, fgstop, fgstatus) ~
@@ -3386,39 +3654,27 @@ m4_fr_formula <- Surv(fgstart, fgstop, fgstatus) ~
     baseline_age + Gender + Race + Education + Marital_status +
     emp_lag + smoke_lag + alcohol_lag
 paf_m4_fr_hearing <- paf_row(fg_m4_frailty, fg_dat, m4_fr_formula,
-  "hearing_lag", "FG-M4 (mutual) hearing", R = R_boot, seed = 431)
+  "hearing_lag", "FG-M4 (mutual) hearing", seed = 431)
 paf_m4_fr_vision  <- paf_row(fg_m4_frailty, fg_dat, m4_fr_formula,
-  "vision_lag",  "FG-M4 (mutual) vision",  R = R_boot, seed = 432)
+  "vision_lag",  "FG-M4 (mutual) vision",  seed = 432)
 paf_m4_fr_frailty <- paf_row(fg_m4_frailty, fg_dat, m4_fr_formula,
-  "frailty_lag", "FG-M4 (mutual) frailty", R = R_boot, seed = 433)
+  "frailty_lag", "FG-M4 (mutual) frailty", seed = 433)
 
-# Level-specific PAFs for a multi-level factor exposure (M5 ctx_lag)
-# Partial-PAF decomposition: sum of level PAFs = joint 
-paf_point_by_level <- function(fit, fg_data, exposure_var) {
-  co  <- coef(fit)
-  idx <- grep(paste0("^", exposure_var), names(co))
-  if (length(idx) == 0) return(setNames(numeric(0), character(0)))
-  sHR <- exp(co[idx])
-  p_e <- fg_prev(fg_data, exposure_var)
-  if (is.factor(fg_data[[exposure_var]])) {
-    coef_lv <- sub(paste0("^", exposure_var), "", names(co)[idx])
-    p_e     <- p_e[coef_lv]
-    names(sHR) <- coef_lv
-  }
-  denom <- 1 + sum(p_e * (sHR - 1))
-  (p_e * (sHR - 1)) / denom
-}
-
+# ---- Level-specific PAFs for a multi-level factor exposure (M5 ctx_lag)
 paf_bootstrap_levels <- function(fg_data, formula, exposure_var,
-                                 R = 500, seed = 1, verbose = TRUE) {
+                                 R = R_boot, seed = 1, verbose = TRUE,
+                                 fit0 = NULL, method = paf_method) {
   set.seed(seed)
   ids     <- unique(as.character(fg_data$hhidpn))
   n       <- length(ids)
   row_idx <- split(seq_len(nrow(fg_data)), as.character(fg_data$hhidpn))
 
-  # Discover level names from the full-data fit
-  fit0   <- coxph(formula, data = fg_data, weights = fgwt, ties = "efron")
-  pt_lev <- paf_point_by_level(fit0, fg_data, exposure_var)
+  # point estimate comes from the model actually reported, when supplied
+  if (is.null(fit0)) {
+    fit0 <- suppressWarnings(
+      coxph(formula, data = fg_data, weights = fgwt, ties = "efron"))
+  }
+  pt_lev <- paf_point_by_level(fit0, fg_data, exposure_var, method)
   lev    <- names(pt_lev)
 
   ests <- matrix(NA_real_, nrow = R, ncol = length(lev),
@@ -3429,11 +3685,11 @@ paf_bootstrap_levels <- function(fg_data, formula, exposure_var,
     rows <- unlist(row_idx[samp], use.names = FALSE)
     db   <- fg_data[rows, , drop = FALSE]
     fit_b <- tryCatch(
-      coxph(formula, data = db, weights = fgwt, ties = "efron"),
-      error = function(e) NULL, warning = function(w) NULL
+      suppressWarnings(coxph(formula, data = db, weights = fgwt, ties = "efron")),
+      error = function(e) NULL
     )
     if (!is.null(fit_b)) {
-      v <- paf_point_by_level(fit_b, db, exposure_var)
+      v    <- paf_point_by_level(fit_b, db, exposure_var, method)
       keep <- intersect(lev, names(v))
       ests[b, keep] <- v[keep]
     }
@@ -3442,54 +3698,72 @@ paf_bootstrap_levels <- function(fg_data, formula, exposure_var,
 
   do.call(rbind, lapply(lev, function(L) {
     e <- ests[, L]; e <- e[is.finite(e)]
+    ci <- if (length(e) < 2) c(NA_real_, NA_real_)
+          else unname(quantile(e, c(0.025, 0.975), na.rm = TRUE))
     tibble::tibble(
       level     = L,
       PAF       = unname(pt_lev[L]),
-      lower     = unname(quantile(e, 0.025, na.rm = TRUE)),
-      upper     = unname(quantile(e, 0.975, na.rm = TRUE)),
+      lower     = ci[1],
+      upper     = ci[2],
       n_boot_ok = length(e),
       PAF_CI    = sprintf("%.1f%% (%.1f%% to %.1f%%)",
-                          100 * pt_lev[L],
-                          100 * quantile(e, 0.025, na.rm = TRUE),
-                          100 * quantile(e, 0.975, na.rm = TRUE))
+                          100 * pt_lev[L], 100 * ci[1], 100 * ci[2])
     )
   }))
 }
 
 paf_row_levels <- function(fit, fg_data, formula, exposure_var, label,
-                           R = 500, seed = 1) {
-  out <- paf_bootstrap_levels(fg_data, formula, exposure_var, R = R, seed = seed)
-  dplyr::mutate(out, model = label, .before = 1)
+                           R = R_boot, seed = 1, method = paf_method) {
+  out <- paf_bootstrap_levels(fg_data, formula, exposure_var,
+                              R = R, seed = seed, fit0 = fit, method = method)
+  out %>%
+    mutate(model = label, exposure = exposure_var) %>%
+    dplyr::select(model, exposure, level, PAF, lower, upper,
+                  n_boot_ok, PAF_CI)
 }
 
 # ---- M5 level-specific PAFs ------------------------------------------
 paf_m5_hearing_lev <- paf_row_levels(
   fit_m5_fg_hearing, fg_dat_hearing_m5, m5_formula,
-  "ctx_lag", "FG-M5 hearing (ctx)", R = R_boot, seed = 511
+  "ctx_lag", "FG-M5 hearing (ctx)", seed = 511
 )
 paf_m5_vision_lev  <- paf_row_levels(
   fit_m5_fg_vision,  fg_dat_vision_m5,  m5_formula,
-  "ctx_lag", "FG-M5 vision (ctx)",  R = R_boot, seed = 521
+  "ctx_lag", "FG-M5 vision (ctx)",  seed = 521
 )
 
 print(paf_m5_hearing_lev)
 print(paf_m5_vision_lev)
 
-# Sanity check: level PAFs should sum to the joint PAF you printed earlier
-cat("Sum of hearing level PAFs:", sum(paf_m5_hearing_lev$PAF), "\n")
-cat("Sum of vision  level PAFs:", sum(paf_m5_vision_lev$PAF),  "\n")
+# Sanity check: level PAFs must sum to the joint PAF from the same model
+cat("\nHearing -- sum of level PAFs:", sum(paf_m5_hearing_lev$PAF),
+    "| joint PAF:", paf_point(fit_m5_fg_hearing, fg_dat_hearing_m5, "ctx_lag"), "\n")
+cat("Vision  -- sum of level PAFs:", sum(paf_m5_vision_lev$PAF),
+    "| joint PAF:", paf_point(fit_m5_fg_vision,  fg_dat_vision_m5,  "ctx_lag"), "\n")
 
-# ---- Final PAF table (M5 now uses level-specific rows) ---------------
+# ---- Final PAF table --------------------------------------------------
 paf_fg_table <- bind_rows(
   paf_m1_hearing, paf_m1_vision, paf_m1_frailty,
   paf_m2_hearing, paf_m2_vision, paf_m2_frailty,
   paf_m3_hearing, paf_m3_vision, paf_m3_frailty,
   paf_m4_hearing, paf_m4_vision,
   paf_m4_fr_hearing, paf_m4_fr_vision, paf_m4_fr_frailty,
-  paf_m5_hearing_lev,        # replaces paf_m5_hearing
-  paf_m5_vision_lev          # replaces paf_m5_vision
+  paf_m5_hearing_lev,
+  paf_m5_vision_lev
 )
+
+cat("\n==========================================================\n")
+cat("PAF TABLE -- method:", paf_method, "| bootstrap reps:", R_boot, "\n")
+cat("==========================================================\n")
 print(paf_fg_table, n = Inf)
+
+# Any row where n_boot_ok is well below R_boot has an unreliable CI
+cat("\nReplicates that failed to converge:\n")
+paf_fg_table %>%
+  mutate(n_failed = R_boot - n_boot_ok) %>%
+  filter(n_failed > 0) %>%
+  dplyr::select(model, exposure, level, n_boot_ok, n_failed) %>%
+  print(n = Inf)
 
 ```
 

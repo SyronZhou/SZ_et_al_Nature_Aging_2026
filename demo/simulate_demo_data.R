@@ -22,7 +22,7 @@ suppressPackageStartupMessages(library(dplyr))
 set.seed(2026)
 
 N_HRS   <- 600L
-N_ELSA  <- 500L
+N_ELSA  <- 600L
 HRS_WAVES  <- seq(2004L, 2020L, by = 2L)
 ELSA_WAVES <- seq(2002L, 2018L, by = 2L)
 
@@ -59,6 +59,34 @@ simulate_cohort <- function(n, waves, id_name,
       # frailty index accrues with time, bounded to (0, 1)
       fi_raw = fi_intercept + fi_slope * (wave_idx - 1) + rnorm(n(), 0, 0.03),
       fi     = pmin(pmax(fi_raw, 0), 0.95),
+      frail  = as.integer(fi >= 0.25)
+    )
+
+  # Force a minority of people to acquire sensory impairment in the SAME wave as
+  # frailty onset. Without this, simultaneous onset (multi-state state 6) arises
+  # only by chance, leaving that state too sparse for msm::qratio.msm() to form
+  # a rate ratio out of it -- which fails with "object 'L' not found" whenever a
+  # transition rate is exactly zero.
+  first_frail <- panel %>%
+    filter(frail == 1L) %>%
+    group_by(.id) %>%
+    summarise(first_frail_wave = min(wave_idx), .groups = "drop")
+
+  people <- people %>%
+    left_join(first_frail, by = ".id") %>%
+    mutate(
+      sim_hear = !is.na(first_frail_wave) & runif(n()) < 0.12,
+      sim_vis  = !is.na(first_frail_wave) & runif(n()) < 0.12,
+      hear_onset_wave = if_else(sim_hear, first_frail_wave, hear_onset_wave),
+      vis_onset_wave  = if_else(sim_vis,  first_frail_wave, vis_onset_wave)
+    ) %>%
+    dplyr::select(-sim_hear, -sim_vis, -first_frail_wave)
+
+  panel <- panel %>%
+    dplyr::select(-hear_onset_wave, -vis_onset_wave) %>%
+    left_join(people %>% dplyr::select(.id, hear_onset_wave, vis_onset_wave),
+              by = ".id") %>%
+    mutate(
       # sensory impairment: present from onset, with occasional remission so the
       # time-varying exposures in the Cox models are genuinely reversible
       hearing_loss = if_else(!is.na(hear_onset_wave) & wave_idx >= hear_onset_wave,
@@ -75,7 +103,6 @@ simulate_cohort <- function(n, waves, id_name,
     group_by(.id) %>%
     arrange(wave_idx, .by_group = TRUE) %>%
     mutate(
-      frail = as.integer(fi >= 0.25),
       # a slightly leaner index for the (I)ADL-removed sensitivity analysis
       fi_noiadl    = pmin(pmax(fi - runif(n(), 0.00, 0.04), 0), 0.95),
       frail_noiadl = as.integer(fi_noiadl >= 0.25),

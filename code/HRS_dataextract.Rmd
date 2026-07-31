@@ -15,63 +15,94 @@ library(purrr)
 library(mice)       # make.method, make.predictorMatrix, mice, complete
 library(lattice)    # densityplot / stripplot in the MICE diagnostics
 
+# ---------------------------------------------------------------------------
+# Paths are relative to the REPOSITORY ROOT, not to code/.
+#
+# RStudio runs .Rmd chunks with the working directory set to the notebook's own
+# folder, so without this the code would look for code/data/ instead of data/.
+# The root is resolved into a variable rather than with setwd(), because a
+# setwd() inside a chunk does not persist to the next chunk.
+# ---------------------------------------------------------------------------
+repo_root <- if (basename(getwd()) == "code") normalizePath("..") else normalizePath(".")
+cat("Repository root:", repo_root, "\n")
+
 # Shared output location -- MUST match `data_dir` in HRS_analysis.Rmd so the
 # analysis notebook reads exactly what this notebook writes.
-data_dir <- "data"
+data_dir <- file.path(repo_root, "data")
 dir.create(data_dir, recursive = TRUE, showWarnings = FALSE)
 ```
 
 ```{r}
 #hrs summary data 
-hrs_2022summary <- "data/HRS/randhrs1992_2022v1_STATA/randhrs1992_2022v1.dta"
+hrs_2022summary <- file.path(repo_root, "data/HRS/randhrs1992_2022v1_STATA/randhrs1992_2022v1.dta")
 hrs_2022summary <- read_dta(hrs_2022summary)
 
 #hrs LangaWeir data 
-hrs_LangaWeir <- "data/HRS/LangaWeir2022v1/cogfinalimp_9522wide.dta"
+hrs_LangaWeir <- file.path(repo_root, "data/HRS/LangaWeir2022v1/cogfinalimp_9522wide.dta")
 hrs_LangaWeir <- read_dta(hrs_LangaWeir)
 
-#hrs Track data 
-hrs_Track <- "data/HRS/trk2022v1/trk2022tr_r.csv"
+# hrs Track data
+hrs_Track <- file.path(repo_root, "data/HRS/trk2022v1/trk2022tr_r.csv")
 hrs_Track <- read_csv(hrs_Track)
 
 # ---- Determine death events from the HRS Tracker ------------------------
-# A person is a death event (died == 1) iff a death YEAR can be established
-# from any tracker source. Sources, in priority order:
-#   1. KNOWNDECEASED* : confirmed deceased (highest quality)
-#   2. EXDEATH*       : death reported at/around an exit interview
-#   3. N* (NYEAR/NMONTH): National Death Index linkage
+# died == 1 iff a death YEAR can be established from any tracker source.
 #
-# FIX (death-date integrity): the previous code coalesced year and month
-# INDEPENDENTLY, so a year from one source could be paired with a month from a
-# different source. Here year and month are taken TOGETHER from the first
-# (highest-priority) source that supplies a year, keeping each date consistent.
+# Sources, in priority order:
+#   1. KNOWNDECEASED* with SOURCE 1-3 : observed death date (exit interview,
+#      spouse core interview, or field report)
+#   2. N* (NYEAR/NMONTH)              : National Death Index linkage
+#   3. KNOWNDECEASED* with SOURCE 4   : HRS-imputed date, last resort
+#
+# Year and month are taken TOGETHER from the first source supplying a year,
+# so a date is never assembled from two different sources.
+#
+# NOTE: NMONTH is a calendar QUARTER (1=Jan-Mar ... 4=Oct-Dec) in the public
+# release, NOT a month. It is mapped to the mid-quarter month before use.
+# EXDEATH* is omitted: it is a strict subset of KNOWNDECEASED* sources 1-2
+# (17,299 + 188 = 17,487) and adds no cases.
+
 death_track <- hrs_Track %>%
   transmute(
     # ID
     hhidpn = 1000 * as.numeric(HHID) + as.numeric(PN),
 
     # source-specific year/month, kept as pairs
-    ky = KNOWNDECEASEDYR, km = KNOWNDECEASEDMO,   # confirmed deceased
-    ey = EXDEATHYR,       em = EXDEATHMO,          # exit interview
-    ny = NYEAR,           nm = NMONTH,             # NDI linkage
+    ky = as.numeric(KNOWNDECEASEDYR),
+    km = as.numeric(KNOWNDECEASEDMO),
+    ks = as.numeric(KNOWNDECEASEDSOURCE),
+    ny = as.numeric(NYEAR),
+    nq = as.numeric(NMONTH),          # QUARTER, not month
 
     # Last observed alive
-    lastalive_year  = LASTALIVEYR,
-    lastalive_month = LASTALIVEMO
+    lastalive_year  = as.numeric(LASTALIVEYR),
+    lastalive_month = as.numeric(LASTALIVEMO)
   ) %>%
   mutate(
-    # take YEAR and MONTH from the SAME highest-priority available source
+    # NDI quarter -> mid-quarter month (1->2, 2->5, 3->8, 4->11)
+    nm = 3 * nq - 1,
+
+    # KD date is observed unless source 4 (imputed from last-alive date and
+    # the date HRS learned the respondent had died)
+    kd_observed = !is.na(ky) & ks %in% 1:3,
+
     death_year = case_when(
-      !is.na(ky) ~ as.numeric(ky),
-      !is.na(ey) ~ as.numeric(ey),
-      !is.na(ny) ~ as.numeric(ny),
-      TRUE       ~ NA_real_
+      kd_observed ~ ky,
+      !is.na(ny)  ~ ny,
+      !is.na(ky)  ~ ky,
+      TRUE        ~ NA_real_
     ),
     death_month = case_when(
-      !is.na(ky) ~ as.numeric(km),
-      !is.na(ey) ~ as.numeric(em),
-      !is.na(ny) ~ as.numeric(nm),
-      TRUE       ~ NA_real_
+      kd_observed ~ km,
+      !is.na(ny)  ~ nm,
+      !is.na(ky)  ~ km,
+      TRUE        ~ NA_real_
+    ),
+    death_src = case_when(
+      kd_observed ~ "known_observed",
+      !is.na(ny)  ~ "ndi",
+      !is.na(ky)  ~ "known_imputed",
+      TRUE        ~ NA_character_
     ),
 
     died = if_else(!is.na(death_year), 1L, 0L),
@@ -79,10 +110,15 @@ death_track <- hrs_Track %>%
     # fill missing month with mid-year ONLY when a death year exists
     death_month = if_else(is.na(death_month) & !is.na(death_year), 6, death_month),
     lastalive_month = if_else(is.na(lastalive_month) & !is.na(lastalive_year),
-                              6, lastalive_month)
+                              6, lastalive_month),
+
+    # flag deaths dated before the last known-alive date (n = 93)
+    date_conflict = died == 1 &
+      (death_year + (death_month - 1) / 12) <
+      (lastalive_year + (lastalive_month - 1) / 12)
   ) %>%
-  dplyr::select(hhidpn, death_year, death_month,
-                lastalive_year, lastalive_month, died)
+  dplyr::select(hhidpn, death_year, death_month, death_src,
+                lastalive_year, lastalive_month, died, date_conflict)
 
 # Quick look at how many death events were established
 cat("Death events determined from tracker:\n")
@@ -220,7 +256,7 @@ lw_2004 <- hrs_LangaWeir %>%
 # FAT 2004 file (UPDATE PATH to your 2004 file)
 ```{r}
 # FAT 2004 file
-fat_path_04 <- "data/HRS/h04f1c_STATA/h04f1c.dta"
+fat_path_04 <- file.path(repo_root, "data/HRS/h04f1c_STATA/h04f1c.dta")
 
 fat04 <- read_dta(
   fat_path_04,
@@ -763,7 +799,7 @@ lw_2006 <- hrs_LangaWeir %>%
 
 ```{r}
 # FAT 2006 file
-fat_path_06 <- "data/HRS/h06f4b_STATA/h06f4b.dta"
+fat_path_06 <- file.path(repo_root, "data/HRS/h06f4b_STATA/h06f4b.dta")
 
 fat06 <- read_dta(
   fat_path_06,
@@ -1218,7 +1254,7 @@ lw_2008 <- hrs_LangaWeir %>%
 
 ```{r}
 # FAT 2008 file
-fat_path_08 <- "data/HRS/h08f3b_STATA/h08f3b.dta"
+fat_path_08 <- file.path(repo_root, "data/HRS/h08f3b_STATA/h08f3b.dta")
 
 fat08 <- read_dta(
   fat_path_08,
@@ -1672,7 +1708,7 @@ lw_2010 <- hrs_LangaWeir %>%
 
 ```{r}
 # FAT 2010 file
-fat_path_10 <- "data/HRS/hd10f6b_STATA/hd10f6b.dta"
+fat_path_10 <- file.path(repo_root, "data/HRS/hd10f6b_STATA/hd10f6b.dta")
 
 fat10 <- read_dta(
   fat_path_10,
@@ -2125,7 +2161,7 @@ lw_2012 <- hrs_LangaWeir %>%
 
 ```{r}
 # FAT 2012 file
-fat_path_12 <- "data/HRS/h12f3a_STATA/h12f3a.dta"
+fat_path_12 <- file.path(repo_root, "data/HRS/h12f3a_STATA/h12f3a.dta")
 
 fat12 <- read_dta(
   fat_path_12,
@@ -2578,7 +2614,7 @@ lw_2014 <- hrs_LangaWeir %>%
 
 ```{r}
 # FAT 2014 file
-fat_path_14 <- "data/HRS/h14f2b_STATA/h14f2b.dta"
+fat_path_14 <- file.path(repo_root, "data/HRS/h14f2b_STATA/h14f2b.dta")
 
 fat14 <- read_dta(
   fat_path_14,
@@ -3030,7 +3066,7 @@ lw_2016 <- hrs_LangaWeir %>%
 
 ```{r}
 # FAT 2016 file
-fat_path_16 <- "data/HRS/h16f2c_STATA/h16f2c.dta"
+fat_path_16 <- file.path(repo_root, "data/HRS/h16f2c_STATA/h16f2c.dta")
 
 fat16 <- read_dta(
   fat_path_16,
@@ -3478,7 +3514,7 @@ lw_2018 <- hrs_LangaWeir %>%
 
 ```{r}
 # FAT 2018 file
-fat_path_18 <- "data/HRS/h18f2c_STATA/h18f2c.dta"
+fat_path_18 <- file.path(repo_root, "data/HRS/h18f2c_STATA/h18f2c.dta")
 
 fat18 <- read_dta(
   fat_path_18,
@@ -3939,7 +3975,7 @@ lw_2020 <- hrs_LangaWeir %>%
 
 ```{r}
 # FAT 2020 file
-fat_path_20 <- "data/HRS/h20f1b_STATA/h20f1b.dta"
+fat_path_20 <- file.path(repo_root, "data/HRS/h20f1b_STATA/h20f1b.dta")
 
 fat20 <- read_dta(
   fat_path_20,

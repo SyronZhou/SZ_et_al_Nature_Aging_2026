@@ -21,7 +21,19 @@ library(scales)
 
 # Load data
 ```{r}
-ELSA_long_final <- "data/elsa_long.csv"
+# ---------------------------------------------------------------------------
+# Paths are relative to the REPOSITORY ROOT, not to code/.
+#
+# RStudio runs .Rmd chunks with the working directory set to the notebook's own
+# folder, so without this the code would look for code/data/ instead of data/.
+# The root is resolved into a variable rather than with setwd(), because a
+# setwd() inside a chunk does not persist to the next chunk.
+# ---------------------------------------------------------------------------
+repo_root <- if (basename(getwd()) == "code") normalizePath("..") else normalizePath(".")
+data_dir  <- file.path(repo_root, "data")
+cat("Repository root:", repo_root, "\n")
+
+ELSA_long_final <- file.path(data_dir, "elsa_long.csv")
 ELSA_long <- read_csv(ELSA_long_final)
 
 ```

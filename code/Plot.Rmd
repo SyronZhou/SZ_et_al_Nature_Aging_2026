@@ -14,8 +14,18 @@ output: html_notebook
 -->
 
 
-
 ```{r}
+# ---------------------------------------------------------------------------
+# Paths are relative to the REPOSITORY ROOT, not to code/.
+#
+# RStudio runs .Rmd chunks with the working directory set to the notebook's own
+# folder, so without this the code would look for code/data/ instead of data/.
+# The root is resolved into a variable rather than with setwd(), because a
+# setwd() inside a chunk does not persist to the next chunk.
+# ---------------------------------------------------------------------------
+repo_root <- if (basename(getwd()) == "code") normalizePath("..") else normalizePath(".")
+cat("Repository root:", repo_root, "\n")
+
 library(ggplot2)
 library(dplyr)
 library(tidyr)
@@ -313,7 +323,7 @@ fig <- (pA | pD) /
 fig
 
 # ---- 8. Save (Nature double-column spec) -----------------------------------
-out_dir <- "output"
+out_dir <- file.path(repo_root, "output")
 if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
 
 ggsave(file.path(out_dir, "Figure_combined_HR_PAF_HRS_vs_ELSA_nature.png"),
@@ -558,7 +568,7 @@ fig_t4 <- (qA | qB) /
 fig_t4
 
 # ---- 8. Save (Nature double-column spec) ----------------------------------
-out_dir <- "output"
+out_dir <- file.path(repo_root, "output")
 if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
 
 ggsave(file.path(out_dir, "Figure_Table4_context_HR_PAF.png"),
@@ -579,8 +589,8 @@ library(forestploter); library(grid); library(dplyr); library(tidyr)
 library(purrr);       library(tibble); library(ggplot2)
 
 # ---- 1. Load + sanity check ----------------------------------------------
-sub_HRS  <- readRDS("results/subgroup_HRS.rds")
-sub_ELSA <- readRDS("results/subgroup_ELSA.rds")
+sub_HRS  <- readRDS(file.path(repo_root, "results/subgroup_HRS.rds"))
+sub_ELSA <- readRDS(file.path(repo_root, "results/subgroup_ELSA.rds"))
 
 # Compatibility shim: older saves were flat (m4_h, m4_v, ...), newer ones
 # wrap them in $cox plus $paf and $forest.
@@ -873,8 +883,8 @@ library(purrr);       library(tibble); library(ggplot2)
 # install.packages("ragg")
 
 # ---- 1. Load results and sanity-check cohorts ----------------------------
-sub_HRS  <- readRDS("results/subgroup_HRS.rds")
-sub_ELSA <- readRDS("results/subgroup_ELSA.rds")
+sub_HRS  <- readRDS(file.path(repo_root, "results/subgroup_HRS.rds"))
+sub_ELSA <- readRDS(file.path(repo_root, "results/subgroup_ELSA.rds"))
 
 get_cox <- function(x) if (!is.null(x$cox)) x$cox else x
 get_paf <- function(x) {
@@ -1240,6 +1250,9 @@ print(p_combined)
 #       To switch to ELSA, change cohort = "ELSA" and pal entry accordingly.
 ```{r}
 # ---- 0. Shared palette ----------------------------------------------------
+library(ggplot2); library(dplyr); library(tibble)
+library(patchwork); library(scales); library(grid)
+
 pal <- c(HRS = "#0072B2", ELSA = "#D55E00")
 
 # ============================================================================
@@ -1500,38 +1513,40 @@ make_paf_panel_t4 <- function(dat, panel_letter, exposure_label,
 }
 
 # ============================================================================
-# 1. Table 18 — hazard ratios (HRS Fine–Gray)
+# 1. Supplementary Table 20 — hazard ratios and PAFs (HRS Fine–Gray)
 # ============================================================================
 res_fg <- tibble::tribble(
   ~exposure, ~model, ~cohort, ~HR,  ~lcl, ~ucl,
-  "Hearing", "M1",   "HRS",   1.77, 1.65, 1.90,
-  "Hearing", "M2",   "HRS",   1.32, 1.22, 1.42,
-  "Hearing", "M3",   "HRS",   1.18, 1.09, 1.27,
-  "Hearing", "M4",   "HRS",   1.12, 1.04, 1.21,
-  "Vision",  "M1",   "HRS",   2.00, 1.87, 2.14,
-  "Vision",  "M2",   "HRS",   1.75, 1.63, 1.88,
-  "Vision",  "M3",   "HRS",   1.26, 1.17, 1.36,
-  "Vision",  "M4",   "HRS",   1.19, 1.10, 1.28,
-  "Frailty", "M1",   "HRS",   2.38, 2.22, 2.54,
-  "Frailty", "M2",   "HRS",   1.81, 1.69, 1.95,
-  "Frailty", "M3",   "HRS",   1.34, 1.25, 1.44,
-  "Frailty", "M4",   "HRS",   1.28, 1.19, 1.38
+  "Hearing", "M1",   "HRS",   1.83, 1.70, 1.97,
+  "Hearing", "M2",   "HRS",   1.40, 1.29, 1.51,
+  "Hearing", "M3",   "HRS",   1.25, 1.16, 1.35,
+  "Hearing", "M4",   "HRS",   1.18, 1.09, 1.27,
+  "Vision",  "M1",   "HRS",   2.09, 1.95, 2.24,
+  "Vision",  "M2",   "HRS",   1.87, 1.74, 2.01,
+  "Vision",  "M3",   "HRS",   1.34, 1.24, 1.44,
+  "Vision",  "M4",   "HRS",   1.23, 1.14, 1.33,
+  "Frailty", "M1",   "HRS",   2.51, 2.34, 2.69,
+  "Frailty", "M2",   "HRS",   2.00, 1.86, 2.15,
+  "Frailty", "M3",   "HRS",   1.46, 1.36, 1.58,
+  "Frailty", "M4",   "HRS",   1.38, 1.28, 1.49
 )
 
+# NOTE: `prev` (person-time prevalence) is carried over from the previous
+# version -- Supplementary Table 20 does not report it. Update if it changed.
 paf_fg <- tibble::tribble(
   ~cohort, ~exposure, ~model, ~prev,  ~paf, ~lo,  ~hi,
-  "HRS", "Hearing", 1, 0.2050, 14.4, 12.3, 16.4,
-  "HRS", "Hearing", 2, 0.2050,  6.4,  4.7,  8.3,
-  "HRS", "Hearing", 3, 0.2050,  3.7,  1.8,  5.5,
-  "HRS", "Hearing", 4, 0.2050,  2.6,  0.8,  4.4,
-  "HRS", "Vision",  1, 0.2220, 19.1, 17.2, 21.3,
-  "HRS", "Vision",  2, 0.2220, 15.1, 12.9, 17.2,
-  "HRS", "Vision",  3, 0.2220,  5.8,  3.9,  7.7,
-  "HRS", "Vision",  4, 0.2220,  4.2,  2.4,  6.3,
-  "HRS", "Frailty", 1, 0.2900, 31.0, 28.6, 33.7,
-  "HRS", "Frailty", 2, 0.2900, 21.0, 18.4, 23.7,
-  "HRS", "Frailty", 3, 0.2900, 10.1,  7.6, 12.7,
-  "HRS", "Frailty", 4, 0.2900,  8.4,  5.7, 11.1
+  "HRS", "Hearing", 1, 0.2050, 14.8, 12.9, 16.3,
+  "HRS", "Hearing", 2, 0.2050,  9.2,  7.2, 11.5,
+  "HRS", "Hearing", 3, 0.2050,  6.5,  2.6,  8.2,
+  "HRS", "Hearing", 4, 0.2050,  4.9,  3.0,  7.6,
+  "HRS", "Vision",  1, 0.2220, 19.8, 18.7, 21.7,
+  "HRS", "Vision",  2, 0.2220, 17.7, 15.7, 19.6,
+  "HRS", "Vision",  3, 0.2220,  9.5,  7.3, 11.6,
+  "HRS", "Vision",  4, 0.2220,  7.2,  5.1,  9.6,
+  "HRS", "Frailty", 1, 0.2900, 31.1, 28.7, 33.1,
+  "HRS", "Frailty", 2, 0.2900, 25.8, 22.6, 27.6,
+  "HRS", "Frailty", 3, 0.2900, 16.3, 13.6, 19.6,
+  "HRS", "Frailty", 4, 0.2900, 14.2, 11.2, 16.9
 )
 
 # ---- 2. Factor levels, axis ranges (must exist before panels are built) ---
@@ -1563,9 +1578,10 @@ paf_fg <- paf_fg %>%
          paf_lab  = sprintf("%.1f%% (%.1f, %.1f)", paf, lo, hi),
          y_num    = as.numeric(model))
 
-hr_xlim     <- c(0.8, 3.2)
-hr_breaks   <- c(1, 1.5, 2, 2.5, 3)
-hr_label_x  <- 3.25
+# Rescaled for the new maxima: HR ucl tops out at 2.69, PAF hi at 33.1
+hr_xlim     <- c(0.8, 2.8)
+hr_breaks   <- c(1, 1.5, 2, 2.5)
+hr_label_x  <- 2.85
 paf_xlim    <- c(-3, 50)
 paf_breaks  <- c(0, 5, 10, 15, 20, 25, 30, 35)
 paf_label_x <- 36
@@ -1597,22 +1613,22 @@ fig_S1a <- (pA | pD) / (pB | pE) / (pC | pF) +
 fig_S1a
 
 # ============================================================================
-# 4. Table 19 — context-specific (Model 5)
+# 4. Supplementary Table 21 — context-specific (Model 5)
 # ============================================================================
 hr_fg_t5 <- tibble::tribble(
   ~exposure, ~pathway,    ~cohort, ~HR,  ~lcl, ~ucl,
-  "Hearing", "Before",    "HRS",   0.96, 0.85, 1.08,
-  "Hearing", "With/after","HRS",   1.27, 1.16, 1.39,
+  "Hearing", "Before",    "HRS",   0.93, 0.82, 1.04,
+  "Hearing", "With/after","HRS",   1.30, 1.19, 1.41,
   "Vision",  "Before",    "HRS",   1.03, 0.92, 1.16,
-  "Vision",  "With/after","HRS",   1.33, 1.23, 1.45
+  "Vision",  "With/after","HRS",   1.41, 1.30, 1.53
 )
 
 paf_fg_t5 <- tibble::tribble(
   ~exposure, ~pathway,    ~cohort, ~paf, ~lo,  ~hi,
-  "Hearing", "Before",    "HRS",   -0.4, -1.4,  0.6,
-  "Hearing", "With/after","HRS",    3.5,  2.1,  5.1,
-  "Vision",  "Before",    "HRS",    0.2, -0.8,  1.2,
-  "Vision",  "With/after","HRS",    5.0,  3.5,  6.6
+  "Hearing", "Before",    "HRS",   -0.7, -1.6,  0.0,
+  "Hearing", "With/after","HRS",    5.3,  3.9,  7.2,
+  "Vision",  "Before",    "HRS",    0.3, -0.8,  1.5,
+  "Vision",  "With/after","HRS",    8.3,  6.4, 10.6
 )
 
 pathway_levels <- c("Total", "With/after", "Before")
@@ -1634,12 +1650,13 @@ paf_fg_t5 <- paf_fg_t5 %>%
          paf_lab  = sprintf("%.1f%% (%.1f, %.1f)", paf, lo, hi),
          y_num    = as.numeric(pathway))
 
-hr_xlim_t4    <- c(0.65, 2.0)
-hr_breaks_t4  <- c(0.8, 1, 1.2, 1.5, 1.8)
-hr_label_x4   <- 2.05
-paf_xlim_t4   <- c(-3, 12)
+# Rescaled: HR ucl tops out at 1.53, PAF point at 8.3 (hi 10.6)
+hr_xlim_t4    <- c(0.75, 1.70)
+hr_breaks_t4  <- c(0.8, 1.0, 1.2, 1.4, 1.6)
+hr_label_x4   <- 1.72
+paf_xlim_t4   <- c(-3, 18)
 paf_breaks_t4 <- c(-2, 0, 2, 4, 6, 8)
-paf_label_x4  <- 7.5
+paf_label_x4  <- 9.2
 
 qA <- make_hr_panel_t4(filter(hr_fg_t5,  exposure == "Hearing"),
                        "a", "Hearing impairment",
@@ -1662,7 +1679,7 @@ fig_S1b <- (qA | qB) / (qC | qD) +
 fig_S1b
 
 # ---- 5. Save --------------------------------------------------------------
-out_dir <- "output"
+out_dir <- file.path(repo_root, "output")
 if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
 
 ggsave(file.path(out_dir, "FigureS1a_FineGray_HR_PAF_M1toM4.png"),
@@ -1853,7 +1870,7 @@ fig_S2b <- (qA | qB) / (qC | qD) +
         legend.box.margin = margin(b = -2))
 fig_S2b
 # ---- Save ------------------------------------------------------------------
-out_dir <- "output"
+out_dir <- file.path(repo_root, "output")
 if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
 ggsave(file.path(out_dir, "FigureS2a_Lagged2w_HR_PAF_M1toM4.png"),
        fig_S2a, width = 183, height = 215, units = "mm", dpi = 600, bg = "white")
@@ -2042,7 +2059,7 @@ fig_S3b <- (qA | qB) / (qC | qD) +
         legend.box.margin = margin(b = -2))
 fig_S3b
 # ---- Save ------------------------------------------------------------------
-out_dir <- "output"
+out_dir <- file.path(repo_root, "output")
 if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
 ggsave(file.path(out_dir, "FigureS3a_FInoADL_HR_PAF_M1toM4.png"),
        fig_S3a, width = 183, height = 215, units = "mm", dpi = 600, bg = "white")
