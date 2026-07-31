@@ -552,6 +552,40 @@ write.csv(panel_df_eligible,
 
 # msm for hearing loss, frailty, and dementia (HRS — 8-state model with death)
 ```{r}
+# MSM data build — HEARING (8-state model with death)
+# Logic unchanged; diagnostics added so the effect of the corrected death
+# dates is visible and the before/after comparison can be made directly.
+# ============================================================================
+
+# ---- 0) PRE-FLIGHT: death columns must be present on panel_df_eligible -----
+# Re-running the eligibility chunk rebuilds panel_df_eligible from panel_df
+# and silently discards the death columns. This block makes the MSM chunk
+# independent of execution order.
+if (!exists("death_track_clean")) {
+  stop("death_track_clean not found -- run the death-tracking chunk (Step 5) first.")
+}
+
+drop_stale <- function(d) dplyr::select(d, -any_of(
+  c("death_year", "death_month", "death_date", "died")))
+
+if (!all(c("died", "death_date") %in% names(panel_df_eligible))) {
+  message("panel_df_eligible is missing death columns -- re-joining death_track_clean.")
+  panel_df_eligible <- panel_df_eligible %>%
+    drop_stale() %>%
+    mutate(hhidpn = as.character(hhidpn)) %>%
+    left_join(death_track_clean %>% mutate(hhidpn = as.character(hhidpn)),
+              by = "hhidpn")
+}
+
+n_dead_panel <- sum(panel_df_eligible$died == 1, na.rm = TRUE)
+if (is.null(panel_df_eligible$died) || n_dead_panel == 0) {
+  stop("panel_df_eligible has no deaths after the join -- check that hhidpn ",
+       "types match between panel_df_eligible and death_track_clean.")
+}
+cat("Death join OK:", n_dead_panel, "person-waves |",
+    dplyr::n_distinct(panel_df_eligible$hhidpn[panel_df_eligible$died == 1]),
+    "decedents\n")
+
 # 1) Build interview-based dataset with time since baseline (NO age)
 ms_base <- panel_df_eligible %>%
   mutate(
@@ -578,10 +612,50 @@ death_tbl <- ms_base %>%
       NA_real_
     ),
     .groups = "drop"
-  ) %>%
+  )
+
+# death info must be constant within person, or first() is silently arbitrary
+stopifnot(
+  ms_base %>% distinct(hhidpn, death_date, died) %>%
+    count(hhidpn) %>% pull(n) %>% max() == 1
+)
+
+# ---- diagnostic: deaths lost at the >= 0 boundary --------------------------
+n_dec_raw  <- sum(death_tbl$died == 1 & !is.na(death_tbl$death_time))
+n_before_0 <- sum(death_tbl$died == 1 & !is.na(death_tbl$death_time) &
+                    death_tbl$death_time < 0)
+n_at_0     <- sum(death_tbl$died == 1 & !is.na(death_tbl$death_time) &
+                    death_tbl$death_time == 0)
+cat("Decedents with a death date      :", n_dec_raw, "\n")
+cat("  dropped, death before baseline :", n_before_0, "\n")
+cat("  death exactly AT baseline (t=0):", n_at_0,
+    "  <- these tie with the baseline interview, become a single\n",
+    "                                      state-8 row, and are then removed by n() >= 2\n")
+
+death_tbl <- death_tbl %>%
   mutate(
     death_time = ifelse(!is.na(death_time) & death_time >= 0, death_time, NA_real_)
   )
+
+# ---- diagnostic: deaths dated BEFORE the last observed interview -----------
+# These silently truncate real interview rows in step 6. This is the MSM
+# analogue of the Fine-Gray `bad_death_times` warning.
+last_int <- ms_base %>%
+  group_by(hhidpn) %>%
+  summarise(last_int_time = max(time), .groups = "drop")
+
+conflict_tbl <- death_tbl %>%
+  filter(died == 1, !is.na(death_time)) %>%
+  left_join(last_int, by = "hhidpn") %>%
+  filter(death_time < last_int_time)
+
+if (nrow(conflict_tbl) > 0) {
+  warning(sprintf(
+    "%d decedent(s) have death_time before their last interview; interview rows after death will be truncated (hhidpn: %s)",
+    nrow(conflict_tbl), paste(head(conflict_tbl$hhidpn, 10), collapse = ", ")
+  ))
+}
+cat("Deaths dated before last interview:", nrow(conflict_tbl), "\n")
 
 # 3) Append ONE death row per decedent at exact death_time
 death_rows <- death_tbl %>%
@@ -591,6 +665,7 @@ death_rows <- death_tbl %>%
     time  = death_time,
     state = 8L
   )
+cat("Death rows appended               :", nrow(death_rows), "\n")
 
 # 4) Construct clinical states (1-7) on interview rows
 #
@@ -643,22 +718,50 @@ ms_states <- ms_base %>%
 # FIX: same issue as the vision pipeline -- ms_states was listed first in
 # bind_rows(), so a stable sort + slice(1) always kept the interview row
 # over a same-day death row. This ranks death (state 8) first on ties.
-ms_dat <- bind_rows(ms_states, death_rows) %>%
+ms_pre <- bind_rows(ms_states, death_rows) %>%
   arrange(hhidpn, time, desc(state == 8L)) %>%   # death wins any same-time tie
   group_by(hhidpn, time) %>%
   slice(1) %>%                                  # collapse duplicates at same t
-  ungroup() %>%
+  ungroup()
+
+ms_trunc <- ms_pre %>%
   group_by(hhidpn) %>%
   mutate(
     first_absorb_time = if (any(state %in% c(7L, 8L)))
                           min(time[state %in% c(7L, 8L)]) else NA_real_
   ) %>%
   filter(is.na(first_absorb_time) | time <= first_absorb_time) %>%
-  ungroup() %>%
+  ungroup()
+
+ms_dat <- ms_trunc %>%
   group_by(hhidpn) %>%
   filter(n() >= 2) %>%
   ungroup() %>%
   dplyr::select(hhidpn, time, state)
+
+# ---- attrition report ------------------------------------------------------
+cat("\nRows after merge + tie-collapse   :", nrow(ms_pre), "\n")
+cat("Rows truncated after absorption   :", nrow(ms_pre) - nrow(ms_trunc), "\n")
+cat("Persons dropped by n() >= 2       :",
+    dplyr::n_distinct(ms_trunc$hhidpn) - dplyr::n_distinct(ms_dat$hhidpn), "\n")
+cat("Final: rows", nrow(ms_dat), "| persons", dplyr::n_distinct(ms_dat$hhidpn), "\n")
+
+# ---- KEY before/after comparator ------------------------------------------
+# The corrected death dates can flip a person between terminal state 7
+# (dementia) and 8 (death). Compare this table against your previous run.
+cat("\nTerminal state per person (7 = dementia, 8 = death, else censored):\n")
+ms_dat %>%
+  group_by(hhidpn) %>%
+  summarise(terminal = dplyr::last(state[order(time)]), .groups = "drop") %>%
+  mutate(terminal = dplyr::case_when(terminal == 7L ~ "7 dementia",
+                                     terminal == 8L ~ "8 death",
+                                     TRUE           ~ "censored")) %>%
+  count(terminal) %>%
+  print()
+
+# the model cannot be identified without observed deaths
+stopifnot(sum(ms_dat$state == 8L) > 0)
+
 
 ```
 
@@ -752,6 +855,41 @@ cat("\n=== Transition probabilities at t = 10 years ===\n"); print(P10)
 
 # msm for vision loss, frailty, and dementia (HRS — 8-state model with death)
 ```{r}
+# MSM data build — VISION (8-state model with death)
+# Logic unchanged; mirrors the hearing pipeline, including the pre-flight
+# guard so a missing death join fails loudly instead of producing
+# "Deceased in cohort: 0".
+# ============================================================================
+
+# ---- 0) PRE-FLIGHT: death columns must be present on panel_df_eligible -----
+# Re-running the eligibility chunk rebuilds panel_df_eligible from panel_df
+# and silently discards the death columns. This block makes the chunk
+# independent of execution order.
+if (!exists("death_track_clean")) {
+  stop("death_track_clean not found -- run the death-tracking chunk (Step 5) first.")
+}
+
+drop_stale <- function(d) dplyr::select(d, -any_of(
+  c("death_year", "death_month", "death_date", "died")))
+
+if (!all(c("died", "death_date") %in% names(panel_df_eligible))) {
+  message("panel_df_eligible is missing death columns -- re-joining death_track_clean.")
+  panel_df_eligible <- panel_df_eligible %>%
+    drop_stale() %>%
+    mutate(hhidpn = as.character(hhidpn)) %>%
+    left_join(death_track_clean %>% mutate(hhidpn = as.character(hhidpn)),
+              by = "hhidpn")
+}
+
+n_dead_panel <- sum(panel_df_eligible$died == 1, na.rm = TRUE)
+if (is.null(panel_df_eligible$died) || n_dead_panel == 0) {
+  stop("panel_df_eligible has no deaths after the join -- check that hhidpn ",
+       "types match between panel_df_eligible and death_track_clean.")
+}
+cat("Death join OK:", n_dead_panel, "person-waves |",
+    dplyr::n_distinct(panel_df_eligible$hhidpn[panel_df_eligible$died == 1]),
+    "decedents\n")
+
 # 1) Build interview-based dataset with time since baseline
 ms_base_vis <- panel_df_eligible %>%
   mutate(
@@ -778,10 +916,49 @@ death_tbl_vis <- ms_base_vis %>%
       NA_real_
     ),
     .groups = "drop"
-  ) %>%
+  )
+
+# death info must be constant within person, or first() is silently arbitrary
+stopifnot(
+  ms_base_vis %>% distinct(hhidpn, death_date, died) %>%
+    count(hhidpn) %>% pull(n) %>% max() == 1
+)
+
+# ---- diagnostic: deaths lost at the >= 0 boundary --------------------------
+n_dec_raw_vis  <- sum(death_tbl_vis$died == 1 & !is.na(death_tbl_vis$death_time))
+n_before_0_vis <- sum(death_tbl_vis$died == 1 & !is.na(death_tbl_vis$death_time) &
+                        death_tbl_vis$death_time < 0)
+n_at_0_vis     <- sum(death_tbl_vis$died == 1 & !is.na(death_tbl_vis$death_time) &
+                        death_tbl_vis$death_time == 0)
+cat("Decedents with a death date      :", n_dec_raw_vis, "\n")
+cat("  dropped, death before baseline :", n_before_0_vis, "\n")
+cat("  death exactly AT baseline (t=0):", n_at_0_vis,
+    "  <- these tie with the baseline interview, become a single\n",
+    "                                      state-8 row, and are then removed by n() >= 2\n")
+
+death_tbl_vis <- death_tbl_vis %>%
   mutate(
     death_time = ifelse(!is.na(death_time) & death_time >= 0, death_time, NA_real_)
   )
+
+# ---- diagnostic: deaths dated BEFORE the last observed interview -----------
+# These silently truncate real interview rows in step 6.
+last_int_vis <- ms_base_vis %>%
+  group_by(hhidpn) %>%
+  summarise(last_int_time = max(time), .groups = "drop")
+
+conflict_tbl_vis <- death_tbl_vis %>%
+  filter(died == 1, !is.na(death_time)) %>%
+  left_join(last_int_vis, by = "hhidpn") %>%
+  filter(death_time < last_int_time)
+
+if (nrow(conflict_tbl_vis) > 0) {
+  warning(sprintf(
+    "%d decedent(s) have death_time before their last interview; interview rows after death will be truncated (hhidpn: %s)",
+    nrow(conflict_tbl_vis), paste(head(conflict_tbl_vis$hhidpn, 10), collapse = ", ")
+  ))
+}
+cat("Deaths dated before last interview:", nrow(conflict_tbl_vis), "\n")
 
 # 3) Append ONE death row per decedent at exact death_time
 death_rows_vis <- death_tbl_vis %>%
@@ -791,6 +968,7 @@ death_rows_vis <- death_tbl_vis %>%
     time  = death_time,
     state = 8L
   )
+cat("Death rows appended               :", nrow(death_rows_vis), "\n")
 
 # 4) Construct clinical states (1-7) on interview rows
 #
@@ -847,22 +1025,50 @@ ms_states_vis <- ms_base_vis %>%
 # an interview row would always win a same-day tie against a death row --
 # silently discarding the death. This explicitly ranks death (state 8)
 # first on any tie before collapsing, so a same-day death is never dropped.
-ms_dat_vis <- bind_rows(ms_states_vis, death_rows_vis) %>%
+ms_pre_vis <- bind_rows(ms_states_vis, death_rows_vis) %>%
   arrange(hhidpn, time, desc(state == 8L)) %>%   # death wins any same-time tie
   group_by(hhidpn, time) %>%
   slice(1) %>%                                  # collapse same-time records
-  ungroup() %>%
+  ungroup()
+
+ms_trunc_vis <- ms_pre_vis %>%
   group_by(hhidpn) %>%
   mutate(
     first_absorb_time = if (any(state %in% c(7L, 8L)))
                           min(time[state %in% c(7L, 8L)]) else NA_real_
   ) %>%
   filter(is.na(first_absorb_time) | time <= first_absorb_time) %>%
-  ungroup() %>%
+  ungroup()
+
+ms_dat_vis <- ms_trunc_vis %>%
   group_by(hhidpn) %>%
   filter(n() >= 2) %>%
   ungroup() %>%
   dplyr::select(hhidpn, time, state)
+
+# ---- attrition report ------------------------------------------------------
+cat("\nRows after merge + tie-collapse   :", nrow(ms_pre_vis), "\n")
+cat("Rows truncated after absorption   :", nrow(ms_pre_vis) - nrow(ms_trunc_vis), "\n")
+cat("Persons dropped by n() >= 2       :",
+    dplyr::n_distinct(ms_trunc_vis$hhidpn) - dplyr::n_distinct(ms_dat_vis$hhidpn), "\n")
+cat("Final: rows", nrow(ms_dat_vis), "| persons",
+    dplyr::n_distinct(ms_dat_vis$hhidpn), "\n")
+
+# ---- KEY before/after comparator ------------------------------------------
+# The corrected death dates can flip a person between terminal state 7
+# (dementia) and 8 (death). Compare this table against your previous run.
+cat("\nTerminal state per person (7 = dementia, 8 = death, else censored):\n")
+ms_dat_vis %>%
+  group_by(hhidpn) %>%
+  summarise(terminal = dplyr::last(state[order(time)]), .groups = "drop") %>%
+  mutate(terminal = dplyr::case_when(terminal == 7L ~ "7 dementia",
+                                     terminal == 8L ~ "8 death",
+                                     TRUE           ~ "censored")) %>%
+  count(terminal) %>%
+  print()
+
+# the model cannot be identified without observed deaths
+stopifnot(sum(ms_dat_vis$state == 8L) > 0)
 
 ```
 
@@ -978,7 +1184,7 @@ cat("\n=== Vision: Transition probabilities at t = 10 years ===\n"); print(P10_v
 ```
 
 
-<!-- Composite figure panels: moved here so that the vision multi-state
+<!-- Composite figure panels: placed here so that the vision multi-state
      model (fitted above) already exists when these chunks run. -->
 
 ```{r}
@@ -1014,35 +1220,50 @@ mat_to_long_local <- function(P, time_label, state_levels_local) {
     )
 }
 
-build_heatmap <- function(P5_mat, P10_mat, model_label, sense_word) {
+build_heatmap <- function(P5_mat, P10_mat, model_label, sense_word,
+                          drop_absorbing_rows = TRUE,
+                          highlight_dementia  = FALSE,   # <-- was TRUE
+                          highlight_colour    = "#D55E00") {
+
   state_lvl   <- make_state_levels(sense_word)
   absorb_lvls <- state_lvl[7:8]                # Dementia + Death
+
   data <- bind_rows(
     mat_to_long_local(P5_mat,  "5 years",  state_lvl),
     mat_to_long_local(P10_mat, "10 years", state_lvl)
-  ) %>%
-    filter(!from %in% absorb_lvls) %>%         # <-- drop trivial absorbing rows
+  )
+
+  if (drop_absorbing_rows) {
+    data <- data %>% filter(!from %in% absorb_lvls)
+  }
+
+  data <- data %>%
     mutate(
       from  = droplevels(from),                # keep y-axis tidy
       model = factor(model_label, levels = model_label)
     )
 
-  # --- position of the Dementia column + number of origin rows (for the highlight) ---
+  # --- position of the Dementia column + number of origin rows ---
   dem_x  <- which(levels(data$to) == "Dementia")
-  n_from <- nlevels(droplevels(data$from))
+  n_from <- nlevels(data$from)
 
-  ggplot(data, aes(x = to, y = fct_rev(from), fill = prob)) +
+  p <- ggplot(data, aes(x = to, y = fct_rev(from), fill = prob)) +
     geom_tile(colour = "white", linewidth = 0.5) +
     geom_text(aes(label  = ifelse(prob >= 0.005, sprintf("%.2f", prob), ""),
                   colour = prob > 0.5),
               size = 3.4) +
     scale_colour_manual(values = c(`TRUE` = "white", `FALSE` = "grey15"),
-                        guide  = "none") +
-    # --- highlight the Dementia destination column ---
-    annotate("rect",
-             xmin = dem_x - 0.5, xmax = dem_x + 0.5,
-             ymin = 0.5,         ymax = n_from + 0.5,
-             fill = NA, colour = "#D55E00", linewidth = 1.1) +
+                        guide  = "none")
+
+  if (highlight_dementia) {
+    p <- p +
+      annotate("rect",
+               xmin = dem_x - 0.5, xmax = dem_x + 0.5,
+               ymin = 0.5,         ymax = n_from + 0.5,
+               fill = NA, colour = highlight_colour, linewidth = 1.1)
+  }
+
+  p +
     facet_grid(model ~ time, switch = "y") +
     scale_fill_gradientn(
       colours = c("#FFFFFF", "#DEEBF7", "#9ECAE1",
@@ -1073,9 +1294,11 @@ build_heatmap <- function(P5_mat, P10_mat, model_label, sense_word) {
 
 # ----------------------------------------------------------------------------
 # Compose Panel A (hearing + vision)
-# Requires: fit_vision, P5_vis, P10_vis from the parallel vision pipeline
-# (same code as above with vision_loss replacing hearing_loss).
+# Requires: P5, P10 from the hearing pipeline and
+#           P5_vis, P10_vis from the parallel vision pipeline.
 # ----------------------------------------------------------------------------
+stopifnot(exists("P5"), exists("P10"), exists("P5_vis"), exists("P10_vis"))
+
 panel_A_hearing <- build_heatmap(P5,     P10,     "Hearing model", "Hearing")
 panel_A_vision  <- build_heatmap(P5_vis, P10_vis, "Vision model",  "Vision")
 
@@ -1090,17 +1313,18 @@ panel_A <- panel_A_hearing / panel_A_vision +
   ) &
   theme(legend.position = "right")
 
+panel_A
+
 ```
 
 
 ```{r}
-# COMPOSITE FIGURE — patchwork layout
-ggsave("HRS_panelA_heatmap.tiff",
-       plot   = panel_A,
-       width  = 14, height = 12, units = "in",          # 8 origin rows
-       dpi    = 300,
-       device = "tiff",
-       compression = "lzw")
+# ---- Save ------------------------------------------------------------------
+out_dir <- file.path(repo_root, "output")
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+ggsave(file.path(out_dir, "PanelA_MSM_transition_heatmap.png"),
+       panel_A, width = 340, height = 300, units = "mm", dpi = 600, bg = "white")
 
 ```
 
