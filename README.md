@@ -138,7 +138,7 @@ present in the environment used to run the analyses:
 
 | Package | Version | | Package | Version |
 |---------|---------|-|---------|---------|
-| `tidyverse` | 2.0.0 | | `msm` | 1.8.2 |
+| `tidyverse` | 2.0.0 | | `msm` | 1.9 |
 | `dplyr` | 1.1.4 | | `survival` | 3.7.0 |
 | `haven` | 2.5.5 | | `survminer` | 0.4.9 |
 | `labelled` | 2.13.0 | | `MASS` | 7.3.65 |
@@ -307,7 +307,7 @@ g-formula bootstrap replicates on 3 parallel workers:
 | `demo/simulate_demo_data.R` | ~1 second |
 | `code/HRS_analysis_MSM.Rmd` | over 30 minutes (being measured) |
 | `code/HRS_analysis_Cox.Rmd` | ~9 minutes |
-| `code/ELSA_analysis_MSM.Rmd` | being measured |
+| `code/ELSA_analysis_MSM.Rmd` | ~15 minutes |
 | `code/ELSA_analysis_Cox.Rmd` | ~10 minutes |
 | `code/Plot.Rmd` | ~30 seconds |
 
@@ -390,7 +390,7 @@ specific notebook section:
 | Supplementary Tables 1–4 (exclusion flow, baseline year) | `*_analysis_MSM.Rmd` → exclusion-flow and baseline-year chunks |
 | Supplementary Table 12 (assessments attended and follow-up) | `*_analysis_Cox.Rmd` → "Attendance and follow-up" chunk |
 | Fig. 1, Fig. 2, Supplementary Figs 7–8, Supplementary Tables 13–16 (HRS) and 19–22 (ELSA) | `*_analysis_MSM.Rmd` → `msm`, `qratio.msm` and `pmatrix.msm` chunks and the heatmap chunk |
-| Supplementary Tables 17–18 (HRS) and 23 (ELSA): reverse transitions | `*_analysis_MSM.Rmd` → reverse-transition chunks |
+| Supplementary Tables 17–18 (HRS) and 23–24 (ELSA): reverse transitions | `*_analysis_MSM.Rmd` → reverse-transition chunks |
 | Supplementary Tables 25–28 (HRS) and 29–32 (ELSA): backward-transition models | `*_analysis_MSM.Rmd` → backward-transition sensitivity chunks |
 | Fig. 3, Supplementary Table 33 (Models 1–4 HRs and PAFs) | `*_analysis_Cox.Rmd` → Cox Models 1–4 and PAF chunks; figure in `Plot.Rmd` |
 | Supplementary Tables 34–35 (interaction, multicollinearity) | `*_analysis_Cox.Rmd` → interaction and pre-flight chunks |

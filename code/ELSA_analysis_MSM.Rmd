@@ -1259,7 +1259,7 @@ saveRDS(list(fit_vision_0 = fit_vision_0, fit_vision_adj = fit_vision_adj),
 
 
 ```{r}
-# Reverse transitions (moving back to an earlier state; Supplementary Table 23)
+# Reverse transitions (moving back to an earlier state; Supplementary Tables 23 and 24)
 #   Builds the backtracking state sequences, then counts people who lose
 #   sensory impairment and/or frailty between two consecutive
 #   observations, for the hearing and vision models.
@@ -1385,7 +1385,46 @@ rev_types   <- bind_rows(rev_hear$by_type, rev_vis$by_type)
 print(rev_persons, width = Inf)
 print(rev_types,   n = Inf)
 
+# ---- 4) Wave-to-wave reversals in the raw wave data (Supplementary Table 24)
+# Same definition as the HRS rev_check(): among consecutive observed waves
+# with the condition present (1), the share followed by absence (0), and the
+# share of ever-affected persons with at least one such reversal.
+rev_check <- function(df, var) {
+  w <- df %>%
+    filter(!is.na(.data[[var]])) %>%
+    arrange(idauniq, time) %>%
+    group_by(idauniq) %>%
+    mutate(prev = lag(.data[[var]])) %>%
+    ungroup() %>%
+    filter(!is.na(prev))
+  p <- w %>%
+    group_by(idauniq) %>%
+    summarise(ever1    = any(prev == 1 | .data[[var]] == 1),
+              reverted = any(prev == 1 & .data[[var]] == 0),
+              .groups  = "drop")
+  tibble(
+    variable              = var,
+    wave_pairs_from_1     = sum(w$prev == 1),
+    wave_pairs_1_to_0     = sum(w$prev == 1 & w[[var]] == 0),
+    pct_wave_reversal     = round(100 * mean(w[[var]][w$prev == 1] == 0), 1),
+    persons_ever_affected = sum(p$ever1),
+    persons_reverted      = sum(p$reverted),
+    pct_persons_reverted  = round(100 * sum(p$reverted) / sum(p$ever1), 1)
+  )
+}
+
+rev_tab <- bind_rows(
+  bind_rows(rev_check(ms_base, "hearing_loss"),
+            rev_check(ms_base, "frailty"),
+            rev_check(ms_base, "dementia")) %>% mutate(model = "Hearing", .before = 1),
+  bind_rows(rev_check(ms_base_vis, "vision_overall"),
+            rev_check(ms_base_vis, "frailty"),
+            rev_check(ms_base_vis, "dementia")) %>% mutate(model = "Vision", .before = 1)
+)
+print(rev_tab, width = Inf)
+
 # ---- Save ----
+save_tab(rev_tab,     "MSM_reversal_summary")
 save_tab(rev_persons, "MSM_bt_reverse_transitions_persons")
 save_tab(rev_types,   "MSM_bt_reverse_transitions_by_type")
 
