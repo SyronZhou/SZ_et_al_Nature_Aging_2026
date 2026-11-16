@@ -1,7 +1,17 @@
 ---
-title: "R Notebook"
+title: "ELSA: harmonised person-wave data, frailty index and dementia status"
 output: html_notebook
 ---
+
+<!--
+  Analysis code for the manuscript on sensory impairment, frailty, and incident
+  dementia in the HRS (United States) and ELSA (England) cohorts.
+
+  DATA NOT INCLUDED. HRS and ELSA are restricted-access and cannot be
+  redistributed. Obtain the source data from the data providers and place them
+  under data/ (git-ignored) so the relative paths in this notebook resolve.
+  See README.md for setup and run order.
+-->
 
 ```{r}
 library(haven)
@@ -19,7 +29,6 @@ library(scales)
 ```
 
 
-
 ```{r}
 # ---------------------------------------------------------------------------
 # Paths are relative to the REPOSITORY ROOT, not to code/.
@@ -32,11 +41,10 @@ library(scales)
 repo_root <- if (basename(getwd()) == "code") normalizePath("..") else normalizePath(".")
 cat("Repository root:", repo_root, "\n")
 
+# ELSA source files (UK Data Service SN 5050, Stata edition)
 data_dir <- file.path(repo_root, "data/ELSA/UKDA-5050-stata/stata/stata13_se")
 
 ```
-
-
 
 
 # From 2002 as baseline start-point wave 1
@@ -112,7 +120,10 @@ elsa_cov_2002 <- elsa_core_w1 %>%
     ),
 
     # --- Smoking (heska: same encoding as HESka) ---
-    Smoking = case_when(heska == 1 ~ 1L, heska == 2 ~ 0L, TRUE ~ NA_integer_),
+    # heska is only asked of ever-smokers; never-smokers (hesmk == 2) are routed past it
+    Smoking = case_when(heska == 1 ~ 1L, heska == 2 ~ 0L,
+                        hesmk == 2 ~ 0L,
+                        TRUE ~ NA_integer_),
 
     # --- Alcohol (heala: frequency in past 12 months) ---
     # W2 uses scal7a (drank in last 7 days: 1=yes, 2=no)
@@ -256,8 +267,6 @@ elsa_cog_2002 <- elsa_cog_2002 %>%
 ```
 
 
-
-
 ```{r}
 # --- 1) Overall sample size ---
 cat("=== Wave 1 (2002) Dementia Classification ===\n\n")
@@ -346,8 +355,6 @@ summary_dementia_w1 <- tibble(
 
 print(summary_dementia_w1)
 ```
-
-
 
 
 ```{r}
@@ -464,6 +471,43 @@ other_health <- elsa_core_w1 %>%
     mmpain = case_when(mmpain == 1 ~ 1L, mmpain == 2 ~ 0L, TRUE ~ NA_integer_)  # pain while walking
   )
 
+# --- 5e'. Items that must be carried forward across waves ---------------
+# hefrac and heji ask "ever" at a respondent's first interview, but from W2
+# continuing respondents are asked "since we last talked to you". To keep
+# "ever fractured hip" / "ever had a joint replacement" comparable across
+# waves, a person keeps a 1 once it has been reported in any wave.
+cum_items <- c("hefrac", "heji")
+
+# Running record of each person's latest status; people absent from a wave
+# keep the status from their last interview.
+carry_record <- function(prev, cur) {
+  cur  <- cur  %>% mutate(idauniq = as.numeric(idauniq))
+  prev <- prev %>% mutate(idauniq = as.numeric(idauniq))
+  bind_rows(cur, prev %>% filter(!idauniq %in% cur$idauniq))
+}
+
+# 1 if reported now or in any earlier wave; otherwise the current answer.
+carry_ever <- function(cur, prev, items) {
+  out <- cur %>%
+    mutate(idauniq = as.numeric(idauniq)) %>%
+    left_join(prev %>%
+                dplyr::select(idauniq, all_of(items)) %>%
+                mutate(idauniq = as.numeric(idauniq)),
+              by = "idauniq", suffix = c("", ".prev"))
+  for (v in items) {
+    out[[v]] <- case_when(
+      out[[v]] == 1 | out[[paste0(v, ".prev")]] == 1 ~ 1L,
+      out[[v]] == 0                                  ~ 0L,
+      TRUE                                           ~ NA_integer_
+    )
+  }
+  out %>% dplyr::select(all_of(names(cur)))
+}
+
+cum_ever <- other_health %>%
+  dplyr::select(idauniq, all_of(cum_items)) %>%
+  mutate(idauniq = as.numeric(idauniq))
+
 # --- 5f. Merge all components and compute Frailty Index (vectorised) ----
 fi_items <- c(
   # Mobility (10)
@@ -566,16 +610,14 @@ elsa_fi_2002 <- elsa_fi_2002_orig %>%
 ```
 
 
-
-
 ```{r}
 # =========================================================================
 # 6. Merge 2002 data (extract only — no filtering)
 # =========================================================================
-# FIX: elsa_fi_2002 carries `year` only on rows that survived the 49-item
-# filter; the noIADL-only rows have year = NA and were therefore silently
-# dropped by a join on c("idauniq","year"). Join on idauniq alone and strip
-# the redundant `year` column from the FI table.
+# elsa_fi_2002 carries `year` only on rows that survived the 49-item
+# filter; the noIADL-only rows have year = NA and would be dropped by a join
+# on c("idauniq","year"). Join on idauniq alone and strip the redundant
+# `year` column from the FI table.
 elsa_2002 <- elsa_cov_2002 %>%
   left_join(sensory_var_2002, by = "idauniq") %>%
   left_join(elsa_cog_2002,    by = c("idauniq", "year")) %>%
@@ -597,12 +639,10 @@ stopifnot(anyDuplicated(elsa_2002$idauniq) == 0)
 #   * Gender and Race are imputed INSIDE the FCS so that no predictor
 #     carries NAs into the design matrix, but are NOT carried back: the
 #     analysis data retains their original values, including missing ones.
-#     (This is the fix for predictors that previously had method "" while
-#     still sitting in the predictor matrix — mice never fills those cells,
-#     so NAs were being fed into every imputation model.)
+#     (mice never fills the cells of a predictor with method "", so leaving
+#     them unimputed would feed NAs into every imputation model.)
 #   * The primary study variables (frailty index, sensory impairment,
-#     dementia) are neither imputed nor used as predictors, matching HRS and
-#     the Methods statement that they were not imputed.
+#     dementia) are neither imputed nor used as predictors, matching HRS.
 #   * birth_year is not a predictor (near-collinear with age). Age is
 #     resolved deterministically from birth_year where it is missing,
 #     mirroring the HRS coalesce(R*AGEY_E, year - birth_year) step.
@@ -637,7 +677,7 @@ if (length(all_missing02) > 0) {
 }
 imputed_vars02 <- setdiff(analysis_covars02, all_missing02)
 
-# ---- 7b. Quantify missingness (for the Methods text) -------------------
+# ---- 7b. Quantify missingness ------------------------------------------
 miss_pct02 <- sapply(imp02_elsa, function(x) mean(is.na(x)) * 100)
 cat("ELSA 2002 — percentage missing per variable:\n")
 print(round(miss_pct02, 2))
@@ -710,9 +750,9 @@ for (v in c("age_2002")) {
 }
 
 # ---- 7g. Observed vs imputed CELLS only -------------------------------
-# FIX: the previous version compared observed values against the *completed*
-# dataset, which is dominated by observed values and so barely moves. This
-# compares the observed distribution against the imputed cells themselves.
+# Compares the observed distribution against the imputed cells themselves
+# (the completed dataset is dominated by observed values, so comparing
+# against it would hide differences).
 imp_vs_obs02 <- function(mids_obj, v) {
   obs   <- mids_obj$data[[v]]
   cells <- mids_obj$imp[[v]]
@@ -745,7 +785,7 @@ print(diag02)
 # Single completion (imputation 1), as in HRS_dataextract.Rmd. Only the
 # analysis covariates are replaced; Gender, Race and every primary study
 # variable keep their ORIGINAL values, including NAs, so the primary study
-# variables remain un-imputed exactly as stated in the Methods.
+# variables remain un-imputed.
 imp02_elsa_complete1 <- complete(imp_mice02_elsa, 1)
 
 elsa02_clean <- elsa_2002 %>%
@@ -765,15 +805,6 @@ stopifnot(nrow(ELSA_2002) == nrow(elsa_2002))
 ```
 
 
-
-
-```{r}
-
-```
-
-
-
-
 # From 2004 as baseline start-point wave 2
 ```{r}
 # 1. Load data ---------------------------------------------------------------
@@ -783,7 +814,7 @@ elsa_derived <- read_dta(file.path(data_dir, "wave_2_derived_variables.dta"))
 # 2. Covariates -------------------------------------------------------------
 # Naming differences from W1: mixed-case for many core vars; w2edqual in derived;
 # scorg01–09 (zero-padded) replacing scorg1/scorga2/scorg3–9; scal7a instead
-# of heala (now a true 7-day indicator, not a 12-month frequency).
+# of heala (a 7-day indicator, not a 12-month frequency).
 elsa_cov_2004 <- elsa_core %>%
   left_join(
     elsa_derived %>% dplyr::select(idauniq, w2edqual, palevel, heoptgl, heoptca),
@@ -827,11 +858,15 @@ elsa_cov_2004 <- elsa_core %>%
       TRUE                          ~ NA_integer_
     ),
 
+    # HESka is only asked of ever-smokers; never-smokers (HeSmk == 2) are routed past it
     Smoking = case_when(HESka == 1 ~ 1L, HESka == 2 ~ 0L,
+                        HeSmk == 2 ~ 0L,
                         TRUE ~ NA_integer_),
 
     # scal7a is a true 7-day binary in W2+
+    # scal7a is skipped for those who had no drink in the last 12 months (scako == 8)
     Alcohol = case_when(scal7a == 1 ~ 1L, scal7a == 2 ~ 0L,
+                        scako == 8 ~ 0L,
                         TRUE ~ NA_integer_),
 
     Physical_activity = case_when(
@@ -975,7 +1010,6 @@ elsa_cog_2004 <- elsa_cog_2004 %>%
 ```
 
 
-
 # Descriptive analysis: Wave 2 (2004) Dementia Classification
 ```{r}
 cat("=== Wave 2 (2004) Dementia Classification ===\n\n")
@@ -1056,7 +1090,6 @@ summary_dementia_w2 <- tibble(
 print(summary_dementia_w2)
 
 ```
-
 
 
 # Frailty Index
@@ -1147,6 +1180,10 @@ other_health <- elsa_core %>%
     mmpain = case_when(MmPain == 1 ~ 1L, MmPain == 2 ~ 0L, TRUE ~ NA_integer_)
   ) %>%
   dplyr::select(idauniq, hehelf, hefla, hefrac, heji, mmpain)
+
+# hefrac / heji: 'since last interview' for continuing respondents -> carry forward
+other_health <- carry_ever(other_health, cum_ever, cum_items)
+cum_ever <- carry_record(cum_ever, other_health %>% dplyr::select(idauniq, all_of(cum_items)))
 
 # 5f. Merge & compute FI — vectorised (matches W1)
 fi_items <- c(
@@ -1243,15 +1280,14 @@ elsa_fi_2004 <- elsa_fi_2004_orig %>%
 ```
 
 
-
 # Merge 2004 data
 ```{r}
 # =========================================================================
 # 6. Merge 2004 data
 # =========================================================================
-# FIX (as at 2002): elsa_fi_2004 carries `year` only on rows that survived
-# the 49-item completeness filter, so noIADL-only rows have year = NA and
-# were silently dropped by a join on c("idauniq","year").
+# As at 2002: elsa_fi_2004 carries `year` only on rows that survived the
+# 49-item completeness filter, so noIADL-only rows have year = NA and would
+# be dropped by a join on c("idauniq","year").
 elsa_2004 <- elsa_cov_2004 %>%
   left_join(sensory_var_2004, by = "idauniq") %>%
   left_join(elsa_cog_2004,    by = c("idauniq", "year")) %>%
@@ -1295,7 +1331,7 @@ if (length(all_missing04) > 0) {
 }
 imputed_vars04 <- setdiff(analysis_covars04, all_missing04)
 
-# ---- 7b. Quantify missingness (for the Methods text) -------------------
+# ---- 7b. Quantify missingness ------------------------------------------
 miss_pct04 <- sapply(imp04_elsa, function(x) mean(is.na(x)) * 100)
 cat("ELSA 2004 — percentage missing per variable:\n")
 print(round(miss_pct04, 2))
@@ -1371,13 +1407,6 @@ stopifnot(nrow(ELSA_2004) == nrow(elsa_2004))
 ```
 
 
-
-```{r}
-
-```
-
-
-
 # ELSA Wave 3 (2006)
 ```{r}
 elsa_core_w3 <- read_dta(file.path(data_dir, "wave_3_elsa_data_v4.dta"))
@@ -1429,10 +1458,14 @@ elsa_cov_2006 <- elsa_core_w3 %>%
       TRUE                          ~ NA_integer_
     ),
 
+    # heska is only asked of ever-smokers; never-smokers (hesmk == 2) are routed past it
     Smoking = case_when(heska == 1 ~ 1L, heska == 2 ~ 0L,
+                        hesmk == 2 ~ 0L,
                         TRUE ~ NA_integer_),
 
+    # scal7a is skipped for those who had no drink in the last 12 months (scako == 8)
     Alcohol = case_when(scal7a == 1 ~ 1L, scal7a == 2 ~ 0L,
+                        scako == 8 ~ 0L,
                         TRUE ~ NA_integer_),
 
     Physical_activity = case_when(
@@ -1580,7 +1613,6 @@ elsa_cog_2006 <- elsa_cog_2006 %>%
 ```
 
 
-
 # Descriptive analysis: Wave 3 (2006) Dementia Classification
 ```{r}
 cat("=== Wave 3 (2006) Dementia Classification ===\n\n")
@@ -1662,7 +1694,6 @@ print(summary_dementia_w3)
 ```
 
 
-
 # Frailty Index 2006
 ```{r}
 # 4. Frailty Index (49 items)
@@ -1709,6 +1740,59 @@ diagnoses_w3 <- elsa_core_w3 %>%
          hedibca, hedibps) %>%
   mutate(across(-idauniq, recode_dx_w3))
 
+# --- Ever-diagnosed conditions, built the same way in every wave ---------
+# From W2, ELSA feeds forward each condition a respondent has reported
+# (hedaw* / hedbw*); the respondent confirms it or disputes it (reason in
+# hedan* / hedbm*: 1 = never had it) and is then asked only about NEW
+# diagnoses. The W2/W3 hedim*/hedib* variables are ELSA-derived "ever
+# reported" flags, but from W4 the same names only flag diagnoses newly
+# reported in that wave. Each wave is therefore coded as:
+#   fed-forward record disputed as "never had"   -> 0 (record corrected)
+#   newly reported, or fed forward (confirmed)   -> 1
+#   reported in any earlier ELSA wave            -> 1
+#   otherwise the current answer (0) or NA
+# This mirrors RAND HRS R*HIBP etc., where "disputes prior record, no" is 0.
+dx_items <- c("hedimbp", "hediman", "hedimmi", "hedimhf", "hedimar",
+              "hedimdi", "hedimst", "hediblu", "hedibas", "hedibar",
+              "hedibos", "hedibca", "hedibps")
+dx_sfx <- c(hedimbp = "bp", hediman = "an", hedimmi = "mi", hedimhf = "hf",
+            hedimar = "ar", hedimdi = "di", hedimst = "st",
+            hediblu = "lu", hedibas = "as", hedibar = "ar", hedibos = "os",
+            hedibca = "ca", hedibps = "ps")
+dx_ff_var <- function(v) paste0(if (startsWith(v, "hedim")) "hedaw" else "hedbw", dx_sfx[[v]])
+dx_rs_var <- function(v) paste0(if (startsWith(v, "hedim")) "hedan" else "hedbm", dx_sfx[[v]])
+
+dx_ever_wave <- function(core, dx_wave, prev) {
+  names(core) <- tolower(names(core))
+  needed <- c(sapply(dx_items, dx_ff_var), sapply(dx_items, dx_rs_var))
+  stopifnot(all(needed %in% names(core)))
+  core <- core %>% mutate(idauniq = as.numeric(idauniq))
+  out  <- dx_wave %>%
+    mutate(idauniq = as.numeric(idauniq)) %>%
+    left_join(prev %>%
+                dplyr::select(idauniq, all_of(dx_items)) %>%
+                mutate(idauniq = as.numeric(idauniq)),
+              by = "idauniq", suffix = c("", ".prev"))
+  idx <- match(out$idauniq, core$idauniq)
+  for (v in dx_items) {
+    ff       <- (core[[dx_ff_var(v)]][idx] > 0) %in% TRUE
+    disputed <- ff & ((core[[dx_rs_var(v)]][idx] == 1) %in% TRUE)
+    out[[v]] <- case_when(
+      disputed                         ~ 0L,
+      out[[v]] == 1 | ff               ~ 1L,
+      out[[paste0(v, ".prev")]] == 1   ~ 1L,
+      out[[v]] == 0                    ~ 0L,
+      TRUE                             ~ NA_integer_
+    )
+  }
+  out %>% dplyr::select(idauniq, all_of(dx_items))
+}
+
+# W3: ELSA's "ever reported" flags plus the W3 dispute corrections;
+# W2 derived flags (ever reported by W2) are the earlier record.
+diagnoses_w3 <- dx_ever_wave(elsa_core_w3, diagnoses_w3, diagnoses)
+dx_ever      <- carry_record(diagnoses, diagnoses_w3)
+
 # CES-D (Items 37–44) — lowercase in W3
 cesd_w3 <- elsa_core_w3 %>%
   dplyr::select(idauniq, psceda, pscedb, pscedc, pscedd,
@@ -1740,6 +1824,10 @@ other_health_w3 <- elsa_core_w3 %>%
     mmpain = case_when(mmpain == 1 ~ 1L, mmpain == 2 ~ 0L, TRUE ~ NA_integer_)
   ) %>%
   dplyr::select(idauniq, hehelf, hefla, hefrac, heji, mmpain)
+
+# hefrac / heji: 'since last interview' for continuing respondents -> carry forward
+other_health_w3 <- carry_ever(other_health_w3, cum_ever, cum_items)
+cum_ever <- carry_record(cum_ever, other_health_w3 %>% dplyr::select(idauniq, all_of(cum_items)))
 
 # Strict (I)ADL items removed in the sensitivity FI
 # (Re-declared so this chunk is self-contained; identical across waves.)
@@ -1825,15 +1913,14 @@ elsa_fi_2006 <- elsa_fi_2006_orig %>%
 ```
 
 
-
 # Merge 2006 data
 ```{r}
 # ==========================================================================
 # 5. Merge 2006 data
 # ==========================================================================
-# FIX (as at 2002/2004): elsa_fi_2006 carries `year` only on rows that
-# survived the 49-item completeness filter, so noIADL-only rows have
-# year = NA and were silently dropped by a join on c("idauniq","year").
+# As at 2002/2004: elsa_fi_2006 carries `year` only on rows that survived
+# the 49-item completeness filter, so noIADL-only rows have year = NA and
+# would be dropped by a join on c("idauniq","year").
 elsa_2006 <- elsa_cov_2006 %>%
   left_join(sensory_var_2006, by = "idauniq") %>%
   left_join(elsa_cog_2006,    by = c("idauniq", "year")) %>%
@@ -1877,7 +1964,7 @@ if (length(all_missing06) > 0) {
 }
 imputed_vars06 <- setdiff(analysis_covars06, all_missing06)
 
-# ---- 6b. Quantify missingness (for the Methods text) -------------------
+# ---- 6b. Quantify missingness ------------------------------------------
 miss_pct06 <- sapply(imp06_elsa, function(x) mean(is.na(x)) * 100)
 cat("ELSA 2006 — percentage missing per variable:\n")
 print(round(miss_pct06, 2))
@@ -1953,14 +2040,6 @@ stopifnot(nrow(ELSA_2006) == nrow(elsa_2006))
 ```
 
 
-
-```{r}
-
-
-```
-
-
-
 # ELSA Wave 4 (2008)
 ```{r}
 elsa_core_w4 <- read_dta(file.path(data_dir, "wave_4_elsa_data_v3.dta"))
@@ -2013,10 +2092,14 @@ elsa_cov_2008 <- elsa_core_w4 %>%
       TRUE                          ~ NA_integer_
     ),
 
+    # heska is only asked of ever-smokers; never-smokers (hesmk == 2) are routed past it
     Smoking = case_when(heska == 1 ~ 1L, heska == 2 ~ 0L,
+                        hesmk == 2 ~ 0L,
                         TRUE ~ NA_integer_),
 
+    # scal7a is skipped for those who had no drink in the last 12 months (scako == 8)
     Alcohol = case_when(scal7a == 1 ~ 1L, scal7a == 2 ~ 0L,
+                        scako == 8 ~ 0L,
                         TRUE ~ NA_integer_),
 
     Physical_activity = case_when(
@@ -2093,8 +2176,8 @@ sensory_var_2008 <- elsa_core_w4 %>%
 # NOT cumulative. A respondent diagnosed in W2 or W3 who is not re-asked
 # (or doesn't re-report) this wave will have hedibad = 0. Therefore the
 # wave-level `diagnosed_dementia` here is effectively *incidence-this-wave*,
-# not prevalence-ever. For cumulative prevalence across W4+ you will need
-# to carry forward across waves in the pooled long dataset at the end.
+# not prevalence-ever. Cumulative status across W4+ is recovered in the
+# analysis notebooks, which carry dementia forward across waves (cummax).
 # ==========================================================================
 elsa_cog_2008 <- elsa_core_w4 %>%
   transmute(
@@ -2171,7 +2254,6 @@ elsa_cog_2008 <- elsa_cog_2008 %>%
 #   ≥ 3.4 classification: Yes 88  No 52  NA 10,910
 
 ```
-
 
 
 # Descriptive analysis: Wave 4 (2008) Dementia Classification
@@ -2255,7 +2337,6 @@ print(summary_dementia_w4)
 ```
 
 
-
 # Frailty Index (2008)
 ```{r}
 # 4. Frailty Index (49 items)
@@ -2294,6 +2375,10 @@ diagnoses_w4 <- elsa_core_w4 %>%
          hedibca, hedibps) %>%
   mutate(across(-idauniq, recode_dx_w4))
 
+# Items are "newly reported" in W4: add fed-forward and earlier diagnoses
+diagnoses_w4 <- dx_ever_wave(elsa_core_w4, diagnoses_w4, dx_ever)
+dx_ever <- carry_record(dx_ever, diagnoses_w4)
+
 # CES-D (Items 37–44) — lowercase in W4
 cesd_w4 <- elsa_core_w4 %>%
   dplyr::select(idauniq, psceda, pscedb, pscedc, pscedd,
@@ -2322,6 +2407,10 @@ other_health_w4 <- elsa_core_w4 %>%
     mmpain = case_when(mmpain == 1 ~ 1L, mmpain == 2 ~ 0L, TRUE ~ NA_integer_)
   ) %>%
   dplyr::select(idauniq, hehelf, hefla, hefrac, heji, mmpain)
+
+# hefrac / heji: 'since last interview' for continuing respondents -> carry forward
+other_health_w4 <- carry_ever(other_health_w4, cum_ever, cum_items)
+cum_ever <- carry_record(cum_ever, other_health_w4 %>% dplyr::select(idauniq, all_of(cum_items)))
 
 # Merge & compute FI (vectorised)
 fi_items <- c(
@@ -2420,8 +2509,6 @@ elsa_fi_2008 <- elsa_fi_2008_orig %>%
 ```
 
 
-
-
 ```{r}
 # 5. Merge 2008 data
 # ==========================================================================
@@ -2467,7 +2554,7 @@ if (length(all_missing08) > 0) {
 }
 imputed_vars08 <- setdiff(analysis_covars08, all_missing08)
 
-# ---- 6b. Quantify missingness (for the Methods text) -------------------
+# ---- 6b. Quantify missingness ------------------------------------------
 miss_pct08 <- sapply(imp08_elsa, function(x) mean(is.na(x)) * 100)
 cat("ELSA 2008 — percentage missing per variable:\n")
 print(round(miss_pct08, 2))
@@ -2543,16 +2630,6 @@ stopifnot(nrow(ELSA_2008) == nrow(elsa_2008))
 ```
 
 
-
-
-```{r}
-
-
-
-```
-
-
-
 # ELSA Wave 5 (2010)
 ```{r}
 # W5 specifics:
@@ -2599,10 +2676,14 @@ elsa_cov_2010 <- elsa_core_w5 %>%
       TRUE                          ~ NA_integer_
     ),
 
+    # heska is only asked of ever-smokers; never-smokers (hesmk == 2) are routed past it
     Smoking = case_when(heska == 1 ~ 1L, heska == 2 ~ 0L,
+                        hesmk == 2 ~ 0L,
                         TRUE ~ NA_integer_),
 
+    # scal7a is skipped for those who had no drink in the last 12 months (scako == 8)
     Alcohol = case_when(scal7a == 1 ~ 1L, scal7a == 2 ~ 0L,
+                        scako == 8 ~ 0L,
                         TRUE ~ NA_integer_),
 
     Physical_activity = case_when(
@@ -2747,7 +2828,6 @@ elsa_cog_2010 <- elsa_cog_2010 %>%
 ```
 
 
-
 # Descriptive analysis: Wave 5 (2010) Dementia Classification
 ```{r}
 
@@ -2830,8 +2910,6 @@ print(summary_dementia_w5)
 ```
 
 
-
-
 # Frailty Index 2010
 ```{r}
 # 4. Frailty Index (49 items) -------------------------------------------
@@ -2863,6 +2941,10 @@ diagnoses_w5 <- elsa_core_w5 %>%
          hedibca, hedibps) %>%
   mutate(across(-idauniq, recode_dx_w5))
 
+# Items are "newly reported" in W5: add fed-forward and earlier diagnoses
+diagnoses_w5 <- dx_ever_wave(elsa_core_w5, diagnoses_w5, dx_ever)
+dx_ever <- carry_record(dx_ever, diagnoses_w5)
+
 # CES-D (Items 37–44)
 cesd_w5 <- elsa_core_w5 %>%
   dplyr::select(idauniq, psceda, pscedb, pscedc, pscedd,
@@ -2891,6 +2973,10 @@ other_health_w5 <- elsa_core_w5 %>%
     mmpain = case_when(mmpain == 1 ~ 1L, mmpain == 2 ~ 0L, TRUE ~ NA_integer_)
   ) %>%
   dplyr::select(idauniq, hehelf, hefla, hefrac, heji, mmpain)
+
+# hefrac / heji: 'since last interview' for continuing respondents -> carry forward
+other_health_w5 <- carry_ever(other_health_w5, cum_ever, cum_items)
+cum_ever <- carry_record(cum_ever, other_health_w5 %>% dplyr::select(idauniq, all_of(cum_items)))
 
 # Merge & compute FI — vectorised
 fi_items <- c(
@@ -2989,7 +3075,6 @@ elsa_fi_2010 <- elsa_fi_2010_orig %>%
 ```
 
 
-
 # Merge 2010 data
 ```{r}
 # 5. Merge 2010 data ----------------------------------------------------
@@ -3035,7 +3120,7 @@ if (length(all_missing10) > 0) {
 }
 imputed_vars10 <- setdiff(analysis_covars10, all_missing10)
 
-# ---- 6b. Quantify missingness (for the Methods text) -------------------
+# ---- 6b. Quantify missingness ------------------------------------------
 miss_pct10 <- sapply(imp10_elsa, function(x) mean(is.na(x)) * 100)
 cat("ELSA 2010 — percentage missing per variable:\n")
 print(round(miss_pct10, 2))
@@ -3111,15 +3196,6 @@ stopifnot(nrow(ELSA_2010) == nrow(elsa_2010))
 ```
 
 
-
-
-```{r}
-
-
-```
-
-
-
 # ELSA Wave 6 (2012)
 ```{r}
 # W6 specifics:
@@ -3167,10 +3243,14 @@ elsa_cov_2012 <- elsa_core_w6 %>%
       TRUE                          ~ NA_integer_
     ),
 
+    # HESka is only asked of ever-smokers; never-smokers (HeSmk == 2) are routed past it
     Smoking = case_when(HESka == 1 ~ 1L, HESka == 2 ~ 0L,
+                        HeSmk == 2 ~ 0L,
                         TRUE ~ NA_integer_),
 
+    # scal7a is skipped for those who had no drink in the last 12 months (scako == 8)
     Alcohol = case_when(scal7a == 1 ~ 1L, scal7a == 2 ~ 0L,
+                        scako == 8 ~ 0L,
                         TRUE ~ NA_integer_),
 
     Physical_activity = case_when(
@@ -3315,8 +3395,6 @@ elsa_cog_2012 <- elsa_cog_2012 %>%
 ```
 
 
-
-
 # Descriptive analysis: Wave 6 (2012) Dementia Classification
 ```{r}
 
@@ -3399,8 +3477,6 @@ print(summary_dementia_w6)
 ```
 
 
-
-
 # Frailty Index 2012
 ```{r}
 # 4. Frailty Index (49 items) --------------------------------------------
@@ -3431,6 +3507,10 @@ diagnoses_w6 <- elsa_core_w6 %>%
          hedibca, hedibps) %>%
   mutate(across(-idauniq, recode_dx_w6))
 
+# Items are "newly reported" in W6: add fed-forward and earlier diagnoses
+diagnoses_w6 <- dx_ever_wave(elsa_core_w6, diagnoses_w6, dx_ever)
+dx_ever <- carry_record(dx_ever, diagnoses_w6)
+
 # CES-D (Items 37–44) — mixed-case PScedA-H
 cesd_w6 <- elsa_core_w6 %>%
   dplyr::select(idauniq, PScedA, PScedB, PScedC, PScedD,
@@ -3460,6 +3540,10 @@ other_health_w6 <- elsa_core_w6 %>%
     mmpain = case_when(MmPain == 1 ~ 1L, MmPain == 2 ~ 0L, TRUE ~ NA_integer_)
   ) %>%
   dplyr::select(idauniq, hehelf, hefla, hefrac, heji, mmpain)
+
+# hefrac / heji: 'since last interview' for continuing respondents -> carry forward
+other_health_w6 <- carry_ever(other_health_w6, cum_ever, cum_items)
+cum_ever <- carry_record(cum_ever, other_health_w6 %>% dplyr::select(idauniq, all_of(cum_items)))
 
 # Merge & compute FI — vectorised
 fi_items <- c(
@@ -3558,8 +3642,6 @@ elsa_fi_2012 <- elsa_fi_2012_orig %>%
 ```
 
 
-
-
 ```{r}
 # 5. Merge 2012 data -----------------------------------------------------
 elsa_2012 <- elsa_cov_2012 %>%
@@ -3605,7 +3687,7 @@ if (length(all_missing12) > 0) {
 }
 imputed_vars12 <- setdiff(analysis_covars12, all_missing12)
 
-# ---- 6b. Quantify missingness (for the Methods text) -------------------
+# ---- 6b. Quantify missingness ------------------------------------------
 miss_pct12 <- sapply(imp12_elsa, function(x) mean(is.na(x)) * 100)
 cat("ELSA 2012 — percentage missing per variable:\n")
 print(round(miss_pct12, 2))
@@ -3681,13 +3763,6 @@ stopifnot(nrow(ELSA_2012) == nrow(elsa_2012))
 ```
 
 
-
-```{r}
-
-```
-
-
-
 # ELSA Wave 7 (2014)
 ```{r}
 # W7 specifics: structurally identical to W6 —
@@ -3728,10 +3803,14 @@ elsa_cov_2014 <- elsa_core_w7 %>%
       TRUE                          ~ NA_integer_
     ),
 
+    # HESka is only asked of ever-smokers; never-smokers (HeSmk == 2) are routed past it
     Smoking = case_when(HESka == 1 ~ 1L, HESka == 2 ~ 0L,
+                        HeSmk == 2 ~ 0L,
                         TRUE ~ NA_integer_),
 
+    # scal7a is skipped for those who had no drink in the last 12 months (scako == 8)
     Alcohol = case_when(scal7a == 1 ~ 1L, scal7a == 2 ~ 0L,
+                        scako == 8 ~ 0L,
                         TRUE ~ NA_integer_),
 
     Physical_activity = case_when(
@@ -3877,7 +3956,6 @@ elsa_cog_2014 <- elsa_cog_2014 %>%
 ```
 
 
-
 # Descriptive analysis: Wave 7 (2014) Dementia Classification
 ```{r}
 cat("=== Wave 7 (2014) Dementia Classification ===\n\n")
@@ -3959,7 +4037,6 @@ print(summary_dementia_w7)
 ```
 
 
-
 ```{r}
 # 4. Frailty Index (49 items) --------------------------------------------
 recode_mob_adl_w7 <- function(x) {
@@ -3988,6 +4065,10 @@ diagnoses_w7 <- elsa_core_w7 %>%
          hedimdi, hedimst, hediblu, hedibas, hedibar, hedibos,
          hedibca, hedibps) %>%
   mutate(across(-idauniq, recode_dx_w7))
+
+# Items are "newly reported" in W7: add fed-forward and earlier diagnoses
+diagnoses_w7 <- dx_ever_wave(elsa_core_w7, diagnoses_w7, dx_ever)
+dx_ever <- carry_record(dx_ever, diagnoses_w7)
 
 # CES-D (Items 37–44) — mixed-case PScedA–H
 cesd_w7 <- elsa_core_w7 %>%
@@ -4018,6 +4099,10 @@ other_health_w7 <- elsa_core_w7 %>%
     mmpain = case_when(MmPain == 1 ~ 1L, MmPain == 2 ~ 0L, TRUE ~ NA_integer_)
   ) %>%
   dplyr::select(idauniq, hehelf, hefla, hefrac, heji, mmpain)
+
+# hefrac / heji: 'since last interview' for continuing respondents -> carry forward
+other_health_w7 <- carry_ever(other_health_w7, cum_ever, cum_items)
+cum_ever <- carry_record(cum_ever, other_health_w7 %>% dplyr::select(idauniq, all_of(cum_items)))
 
 # Merge & compute FI — vectorised
 fi_items <- c(
@@ -4117,8 +4202,6 @@ elsa_fi_2014 <- elsa_fi_2014_orig %>%
 ```
 
 
-
-
 ```{r}
 # 5. Merge 2014 data -----------------------------------------------------
 elsa_2014 <- elsa_cov_2014 %>%
@@ -4163,7 +4246,7 @@ if (length(all_missing14) > 0) {
 }
 imputed_vars14 <- setdiff(analysis_covars14, all_missing14)
 
-# ---- 6b. Quantify missingness (for the Methods text) -------------------
+# ---- 6b. Quantify missingness ------------------------------------------
 miss_pct14 <- sapply(imp14_elsa, function(x) mean(is.na(x)) * 100)
 cat("ELSA 2014 — percentage missing per variable:\n")
 print(round(miss_pct14, 2))
@@ -4239,21 +4322,13 @@ stopifnot(nrow(ELSA_2014) == nrow(elsa_2014))
 ```
 
 
-
-```{r}
-
-
-```
-
-
-
 # ELSA Wave 8 (2016)
 ```{r}
 # W8 specifics:
 #   - all lowercase variable names
 #   - dimarr (double-r) with simplified 1–6 coding (CP folded into married codes)
 #   - fqethnmr (not fqethnr)
-#   - NEW social-activity var names: scorgpo/nw/rl/ch/ed/sc/sp/95/96
+#   - different social-activity var names: scorgpo/nw/rl/ch/ed/sc/sp/95/96
 #   - headlph present (not headlte)
 #   - hehelf 1=Excellent … 5=Poor (same as W2/W4/W5/W6/W7)
 #   - heoptca/heoptgl/hedibad/hedibde: binary 0/1 "newly reported"
@@ -4295,10 +4370,14 @@ elsa_cov_2016 <- elsa_core_w8 %>%
       TRUE                          ~ NA_integer_
     ),
 
+    # heska is only asked of ever-smokers; never-smokers (hesmk == 2) are routed past it
     Smoking = case_when(heska == 1 ~ 1L, heska == 2 ~ 0L,
+                        hesmk == 2 ~ 0L,
                         TRUE ~ NA_integer_),
 
+    # scal7a is skipped for those who had no drink in the last 12 months (scako == 8)
     Alcohol = case_when(scal7a == 1 ~ 1L, scal7a == 2 ~ 0L,
+                        scako == 8 ~ 0L,
                         TRUE ~ NA_integer_),
 
     Physical_activity = case_when(
@@ -4445,7 +4524,6 @@ elsa_cog_2016 <- elsa_cog_2016 %>%
 ```
 
 
-
 # Descriptive analysis: Wave 8 (2016) Dementia Classification
 ```{r}
 cat("=== Wave 8 (2016) Dementia Classification ===\n\n")
@@ -4527,8 +4605,6 @@ print(summary_dementia_w8)
 ```
 
 
-
-
 ```{r}
 # 4. Frailty Index (49 items) --------------------------------------------
 recode_mob_adl_w8 <- function(x) {
@@ -4558,6 +4634,10 @@ diagnoses_w8 <- elsa_core_w8 %>%
          hedibca, hedibps) %>%
   mutate(across(-idauniq, recode_dx_w8))
 
+# Items are "newly reported" in W8: add fed-forward and earlier diagnoses
+diagnoses_w8 <- dx_ever_wave(elsa_core_w8, diagnoses_w8, dx_ever)
+dx_ever <- carry_record(dx_ever, diagnoses_w8)
+
 # CES-D (Items 37–44) — lowercase in W8
 cesd_w8 <- elsa_core_w8 %>%
   dplyr::select(idauniq, psceda, pscedb, pscedc, pscedd,
@@ -4586,6 +4666,10 @@ other_health_w8 <- elsa_core_w8 %>%
     mmpain = case_when(mmpain == 1 ~ 1L, mmpain == 2 ~ 0L, TRUE ~ NA_integer_)
   ) %>%
   dplyr::select(idauniq, hehelf, hefla, hefrac, heji, mmpain)
+
+# hefrac / heji: 'since last interview' for continuing respondents -> carry forward
+other_health_w8 <- carry_ever(other_health_w8, cum_ever, cum_items)
+cum_ever <- carry_record(cum_ever, other_health_w8 %>% dplyr::select(idauniq, all_of(cum_items)))
 
 # Merge & compute FI — vectorised
 fi_items <- c(
@@ -4684,8 +4768,6 @@ elsa_fi_2016 <- elsa_fi_2016_orig %>%
 ```
 
 
-
-
 ```{r}
 # 5. Merge 2016 data -----------------------------------------------------
 elsa_2016 <- elsa_cov_2016 %>%
@@ -4730,7 +4812,7 @@ if (length(all_missing16) > 0) {
 }
 imputed_vars16 <- setdiff(analysis_covars16, all_missing16)
 
-# ---- 6b. Quantify missingness (for the Methods text) -------------------
+# ---- 6b. Quantify missingness ------------------------------------------
 miss_pct16 <- sapply(imp16_elsa, function(x) mean(is.na(x)) * 100)
 cat("ELSA 2016 — percentage missing per variable:\n")
 print(round(miss_pct16, 2))
@@ -4806,13 +4888,6 @@ stopifnot(nrow(ELSA_2016) == nrow(elsa_2016))
 ```
 
 
-
-```{r}
-
-```
-
-
-
 # ELSA Wave 9 (2018)
 ```{r}
 # W9 specifics: structurally identical to W8 except
@@ -4854,11 +4929,15 @@ elsa_cov_2018 <- elsa_core_w9 %>%
       TRUE                          ~ NA_integer_
     ),
 
+    # heska is only asked of ever-smokers; never-smokers (hesmk == 2) are routed past it
     Smoking = case_when(heska == 1 ~ 1L, heska == 2 ~ 0L,
+                        hesmk == 2 ~ 0L,
                         TRUE ~ NA_integer_),
 
     # W9: scalcy replaces scal7a (same 1=Yes/2=No coding)
+    # scalcy is skipped for those who had no drink in the last 12 months (scalcm == 8)
     Alcohol = case_when(scalcy == 1 ~ 1L, scalcy == 2 ~ 0L,
+                        scalcm == 8 ~ 0L,
                         TRUE ~ NA_integer_),
 
     Physical_activity = case_when(
@@ -5084,7 +5163,6 @@ print(summary_dementia_w9)
 ```
 
 
-
 # Frailty Index 2018-2019
 ```{r}
 # 4. Frailty Index (49 items) --------------------------------------------
@@ -5115,6 +5193,10 @@ diagnoses_w9 <- elsa_core_w9 %>%
          hedibca, hedibps) %>%
   mutate(across(-idauniq, recode_dx_w9))
 
+# Items are "newly reported" in W9: add fed-forward and earlier diagnoses
+diagnoses_w9 <- dx_ever_wave(elsa_core_w9, diagnoses_w9, dx_ever)
+dx_ever <- carry_record(dx_ever, diagnoses_w9)
+
 # CES-D (Items 37–44) — lowercase in W9
 cesd_w9 <- elsa_core_w9 %>%
   dplyr::select(idauniq, psceda, pscedb, pscedc, pscedd,
@@ -5143,6 +5225,10 @@ other_health_w9 <- elsa_core_w9 %>%
     mmpain = case_when(mmpain == 1 ~ 1L, mmpain == 2 ~ 0L, TRUE ~ NA_integer_)
   ) %>%
   dplyr::select(idauniq, hehelf, hefla, hefrac, heji, mmpain)
+
+# hefrac / heji: 'since last interview' for continuing respondents -> carry forward
+other_health_w9 <- carry_ever(other_health_w9, cum_ever, cum_items)
+cum_ever <- carry_record(cum_ever, other_health_w9 %>% dplyr::select(idauniq, all_of(cum_items)))
 
 # Merge & compute FI — vectorised
 fi_items <- c(
@@ -5241,8 +5327,6 @@ elsa_fi_2018 <- elsa_fi_2018_orig %>%
 ```
 
 
-
-
 ```{r}
 # 5. Merge 2018 data -----------------------------------------------------
 elsa_2018 <- elsa_cov_2018 %>%
@@ -5287,7 +5371,7 @@ if (length(all_missing18) > 0) {
 }
 imputed_vars18 <- setdiff(analysis_covars18, all_missing18)
 
-# ---- 6b. Quantify missingness (for the Methods text) -------------------
+# ---- 6b. Quantify missingness ------------------------------------------
 miss_pct18 <- sapply(imp18_elsa, function(x) mean(is.na(x)) * 100)
 cat("ELSA 2018 — percentage missing per variable:\n")
 print(round(miss_pct18, 2))
@@ -5363,8 +5447,6 @@ stopifnot(nrow(ELSA_2018) == nrow(elsa_2018))
 ```
 
 
-
-
 ```{r}
 # Merge all waves into longitudinal datasets
 # Put wave datasets into a list
@@ -5393,186 +5475,186 @@ elsa_long <- elsa_long %>%
   ) %>%
   dplyr::select(-matches("^age_\\d{4}$"))
 
-write.csv(elsa_long,
-          file = "elsa_long.csv",
-          row.names = FALSE)
+# Written to data/, where the analysis notebooks read it
+out_dir <- file.path(repo_root, "data")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+imputed_covars <- c("Marital_status", "Employment", "Smoking", "Alcohol",
+                    "Physical_activity", "Social_activity")
+stopifnot(!anyNA(elsa_long[imputed_covars]))
+write.csv(elsa_long, file.path(out_dir, "elsa_long.csv"), row.names = FALSE)
 
 ```
 
 
-
+# Reduced frailty index: (I)ADL items and affective CES-D items removed
 ```{r}
+# Reduced frailty index for the sensitivity analysis of potentially
+# prodromal dementia symptoms (ELSA_analysis_Cox.Rmd), as in HRS.
+# 49-item main index (wave chunks above): mobility 10, ADL/IADL 13,
+# diagnosed conditions 13, CES-D 8, other health 5.
+# Removed:
+#   * 13 ADL/IADL items (the items already removed in the noIADL index)
+#   * 5 affective CES-D items: psceda (felt depressed), pscedd (was not
+#     happy), pscede (felt lonely), pscedf (did not enjoy life), pscedg
+#     (felt sad)
+# Kept CES-D items: pscedb (everything an effort) and pscedh (could not get
+# going), the Fried exhaustion criterion, and pscedc (restless sleep).
+# HRS removed DEPRES, FSAD, FLONE and ENLIFE; the HRS index has no "happy"
+# item, ELSA's does, and it is affective, so it is removed too. To follow the
+# HRS list literally (keeping pscedd) gives a 32-item index (>= 26 answered).
+# Same rules as the main index: at least 80% of items answered (25 of 31),
+# score = deficits / items answered, frail if score >= 0.25.
+#
+# Built from the 36-item noIADL counts already in elsa_long.csv
+# (fi_n_valid_noIADL, fi_n_deficit_noIADL). The reduced index is the noIADL
+# index without the affective CES-D items, so
+#   answered_reduced = answered_noIADL - affective items answered
+#   deficits_reduced = deficits_noIADL - affective deficits
+# The CES-D items are read from each wave's core file with the recodes of
+# the wave chunks above (1 = yes -> 1, 2 = no -> 0; pscedd and pscedf
+# reversed). No MICE rerun is needed.
+# Limitation: a person-wave without a valid noIADL index (fewer than 29 of
+# 36 items answered, e.g. a proxy interview without the CES-D) gets no
+# reduced index here, even if 25 of the 31 reduced items were answered.
+# These person-waves are counted below.
+
+# ---- Paths: raw core files in data_dir, elsa_long.csv in out_dir ----------------
+elsa_raw_dir <- data_dir
+core_files <- c(
+  `2002` = "wave_1_core_data_v3.dta",
+  `2004` = "wave_2_core_data_v4.dta",
+  `2006` = "wave_3_elsa_data_v4.dta",
+  `2008` = "wave_4_elsa_data_v3.dta",
+  `2010` = "wave_5_elsa_data_v4.dta",
+  `2012` = "wave_6_elsa_data_v2.dta",
+  `2014` = "wave_7_elsa_data.dta",
+  `2016` = "wave_8_elsa_data_eul_v2.dta",
+  `2018` = "wave_9_elsa_data_eul_v2.dta"
+)
+
+# ---- Items --------------------------------------------------------------------
+n_items_full   <- 49L
+n_items_noIADL <- 36L
+cesd_items           <- paste0("psced", letters[1:8])
+cesd_reversed        <- c("pscedd", "pscedf")          # positively worded
+affective_cesd_items <- c("psceda", "pscedd", "pscede", "pscedf", "pscedg")
+n_items_reduced  <- n_items_noIADL - length(affective_cesd_items)
+cutoff_reduced   <- ceiling(0.80 * n_items_reduced)
+
+# ---- CES-D items, one wave (names are lower case in some waves, PScedA-H in
+#      others) ------------------------------------------------------------------
+read_cesd_wave <- function(year, file) {
+  path <- file.path(elsa_raw_dir, file)
+  nm   <- names(haven::read_dta(path, n_max = 0))
+  keep <- nm[tolower(nm) %in% c("idauniq", cesd_items)]
+  raw  <- haven::zap_labels(haven::read_dta(path, col_select = all_of(keep)))
+  names(raw) <- tolower(names(raw))
+  stopifnot("a CES-D item is missing from a core file" =
+              all(c("idauniq", cesd_items) %in% names(raw)))
+  raw %>%
+    transmute(
+      id_num  = as.numeric(idauniq),
+      year    = as.integer(year),
+      across(all_of(cesd_items),
+             ~ case_when(.x == 1 ~ 1L, .x == 2 ~ 0L, TRUE ~ NA_integer_))
+    ) %>%
+    mutate(across(all_of(cesd_reversed), ~ 1L - .x))
+}
+
+cesd_all <- bind_rows(lapply(names(core_files), function(y)
+  read_cesd_wave(as.integer(y), core_files[[y]])))
+stopifnot(
+  "a person appears twice in one wave of a core file" =
+    !anyDuplicated(cesd_all[c("id_num", "year")])
+)
+
+# ---- Derive the reduced index for every elsa_long.csv person-wave ---------
+fi_long <- read_csv(
+  file.path(out_dir, "elsa_long.csv"),
+  col_types = cols_only(idauniq = col_character(), year = col_integer(),
+                        fi_n_valid = col_double(), fi_n_deficit = col_double(),
+                        fi_score = col_double(), frailty = col_integer(),
+                        fi_n_valid_noIADL = col_double(),
+                        fi_n_deficit_noIADL = col_double(),
+                        fi_score_noIADL = col_double(),
+                        frailty_noIADL = col_integer())
+) %>%
+  mutate(id_num = as.numeric(idauniq)) %>%   # matched by value, so leading zeros do not matter
+  left_join(cesd_all %>% mutate(in_core = TRUE), by = c("id_num", "year")) %>%
+  mutate(in_core = coalesce(in_core, FALSE))
+
+found_pct <- 100 * mean(fi_long$in_core[!is.na(fi_long$fi_score_noIADL)])
+cat(sprintf("elsa_long person-waves with a noIADL index found in the core files: %.2f%%\n",
+            found_pct))
+stopifnot("idauniq does not match between elsa_long.csv and the core files" =
+            found_pct > 99)
+
+aff_mat <- as.matrix(fi_long[, affective_cesd_items])
+fi_long <- fi_long %>%
+  mutate(
+    aff_answered          = rowSums(!is.na(aff_mat)),
+    aff_deficits          = rowSums(aff_mat == 1, na.rm = TRUE),
+    fi_n_answered_reduced = if_else(in_core, fi_n_valid_noIADL - aff_answered, NA_real_),
+    fi_n_deficit_reduced  = if_else(in_core, fi_n_deficit_noIADL - aff_deficits, NA_real_),
+    valid_reduced         = !is.na(fi_n_answered_reduced) &
+                              fi_n_answered_reduced >= cutoff_reduced,
+    fi_score_reduced      = if_else(valid_reduced,
+                                    fi_n_deficit_reduced / fi_n_answered_reduced,
+                                    NA_real_),
+    frailty_reduced       = if_else(valid_reduced,
+                                    as.integer(fi_score_reduced >= 0.25),
+                                    NA_integer_)
+  )
+
+# ---- Checks -------------------------------------------------------------------
+chk <- fi_long %>% filter(!is.na(fi_score_noIADL), in_core)
+stopifnot(
+  "stored noIADL score differs from deficits / answered" =
+    all(abs(chk$fi_score_noIADL - chk$fi_n_deficit_noIADL / chk$fi_n_valid_noIADL) < 1e-9),
+  "reduced items answered out of range" =
+    all(chk$fi_n_answered_reduced >= 0 & chk$fi_n_answered_reduced <= n_items_reduced),
+  "reduced deficits out of range" =
+    all(chk$fi_n_deficit_reduced >= 0 &
+          chk$fi_n_deficit_reduced <= chk$fi_n_answered_reduced),
+  "noIADL answered exceeds 36 items" =
+    all(chk$fi_n_valid_noIADL <= n_items_noIADL)
+)
+rm(chk, aff_mat)
+
+fi_item_counts <- fi_long %>%
+  group_by(year) %>%
+  summarise(
+    items_full        = n_items_full,
+    items_noIADL      = n_items_noIADL,
+    items_reduced     = n_items_reduced,
+    cutoff_reduced    = cutoff_reduced,
+    valid_main        = sum(!is.na(fi_score)),
+    valid_noIADL      = sum(!is.na(fi_score_noIADL)),
+    valid_reduced     = sum(!is.na(fi_score_reduced)),
+    # main index valid but no noIADL counts, so no reduced index here
+    main_no_noIADL    = sum(!is.na(fi_score) & is.na(fi_score_noIADL)),
+    .groups = "drop"
+  )
+
+cat("\n=== Frailty index items and valid person-waves per wave ===\n")
+print(as.data.frame(fi_item_counts), row.names = FALSE)
+
+# ---- Write -----------------------------------------------------------------------
+elsa_fi_reduced <- fi_long %>%
+  dplyr::select(idauniq, year, fi_score_reduced, frailty_reduced,
+                fi_n_answered_reduced)
+
+write_csv(elsa_fi_reduced, file.path(out_dir, "elsa_fi_reduced.csv"))
+write_csv(fi_item_counts,  file.path(out_dir, "elsa_fi_item_counts.csv"))
+
+cat("\nPerson-waves with a valid index (elsa_long.csv rows):\n")
+print(tibble::tibble(
+  index = c("Main (49 items)", sprintf("Reduced (%d items)", n_items_reduced)),
+  valid = c(sum(!is.na(fi_long$fi_score)), sum(!is.na(fi_long$fi_score_reduced))),
+  valid_on_one_only = c(sum(!is.na(fi_long$fi_score) & is.na(fi_long$fi_score_reduced)),
+                        sum(is.na(fi_long$fi_score) & !is.na(fi_long$fi_score_reduced)))
+))
+cat("Wrote:\n  ", file.path(out_dir, "elsa_fi_reduced.csv"),
+    "\n  ", file.path(out_dir, "elsa_fi_item_counts.csv"), "\n")
 
 ```
-
-
-```{r}
-
-
-```
-
-
-
-```{r}
-
-
-```
-
-
-
-
-```{r}
-
-
-```
-
-
-
-
-```{r}
-
-```
-
-
-
-```{r}
-
-```
-
-
-```{r}
-
-
-```
-
-
-
-```{r}
-
-```
-
-
-
-
-```{r}
-
-
-```
-
-
-
-
-```{r}
-
-```
-
-
-
-```{r}
-
-```
-
-
-
-```{r}
-
-
-```
-
-
-
-```{r}
-
-```
-
-
-
-
-```{r}
-
-
-```
-
-
-
-
-```{r}
-
-```
-
-
-
-```{r}
-
-```
-
-
-
-```{r}
-
-
-```
-
-
-
-```{r}
-
-```
-
-
-
-
-```{r}
-
-
-```
-
-
-
-
-```{r}
-
-```
-
-
-
-```{r}
-
-```
-
-
-```{r}
-
-
-```
-
-
-
-```{r}
-
-```
-
-
-
-
-```{r}
-
-
-```
-
-
-
-
-```{r}
-
-```
-
-
-
-```{r}
-
-```
-
-
-
-

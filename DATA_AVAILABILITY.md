@@ -32,7 +32,18 @@ resolve.
 
 ## Derived, harmonised datasets
 
-The two extraction notebooks write intermediate person-wave files
-(`hrs_long.csv`, `elsa_long.csv`) that the analysis notebooks read back in.
+The two extraction notebooks write intermediate files to `data/` that the
+analysis notebooks read back in:
+
+| File | Written by | Contents |
+|------|------------|----------|
+| `hrs_long.csv` | `HRS_dataextract.Rmd` | Harmonised HRS person-wave data, frailty index and dementia status |
+| `death_track.rds` | `HRS_dataextract.Rmd` | One row per HRS participant: year and month last known alive, and of death |
+| `hrs_age_months.csv` | `HRS_dataextract.Rmd` | Age in months at each HRS interview (attained-age analysis) |
+| `hrs_fi_reduced.csv`, `hrs_fi_item_counts.csv` | `HRS_dataextract.Rmd` | Reduced frailty index without (I)ADL and affective items, and its item counts |
+| `elsa_long.csv` | `ELSA_extractdata.Rmd` | Harmonised ELSA person-wave data, frailty index and dementia status |
+| `elsa_fi_reduced.csv`, `elsa_fi_item_counts.csv` | `ELSA_extractdata.Rmd` | Reduced frailty index for ELSA, and its item counts |
+
 These are derived from restricted data and are therefore **also git-ignored**;
-regenerate them locally by running the extraction notebooks first.
+regenerate them locally by running the extraction notebooks first. The files of
+the same names under `demo/` are simulated and contain no participant data.
