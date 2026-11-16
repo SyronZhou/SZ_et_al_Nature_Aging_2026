@@ -72,7 +72,7 @@ simulate_cohort <- function(n, waves, id_name,
     )
 
   # Force a minority of people to acquire sensory impairment in the SAME wave as
-  # frailty onset. Without this, simultaneous onset (multi-state state 6) arises
+  # frailty onset. Without this, same-interval onset (multi-state state 6) arises
   # only by chance, leaving that state too sparse for msm::qratio.msm() to form
   # a rate ratio out of it -- which fails with "object 'L' not found" whenever a
   # transition rate is exactly zero.

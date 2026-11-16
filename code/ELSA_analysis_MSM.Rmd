@@ -628,7 +628,7 @@ ms_states <- ms_base %>%
     order_type = case_when(
       !is.na(t_hl) & !is.na(t_f) & t_hl <  t_f  ~ "HL_first",
       !is.na(t_hl) & !is.na(t_f) & t_f  <  t_hl ~ "Frail_first",
-      !is.na(t_hl) & !is.na(t_f) & t_hl == t_f  ~ "Simultaneous",
+      !is.na(t_hl) & !is.na(t_f) & t_hl == t_f  ~ "Same_interval",
       TRUE                                       ~ NA_character_
     )
   ) %>%
@@ -637,8 +637,8 @@ ms_states <- ms_base %>%
     state = case_when(
       # 7 = Dementia (highest priority — terminal, sole absorbing state)
       !is.na(t_dem) & time >= t_dem                                     ~ 7L,
-      # 6 = HL + frailty simultaneous
-      order_type == "Simultaneous" & !is.na(t_hl) & time >= t_hl        ~ 6L,
+      # 6 = HL + frailty first observed in the same interval
+      order_type == "Same_interval" & !is.na(t_hl) & time >= t_hl        ~ 6L,
       # 4 = HL first, then frailty
       order_type == "HL_first"     & !is.na(t_f)  & time >= t_f         ~ 4L,
       # 5 = Frailty first, then HL
@@ -709,7 +709,7 @@ stopifnot(sum(ms_dat$state == 7L) > 0)
 #   3 Frailty only        -> 5, 7
 #   4 Both (HL-first)     -> 7
 #   5 Both (Frail-first)  -> 7
-#   6 Both (Simultaneous) -> 7
+#   6 Both (same interval) -> 7
 #   7 Dementia            absorbing (NO outgoing — row 7 all zeros)
 # ----------------------------------------------------------------------------
 Q <- matrix(0, 7, 7)
@@ -724,7 +724,7 @@ Q[3, 5] <- 0.10; Q[3, 7] <- 0.02
 Q[4, 7] <- 0.05
 # From Both Frailty-first (5)
 Q[5, 7] <- 0.05
-# From Both Simultaneous (6)
+# From Both, same interval (6)
 Q[6, 7] <- 0.05
 # Row 7 left as zeros => absorbing
 
@@ -777,8 +777,8 @@ save_mat(transition_count, "MSM_hearing_unadj_statetable")
 save_rr(list("Healthy->Frailty vs Healthy->Hearing (first onset)" = ratio_first_hear,
              "Both (hearing first) vs Hearing only -> Dementia"    = rr_sensory_dem,
              "Both (frailty first) vs Frailty only -> Dementia"    = rr_frailty_dem,
-             "Both (simultaneous) vs Hearing only -> Dementia"     = rr_sim_vs_sensory,
-             "Both (simultaneous) vs Frailty only -> Dementia"     = rr_sim_vs_frailty,
+             "Both (same interval) vs Hearing only -> Dementia"     = rr_sim_vs_sensory,
+             "Both (same interval) vs Frailty only -> Dementia"     = rr_sim_vs_frailty,
              "Both (hearing first) vs Both (frailty first) -> Dementia" = rr_sensfirst_vs_frailfirst),
         "MSM_hearing_unadj_rate_ratios")
 save_mat(P5,  "MSM_hearing_unadj_P5")
@@ -933,8 +933,8 @@ save_tab(hr_hearing_adj,       "MSM_hearing_adj_covariate_HR")
 save_rr(list("Healthy->Frailty vs Healthy->Hearing (first onset)" = ratio_first_hear_adj,
              "Both (hearing first) vs Hearing only -> Dementia"    = rr_sensory_dem_adj,
              "Both (frailty first) vs Frailty only -> Dementia"    = rr_frailty_dem_adj,
-             "Both (simultaneous) vs Hearing only -> Dementia"     = rr_sim_vs_sensory_adj,
-             "Both (simultaneous) vs Frailty only -> Dementia"     = rr_sim_vs_frailty_adj,
+             "Both (same interval) vs Hearing only -> Dementia"     = rr_sim_vs_sensory_adj,
+             "Both (same interval) vs Frailty only -> Dementia"     = rr_sim_vs_frailty_adj,
              "Both (hearing first) vs Both (frailty first) -> Dementia" = rr_sensfirst_vs_frailfirst_adj),
         "MSM_hearing_adj_rate_ratios")
 save_mat(P5_adj,  "MSM_hearing_adj_P5")
@@ -986,7 +986,7 @@ ms_states_vis <- ms_base_vis %>%
     order_type = case_when(
       !is.na(t_vl) & !is.na(t_f) & t_vl <  t_f  ~ "VL_first",
       !is.na(t_vl) & !is.na(t_f) & t_f  <  t_vl ~ "Frail_first",
-      !is.na(t_vl) & !is.na(t_f) & t_vl == t_f  ~ "Simultaneous",
+      !is.na(t_vl) & !is.na(t_f) & t_vl == t_f  ~ "Same_interval",
       TRUE                                       ~ NA_character_
     )
   ) %>%
@@ -995,8 +995,8 @@ ms_states_vis <- ms_base_vis %>%
     state = case_when(
       # 7 = Dementia (highest priority — terminal, sole absorbing state)
       !is.na(t_dem) & time >= t_dem                                     ~ 7L,
-      # 6 = VL + frailty simultaneous
-      order_type == "Simultaneous" & !is.na(t_vl) & time >= t_vl        ~ 6L,
+      # 6 = VL + frailty first observed in the same interval
+      order_type == "Same_interval" & !is.na(t_vl) & time >= t_vl        ~ 6L,
       # 4 = VL first, then frailty
       order_type == "VL_first"     & !is.na(t_f)  & time >= t_f         ~ 4L,
       # 5 = Frailty first, then VL
@@ -1067,7 +1067,7 @@ stopifnot(sum(ms_dat_vis$state == 7L) > 0)
 #   3 Frailty only        -> 5, 7
 #   4 Both (VL-first)     -> 7
 #   5 Both (Frail-first)  -> 7
-#   6 Both (Simultaneous) -> 7
+#   6 Both (same interval) -> 7
 #   7 Dementia            absorbing
 Q_vis <- matrix(0, 7, 7)
 Q_vis[1, 2] <- 0.10; Q_vis[1, 3] <- 0.10; Q_vis[1, 6] <- 0.05; Q_vis[1, 7] <- 0.02
@@ -1120,8 +1120,8 @@ save_mat(transition_count_vis, "MSM_vision_unadj_statetable")
 save_rr(list("Healthy->Frailty vs Healthy->Vision (first onset)" = ratio_first_vis,
              "Both (vision first) vs Vision only -> Dementia"    = rr_vision_dem,
              "Both (frailty first) vs Frailty only -> Dementia"  = rr_frailty_dem_vis,
-             "Both (simultaneous) vs Vision only -> Dementia"    = rr_sim_vs_vision,
-             "Both (simultaneous) vs Frailty only -> Dementia"   = rr_sim_vs_frailty_vis,
+             "Both (same interval) vs Vision only -> Dementia"    = rr_sim_vs_vision,
+             "Both (same interval) vs Frailty only -> Dementia"   = rr_sim_vs_frailty_vis,
              "Both (vision first) vs Both (frailty first) -> Dementia" = rr_visfirst_vs_frailfirst),
         "MSM_vision_unadj_rate_ratios")
 save_mat(P5_vis,  "MSM_vision_unadj_P5")
@@ -1246,8 +1246,8 @@ save_tab(hr_vision_adj,            "MSM_vision_adj_covariate_HR")
 save_rr(list("Healthy->Frailty vs Healthy->Vision (first onset)" = ratio_first_vis_adj,
              "Both (vision first) vs Vision only -> Dementia"    = rr_vision_dem_adj,
              "Both (frailty first) vs Frailty only -> Dementia"  = rr_frailty_dem_vis_adj,
-             "Both (simultaneous) vs Vision only -> Dementia"    = rr_sim_vs_vision_adj,
-             "Both (simultaneous) vs Frailty only -> Dementia"   = rr_sim_vs_frailty_vis_adj,
+             "Both (same interval) vs Vision only -> Dementia"    = rr_sim_vs_vision_adj,
+             "Both (same interval) vs Frailty only -> Dementia"   = rr_sim_vs_frailty_vis_adj,
              "Both (vision first) vs Both (frailty first) -> Dementia" = rr_visfirst_vs_frailfirst_adj),
         "MSM_vision_adj_rate_ratios")
 save_mat(P5_vis_adj,  "MSM_vision_adj_P5")
@@ -1286,7 +1286,7 @@ bt_assign <- function(s, f, dem) {
                else if (prev %in% 4:6) prev    # episode continues
                else if (prev == 2L)    4L      # sensory came first
                else if (prev == 3L)    5L      # frailty came first
-               else                    6L      # from Healthy: simultaneous
+               else                    6L      # from Healthy: same interval
     }
     prev <- st[i]
   }
@@ -1610,7 +1610,7 @@ ggsave(file.path(output_dir, "ELSA_PanelB_MSM_transition_heatmap_adjusted.png"),
 #   3 Frailty only                  (S = 0, F = 1)
 #   4 Both, sensory first           (both present; entered from state 2)
 #   5 Both, frailty first           (both present; entered from state 3)
-#   6 Both, simultaneous            (both present; entered from state 1 / at baseline)
+#   6 Both, same interval           (both present; entered from state 1 / at baseline)
 #   7 Dementia                      (absorbing, carried forward)
 # No death state in ELSA (HRS has state 8 = death).
 # A person stays in 4/5/6 while both conditions persist. If one condition
@@ -1666,7 +1666,7 @@ bt_assign <- function(s, f, dem) {
                else if (prev %in% 4:6) prev    # episode continues
                else if (prev == 2L)    4L      # sensory came first
                else if (prev == 3L)    5L      # frailty came first
-               else                    6L      # from Healthy: simultaneous
+               else                    6L      # from Healthy: same interval
     }
     prev <- st[i]
   }
@@ -1791,8 +1791,8 @@ bt_contrasts <- tribble(
   "Healthy -> frailty only vs Healthy -> sensory only (first onset)",  1,   3,   1,   2,
   "Both (sensory first) vs sensory only -> dementia",                  4,   7,   2,   7,
   "Both (frailty first) vs frailty only -> dementia",                  5,   7,   3,   7,
-  "Both (simultaneous) vs sensory only -> dementia",                   6,   7,   2,   7,
-  "Both (simultaneous) vs frailty only -> dementia",                   6,   7,   3,   7,
+  "Both (same interval) vs sensory only -> dementia",                  6,   7,   2,   7,
+  "Both (same interval) vs frailty only -> dementia",                  6,   7,   3,   7,
   "Both (sensory first) vs both (frailty first) -> dementia",          4,   7,   5,   7
 )
 
@@ -1851,7 +1851,7 @@ cat("\n=== HEARING: backtracking, adjusted, t = 10 years ===\n"); print(bt_P10_h
 # Which comes first? From Healthy, probability of being in each 'Both' state at 10 y
 cat("\nFrom Healthy at 10 y — Both (hearing first):", round(bt_P10_hear[1, 4], 4),
     "| Both (frailty first):", round(bt_P10_hear[1, 5], 4),
-    "| Both (simultaneous):",  round(bt_P10_hear[1, 6], 4), "\n")
+    "| Both (same interval):",  round(bt_P10_hear[1, 6], 4), "\n")
 
 # ---- Save ----
 save_fit(bt_hear$fit0, bt_hear$fit_adj, "MSM_bt_hearing_model_fit")
@@ -1888,7 +1888,7 @@ cat("\n=== VISION: backtracking, adjusted, t = 10 years ===\n"); print(bt_P10_vi
 
 cat("\nFrom Healthy at 10 y — Both (vision first):", round(bt_P10_vis[1, 4], 4),
     "| Both (frailty first):", round(bt_P10_vis[1, 5], 4),
-    "| Both (simultaneous):",  round(bt_P10_vis[1, 6], 4), "\n")
+    "| Both (same interval):",  round(bt_P10_vis[1, 6], 4), "\n")
 
 # ---- Save ----
 save_fit(bt_vis$fit0, bt_vis$fit_adj, "MSM_bt_vision_model_fit")

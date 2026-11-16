@@ -5,7 +5,7 @@
 ### A two-cohort multi-state analysis in HRS (United States) and ELSA (England)
 
 Reproducible `R` code accompanying the manuscript. The analysis traces how
-**hearing and vision loss** and **frailty** accumulate — and in **what order** —
+**hearing and vision impairment** and **frailty** accumulate — and in **what order** —
 on the path to **incident dementia** in two large longitudinal studies of older
 adults.
 
@@ -30,57 +30,57 @@ different risk for dementia. This repository builds harmonised cohorts from two
 independent studies and models the transitions between health states over up to
 ~16 years of follow-up.
 
-Two exposures (**hearing loss**, **vision loss**) are each analysed against
+Two exposures (**hearing impairment**, **vision impairment**) are each analysed against
 frailty and dementia, in each cohort, using an identical modelling template so
 that findings can be compared across studies.
 
 ## The multi-state model at a glance
 
 Each person occupies one of eight mutually exclusive states. Dementia and death
-are absorbing. The "both" state is split by **which deficit came first** — the
-question at the heart of the paper.
+are absorbing. Co-occurrence of sensory impairment and frailty is split by
+**which condition was reached first** — the question at the heart of the paper.
 
-> **Note:** data on death were not available in ELSA due to data limitations, so
-> the ELSA model has seven states with dementia as the sole absorbing state. The
+> **Note:** linked mortality data were not available in ELSA over the analysis
+> window, so the ELSA model has seven states with dementia as the sole absorbing state. The
 > eight-state model with death shown below is the HRS specification.
 
 ```mermaid
 stateDiagram-v2
     direction LR
     [*] --> Healthy
-    Healthy --> Sensory : sensory loss only
+    Healthy --> Sensory : sensory impairment only
     Healthy --> Frailty : frailty only
-    Healthy --> BothSim : simultaneous
-    Sensory --> BothSF  : then frailty
-    Frailty --> BothFS  : then sensory
+    Healthy --> CoSame  : same interval
+    Sensory --> CoSF    : then frailty
+    Frailty --> CoFS    : then sensory impairment
     Healthy --> Dementia
     Sensory --> Dementia
     Frailty --> Dementia
-    BothSF  --> Dementia
-    BothFS  --> Dementia
-    BothSim --> Dementia
+    CoSF    --> Dementia
+    CoFS    --> Dementia
+    CoSame  --> Dementia
     Dementia --> [*]
 
     Healthy  --> Death
     Sensory  --> Death
     Frailty  --> Death
-    BothSF   --> Death
-    BothFS   --> Death
-    BothSim  --> Death
+    CoSF     --> Death
+    CoFS     --> Death
+    CoSame   --> Death
     Death --> [*]
 ```
 
-**State abbreviations.** Each "both" state is named for the two conditions in
-the order they arose:
+**State abbreviations.** Each co-occurrence state is named for the order in
+which the two conditions were first observed:
 
 | Label | Meaning |
 |-------|---------|
 | `Healthy` | No sensory impairment and no frailty |
 | `Sensory` | Sensory impairment only |
 | `Frailty` | Frailty only |
-| `BothSF` | Both present, **S**ensory impairment first, then **F**railty |
-| `BothFS` | Both present, **F**railty first, then **S**ensory impairment |
-| `BothSim` | Both arose **sim**ultaneously, i.e. within the same study wave |
+| `CoSF` | Co-occurrence, **S**ensory impairment first, then **F**railty |
+| `CoFS` | Co-occurrence, **F**railty first, then **S**ensory impairment |
+| `CoSame` | Co-occurrence, both first observed in the **same** assessment interval, so the order of onset cannot be determined |
 | `Dementia` | Incident dementia (absorbing) |
 | `Death` | Death from any cause (absorbing; HRS only) |
 
@@ -94,7 +94,7 @@ the order they arose:
 | **Dementia ascertainment** | HRS: Langa–Weir cognitive classification. ELSA: self-reported physician diagnosis combined with the 16-item IQCODE (mean ≥ 3.4 over the items answered). Dementia is made irreversible (`cummax`). |
 | **Missing data** | Multiple imputation by chained equations (`mice`, `m = 20`, 10 iterations), fitted separately at each wave of each cohort — predictive mean matching for continuous variables, proportional-odds regression for education, logistic regression for binary variables. Sex and race/ethnicity are imputed inside the fully conditional specification so no predictor carries missing values into the design matrix, but are not written back to the analysis data. The primary study variables (frailty index, sensory impairment, dementia) are neither imputed nor used as predictors. A single completed dataset is carried forward; the `mids` objects are retained for optional pooled inference. |
 | **Multi-state models** | 8-state continuous-time, time-homogeneous Markov models (`msm`) with dementia and death as absorbing states (7 states in ELSA, where mortality follow-up is incomplete); reversals and transitions bypassing the single-condition intermediate states are fixed at zero. Unadjusted and covariate-adjusted fits (age, sex, race/ethnicity, education, marital status; effects constrained equal within transition groups). Yields transition intensities, transition-rate ratios, covariate hazard ratios, and 5- and 10-year transition-probability matrices. |
-| **Survival models** | Time-varying Cox proportional-hazards models in counting-process format with one-wave lagged exposures, Efron ties, and cluster-robust standard errors. Models 1–4 apply progressive adjustment on a common complete-case sample; Model 4 is also fitted with a sensory × frailty interaction (ratio of HRs and RERI). Model 5 replaces the binary sensory exposure with a three-level term contrasting person-time before frailty onset against person-time with concurrent or prior frailty. Kaplan–Meier cumulative incidence by baseline status. |
+| **Survival models** | Time-varying Cox proportional-hazards models in counting-process format with one-wave lagged exposures, Efron ties, and cluster-robust standard errors. Models 1–4 apply progressive adjustment on a common complete-case sample; Model 4 is also fitted with a sensory × frailty interaction (ratio of HRs and RERI). Model 5 replaces the binary sensory exposure with a three-level term contrasting sensory impairment before or without subsequent frailty onset against sensory impairment with or subsequent to frailty onset. Kaplan–Meier cumulative incidence by baseline status. |
 | **Attributable burden** | Population attributable fractions (Levin's formula) using person-time-weighted exposure prevalence, with Monte Carlo confidence intervals (10,000 draws; multivariate-normal for the three-level exposure so the correlation among stratum coefficients is preserved). Parametric g-formula PAFs at 10 and 16 years (bootstrap CIs) as a risk-based check on the Levin PAFs. |
 | **Sensitivity analyses** | Age (< 65 / ≥ 65) and sex subgroups with interaction tests; multi-state models allowing recovery (backward transitions); Fine–Gray sub-distribution hazards with death as the competing event (HRS only); exposures and time-varying covariates lagged by two waves; the reduced frailty index; and attained age as the time scale. |
 | **Figures** | Forest plots, PAF plots, cumulative-incidence curves, and transition-probability heatmaps for the main text and supplement. |
