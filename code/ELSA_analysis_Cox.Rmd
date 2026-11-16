@@ -1,0 +1,3794 @@
+---
+title: "ELSA: time-varying Cox models, PAF and sensitivity analyses"
+output: html_notebook
+---
+
+<!--
+  Analysis code for the manuscript on sensory impairment, frailty, and incident
+  dementia in the HRS (United States) and ELSA (England) cohorts.
+
+  DATA NOT INCLUDED. HRS and ELSA are restricted-access and cannot be
+  redistributed. Obtain the source data from the data providers and place them
+  under data/ (git-ignored) so the relative paths in this notebook resolve.
+  See README.md for setup and run order.
+-->
+
+<!--
+ELSA counterpart of HRS_analysis_Cox.Rmd. Same cohort rules, interval
+construction, models, PAF method, sensitivity analyses and saved outputs.
+The two setup chunks below ("Shared setup" and "Load data") are identical
+in ELSA_analysis_Cox.Rmd and ELSA_analysis_MSM.Rmd.
+
+Differences from HRS, all because of the ELSA data:
+  * No death tracking and no Fine-Gray competing-risk analysis (ELSA has
+    no usable mortality data).
+  * Follow-up ends at the last ELSA wave in elsa_long.csv, 2018 (HRS: 2020).
+  * Attained-age time scale from calendar years: age at each wave = wave
+    year - birth year (no interview or birth month in the ELSA End User
+    Licence files). HRS uses age in months from the interview dates.
+  * Reduced frailty index derived from the 36-item noIADL counts plus the
+    CES-D items read from the core files (built in ELSA_extractdata.Rmd).
+  * Every saved file ends in _ELSA instead of _HRS.
+ELSA variable names: idauniq (id), frailty (HRS Frailty_status), fi_score
+(HRS FI_score).
+-->
+
+
+# Shared setup: libraries, data load, cohort construction
+```{r}
+library(haven)
+library(dplyr)
+library(labelled)
+library(tidyverse)
+library(stringr)
+library(lubridate)
+library(msm)
+library(survival)
+library(survminer)
+library(scales)
+```
+
+
+# Load data
+```{r}
+# ---------------------------------------------------------------------------
+# Paths are relative to the REPOSITORY ROOT, not to code/.
+#
+# RStudio runs .Rmd chunks with the working directory set to the notebook's own
+# folder, so without this the code would look for code/data/ instead of data/.
+# The root is resolved into a variable rather than with setwd(), because a
+# setwd() inside a chunk does not persist to the next chunk.
+# ---------------------------------------------------------------------------
+repo_root <- if (basename(getwd()) == "code") normalizePath("..") else normalizePath(".")
+cat("Repository root:", repo_root, "\n")
+data_dir    <- file.path(repo_root, "data")      # harmonised person-wave data (input)
+results_dir <- file.path(repo_root, "results")   # model output: tables (.csv) and fits (.rds)
+output_dir  <- file.path(repo_root, "output")    # figures
+dir.create(results_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(output_dir,  showWarnings = FALSE, recursive = TRUE)
+
+elsa_long_path <- file.path(data_dir, "elsa_long.csv")
+ELSA_long <- read_csv(
+  elsa_long_path,
+  guess_max = Inf,                          # rows are stacked by wave; guess types from all of them
+  col_types = cols(
+    idauniq = col_character(),
+    year    = col_integer(),
+    .default = col_guess()
+  )
+)
+stopifnot(nrow(problems(ELSA_long)) == 0)   # any parsing failure stops here
+stopifnot(nrow(count(ELSA_long, idauniq, year) %>% filter(n > 1)) == 0)
+
+baseline_start <- 2002L
+baseline_end   <- 2008L
+
+# 0) Apply cummax to dementia — make it irreversible
+#    Same rule as HRS: a wave without a dementia assessment stays NA unless
+#    dementia was already observed at an earlier wave.
+ELSA_long_fixed <- ELSA_long %>%
+  arrange(idauniq, year) %>%
+  group_by(idauniq) %>%
+  mutate(
+    dementia_observed = as.integer(dementia),
+    ever_dementia     = cummax(coalesce(dementia_observed, 0L)),
+    dementia = case_when(
+      ever_dementia == 1L       ~ 1L,
+      !is.na(dementia_observed) ~ dementia_observed,
+      TRUE                      ~ NA_integer_
+    )
+  ) %>%
+  dplyr::select(-dementia_observed, -ever_dementia) %>%
+  ungroup()
+
+revert_check <- ELSA_long_fixed %>%
+  arrange(idauniq, year) %>%
+  group_by(idauniq) %>%
+  mutate(reverted = !is.na(lag(dementia)) & lag(dementia) == 1 & dementia == 0) %>%
+  ungroup()
+cat("Reversions remaining after cummax():", sum(revert_check$reverted, na.rm = TRUE), "\n")
+
+cat("\nDementia person-waves after cummax:",
+    sum(ELSA_long_fixed$dementia == 1, na.rm = TRUE), "\n")
+cat("Unique dementia people:",
+    n_distinct(ELSA_long_fixed$idauniq[ELSA_long_fixed$dementia == 1]), "\n")
+
+cat("\nPerson-waves with unknown dementia status (NA) after carry-forward:",
+    sum(is.na(ELSA_long_fixed$dementia)), "\n")
+
+n_never_assessed <- ELSA_long_fixed %>%
+  group_by(idauniq) %>%
+  summarise(all_na = all(is.na(dementia)), .groups = "drop") %>%
+  summarise(n = sum(all_na)) %>%
+  pull(n)
+cat("People never assessed for dementia in any wave:", n_never_assessed, "\n")
+
+# 1) Identify baseline year per person
+#    Require: age >= 50, dementia == 0, hearing_loss, vision_overall, frailty not missing
+baseline_tbl <- ELSA_long_fixed %>%
+  filter(year >= baseline_start, year <= baseline_end) %>%
+  filter(!is.na(age), age >= 50) %>%
+  filter(!is.na(dementia), dementia == 0) %>%
+  filter(!is.na(hearing_loss)) %>%
+  filter(!is.na(vision_overall)) %>%
+  filter(!is.na(frailty)) %>%
+  group_by(idauniq) %>%
+  summarise(baseline_year = min(year), .groups = "drop")
+
+cat("\nParticipants with valid baseline:", nrow(baseline_tbl), "\n")
+
+# 2) Extract the baseline row (one per person)
+baseline_df <- ELSA_long_fixed %>%
+  inner_join(baseline_tbl, by = "idauniq") %>%
+  filter(year == baseline_year) %>%
+  distinct(idauniq, .keep_all = TRUE)
+
+# 3) Build panel: baseline + all follow-up waves
+panel_df <- ELSA_long_fixed %>%
+  inner_join(baseline_tbl, by = "idauniq") %>%
+  filter(year >= baseline_year)
+
+# 4) Eligibility: ≥2 valid waves on each measure; has follow-up
+eligible_ids <- panel_df %>%
+  group_by(idauniq) %>%
+  summarise(
+    n_rounds         = n(),
+    n_hearing_valid  = sum(!is.na(hearing_loss)),
+    n_vision_valid   = sum(!is.na(vision_overall)),
+    n_frailty_valid  = sum(!is.na(frailty)),
+    n_dementia_valid = sum(!is.na(dementia)),
+    has_fu           = any(year > baseline_year),
+    .groups = "drop"
+  ) %>%
+  filter(
+    n_rounds         >= 2,
+    n_hearing_valid  >= 2,
+    n_vision_valid   >= 2,
+    n_frailty_valid  >= 2,
+    n_dementia_valid >= 2,
+    has_fu
+  ) %>%
+  dplyr::select(idauniq)
+
+baseline_df_eligible <- baseline_df %>%
+  semi_join(eligible_ids, by = "idauniq")
+
+panel_df_eligible <- panel_df %>%
+  semi_join(eligible_ids, by = "idauniq")
+
+cat("\nFinal eligible participants:", nrow(baseline_df_eligible), "\n")
+cat("Final person-waves:", nrow(panel_df_eligible), "\n")
+
+```
+
+
+# Cox models (model 1,2,3,4) for hearing loss and vision loss (ELSA)
+
+```{r}
+library(survival)
+
+# Last ELSA wave in elsa_long.csv (wave 9, 2018). HRS uses 2020, its last
+# wave with dementia ascertainment.
+last_wave <- 2018L
+
+# Time-invariant covariates from baseline (includes baseline age)
+baseline_invariant <- baseline_df_eligible %>%
+  mutate(idauniq = as.character(idauniq)) %>%
+  dplyr::select(idauniq, Gender, Race, Education, Marital_status, age) %>%
+  rename(baseline_age = age)
+
+df0_all <- panel_df_eligible %>%
+  mutate(idauniq = as.character(idauniq)) %>%
+  dplyr::select(-Gender, -Race, -Education, -Marital_status) %>%
+  left_join(baseline_invariant, by = "idauniq") %>%
+  mutate(
+    year          = as.integer(year),
+    baseline_year = as.integer(baseline_year),
+    time          = as.numeric(year - baseline_year),
+
+    # outcome (binary)
+    dementia       = as.integer(dementia),
+
+    # binary exposures stay integer 0/1
+    hearing_loss   = as.integer(hearing_loss),
+    vision_overall = as.integer(vision_overall),
+    frailty = as.integer(frailty),
+
+    # categorical exposures/covariates -> factors
+    Employment     = factor(Employment),
+    Smoking        = factor(Smoking),
+    Alcohol        = factor(Alcohol),
+    Gender         = factor(Gender),
+    Race           = factor(Race),
+    Education      = factor(Education),
+    Marital_status = factor(Marital_status),
+
+    baseline_age   = as.numeric(baseline_age)
+  ) %>%
+  arrange(idauniq, time)
+
+# Waves with an assessed dementia status (should stop at 2018)
+cat("Waves with assessed dementia status:\n")
+print(table(df0_all$year[!is.na(df0_all$dementia)]))
+
+# Persons with an unassessed wave before their last assessed wave. These
+# waves are skipped below, so follow-up continues to the next assessed wave
+# instead of stopping at the first missing dementia status.
+na_gap <- df0_all %>%
+  group_by(idauniq) %>%
+  summarise(
+    first_na  = suppressWarnings(min(time[is.na(dementia)])),
+    last_obs  = max(time[!is.na(dementia)]),
+    dem_after = any(dementia == 1 & time > first_na, na.rm = TRUE),
+    .groups = "drop"
+  )
+cat("Persons with an unassessed wave before their last assessed wave:",
+    sum(na_gap$first_na < na_gap$last_obs),
+    " | dementia events after such a wave:", sum(na_gap$dem_after), "\n")
+
+# Keep assessed waves only, within the MSM window (waves up to 2018).
+# An interval then runs from one assessed wave to the next assessed wave;
+# exposures still come from the start of that interval.
+df0 <- df0_all %>%
+  filter(!is.na(dementia), year <= last_wave)
+
+# 1) Build interval dataset (counting-process format)
+tv_dat <- df0 %>%
+  group_by(idauniq) %>%
+  mutate(
+    tstart      = lag(time),
+    tstop       = time,
+    event       = dementia,
+
+    # status at the START of the interval
+    hearing_lag = lag(hearing_loss),
+    vision_lag  = lag(vision_overall),
+    frailty_lag = lag(frailty),
+
+    emp_lag     = lag(Employment),
+    smoke_lag   = lag(Smoking),
+    alcohol_lag = lag(Alcohol)
+  ) %>%
+  ungroup() %>%
+  filter(!is.na(tstart), tstop > tstart)
+
+# 2) Keep intervals up to first dementia event
+tv_dat <- tv_dat %>%
+  group_by(idauniq) %>%
+  mutate(event_cum = cumsum(event)) %>%
+  filter(event_cum <= 1) %>%
+  ungroup() %>%
+  dplyr::select(-event_cum)
+
+stopifnot(!anyNA(tv_dat$event))
+
+# ----------------------------------------------------------------------
+# 3) Common analytic sample (complete-case on the M4 covariate set)
+#    Using the same rows for M1-M4 makes HRs across models comparable.
+# ----------------------------------------------------------------------
+tv_cc <- tv_dat %>%
+  filter(
+    !is.na(hearing_lag), !is.na(vision_lag), !is.na(frailty_lag),
+    !is.na(emp_lag),    !is.na(smoke_lag),  !is.na(alcohol_lag),
+    !is.na(baseline_age),
+    !is.na(Gender), !is.na(Race), !is.na(Education), !is.na(Marital_status)
+  )
+
+# Report what the complete-case restriction costs
+cat("Before CC  -> intervals:", nrow(tv_dat),
+    " | persons:", dplyr::n_distinct(tv_dat$idauniq),
+    " | events:", sum(tv_dat$event), "\n")
+cat("Analytic intervals:", nrow(tv_cc),
+    " | unique persons:", dplyr::n_distinct(tv_cc$idauniq),
+    " | events:", sum(tv_cc$event), "\n")
+
+# ======================================================================
+# Helper: tidy HR table
+# ======================================================================
+tidy_hr <- function(fit, terms = NULL, model_label = NA_character_) {
+  out <- broom::tidy(fit, exponentiate = TRUE, conf.int = TRUE) %>%
+    dplyr::select(term, HR = estimate, conf.low, conf.high, p.value) %>%
+    mutate(
+      HR_CI = sprintf("%.2f (%.2f-%.2f)", HR, conf.low, conf.high),
+      model = model_label
+    )
+  if (!is.null(terms)) out <- out %>% filter(term %in% terms)
+  out
+}
+
+# Helper: print intervals / persons / events for each fit
+fit_n <- function(fit, label, data = tv_cc, id = "idauniq") {
+  cat(sprintf("[%s]  intervals = %d   persons = %d   events = %d\n",
+              label, fit$n, dplyr::n_distinct(data[[id]]), fit$nevent))
+}
+
+# ======================================================================
+# Pre-flight checks (exposure prevalence, correlation and VIF; Supplementary Table 35)
+# ======================================================================
+prev_tab <- tv_cc %>%
+  count(hearing_lag, vision_lag, frailty_lag) %>%
+  mutate(pct = round(100 * n / sum(n), 1))
+print(prev_tab)
+
+# Correlation among the three exposures (frailty as numeric just for diagnostics)
+cor_tab <- tv_cc %>%
+  mutate(frailty_num = as.numeric(frailty_lag)) %>%
+  dplyr::select(hearing_lag, vision_lag, frailty_num) %>%
+  cor()
+print(round(cor_tab, 3))
+
+# VIF: use a logistic GLM for a more appropriate diagnostic on a binary outcome
+vif_check <- glm(
+  event ~ hearing_lag + vision_lag + frailty_lag +
+    baseline_age + Gender + Race + Education + Marital_status +
+    emp_lag + smoke_lag + alcohol_lag,
+  data = tv_cc, family = binomial()
+)
+print(car::vif(vif_check))
+
+# ======================================================================
+# Model 1: Unadjusted (one Cox per exposure)
+# ======================================================================
+fit_m1_hearing <- coxph(
+  Surv(tstart, tstop, event) ~ hearing_lag + cluster(idauniq),
+  data = tv_cc, ties = "efron"
+)
+summary(fit_m1_hearing); fit_n(fit_m1_hearing, "M1 hearing")
+
+fit_m1_vision <- coxph(
+  Surv(tstart, tstop, event) ~ vision_lag + cluster(idauniq),
+  data = tv_cc, ties = "efron"
+)
+summary(fit_m1_vision); fit_n(fit_m1_vision, "M1 vision")
+
+fit_m1_frailty <- coxph(
+  Surv(tstart, tstop, event) ~ frailty_lag + cluster(idauniq),
+  data = tv_cc, ties = "efron"
+)
+summary(fit_m1_frailty); fit_n(fit_m1_frailty, "M1 frailty")
+
+# ======================================================================
+# Model 2: + age
+# ======================================================================
+fit_m2_hearing <- coxph(
+  Surv(tstart, tstop, event) ~ hearing_lag +
+    baseline_age +
+    cluster(idauniq),
+  data = tv_cc, ties = "efron"
+)
+summary(fit_m2_hearing); fit_n(fit_m2_hearing, "M2 hearing")
+
+fit_m2_vision <- coxph(
+  Surv(tstart, tstop, event) ~ vision_lag +
+    baseline_age +
+    cluster(idauniq),
+  data = tv_cc, ties = "efron"
+)
+summary(fit_m2_vision); fit_n(fit_m2_vision, "M2 vision")
+
+fit_m2_frailty <- coxph(
+  Surv(tstart, tstop, event) ~ frailty_lag +
+    baseline_age +
+    cluster(idauniq),
+  data = tv_cc, ties = "efron"
+)
+summary(fit_m2_frailty); fit_n(fit_m2_frailty, "M2 frailty")
+
+# ======================================================================
+# Model 3: + sex, race, education, marital status,
+#          employment, smoking, alcohol
+# ======================================================================
+fit_m3_hearing <- coxph(
+  Surv(tstart, tstop, event) ~ hearing_lag +
+    baseline_age + Gender + Race + Education + Marital_status +
+    emp_lag + smoke_lag + alcohol_lag +
+    cluster(idauniq),
+  data = tv_cc, ties = "efron"
+)
+summary(fit_m3_hearing); fit_n(fit_m3_hearing, "M3 hearing")
+
+fit_m3_vision <- coxph(
+  Surv(tstart, tstop, event) ~ vision_lag +
+    baseline_age + Gender + Race + Education + Marital_status +
+    emp_lag + smoke_lag + alcohol_lag +
+    cluster(idauniq),
+  data = tv_cc, ties = "efron"
+)
+summary(fit_m3_vision); fit_n(fit_m3_vision, "M3 vision")
+
+fit_m3_frailty <- coxph(
+  Surv(tstart, tstop, event) ~ frailty_lag +
+    baseline_age + Gender + Race + Education + Marital_status +
+    emp_lag + smoke_lag + alcohol_lag +
+    cluster(idauniq),
+  data = tv_cc, ties = "efron"
+)
+summary(fit_m3_frailty); fit_n(fit_m3_frailty, "M3 frailty")
+
+# ======================================================================
+# Model 4 (PRIMARY): hybrid design
+#   - Hearing HR  -> separate Cox (hearing  + frailty + covariates)
+#   - Vision  HR  -> separate Cox (vision   + frailty + covariates)
+#   - Frailty HR  -> mutually adjusted Cox (hearing + vision + frailty + covariates)
+# ======================================================================
+
+# ---- Hearing row: separate Cox, frailty as covariate -----------------------
+fit_m4_hearing <- coxph(
+  Surv(tstart, tstop, event) ~ hearing_lag +
+    baseline_age + Gender + Race + Education + Marital_status +
+    emp_lag + smoke_lag + alcohol_lag + frailty_lag +
+    cluster(idauniq),
+  data = tv_cc, ties = "efron"
+)
+summary(fit_m4_hearing); fit_n(fit_m4_hearing, "M4 hearing")
+cox.zph(fit_m4_hearing)
+
+# ---- Vision row: separate Cox, frailty as covariate ------------------------
+fit_m4_vision <- coxph(
+  Surv(tstart, tstop, event) ~ vision_lag +
+    baseline_age + Gender + Race + Education + Marital_status +
+    emp_lag + smoke_lag + alcohol_lag + frailty_lag +
+    cluster(idauniq),
+  data = tv_cc, ties = "efron"
+)
+summary(fit_m4_vision); fit_n(fit_m4_vision, "M4 vision")
+cox.zph(fit_m4_vision)
+
+# ---- Frailty row: mutually-adjusted Cox (single coherent frailty HR) -------
+# Its hearing_lag / vision_lag rows can be reported as a supplementary
+# mutually-adjusted result.
+fit_m4_frailty <- coxph(
+  Surv(tstart, tstop, event) ~
+    hearing_lag + vision_lag + frailty_lag +
+    baseline_age + Gender + Race + Education + Marital_status +
+    emp_lag + smoke_lag + alcohol_lag +
+    cluster(idauniq),
+  data = tv_cc, ties = "efron"
+)
+summary(fit_m4_frailty); fit_n(fit_m4_frailty, "M4 frailty")
+cox.zph(fit_m4_frailty)
+
+# ======================================================================
+# Model 4 + sensory x frailty interaction (Supplementary Table 34)
+#   Same rows and covariates as Model 4; adds the product term.
+#   Reports: interaction (ratio of HRs) with robust Wald P, sensory HR in
+#   non-frail and frail intervals, and RERI (additive scale).
+#   Variances come from vcov(fit) = robust (cluster) variance; do not use
+#   anova() for the P value, because its LR test ignores cluster().
+# ======================================================================
+fit_m4_int_hearing <- coxph(
+  Surv(tstart, tstop, event) ~ hearing_lag * frailty_lag +
+    baseline_age + Gender + Race + Education + Marital_status +
+    emp_lag + smoke_lag + alcohol_lag +
+    cluster(idauniq),
+  data = tv_cc, ties = "efron"
+)
+summary(fit_m4_int_hearing); fit_n(fit_m4_int_hearing, "M4 hearing x frailty")
+
+fit_m4_int_vision <- coxph(
+  Surv(tstart, tstop, event) ~ vision_lag * frailty_lag +
+    baseline_age + Gender + Race + Education + Marital_status +
+    emp_lag + smoke_lag + alcohol_lag +
+    cluster(idauniq),
+  data = tv_cc, ties = "efron"
+)
+summary(fit_m4_int_vision); fit_n(fit_m4_int_vision, "M4 vision x frailty")
+
+# Stratum-specific HRs, interaction and RERI.
+# Prints plain text with cat(), so the output does not depend on how data
+# frames or tibbles display in the console.
+report_int <- function(fit, exposure, label, frailty = "frailty_lag") {
+  b  <- coef(fit)
+  V  <- vcov(fit)                                   # robust (cluster) variance
+  e  <- exposure; f <- frailty; ef <- paste0(e, ":", f)
+  z  <- qnorm(0.975)
+
+  # linear combination of coefficients -> HR, 95% CI, robust Wald P
+  lc <- function(w) {
+    est <- sum(w * b[names(w)])
+    se  <- sqrt(drop(t(w) %*% V[names(w), names(w)] %*% w))
+    c(HR = exp(est), lo = exp(est - z * se), hi = exp(est + z * se),
+      p = 2 * pnorm(-abs(est / se)))
+  }
+  fmt_p <- function(p) if (p < 0.001) "P < 0.001" else sprintf("P = %.3f", p)
+  line  <- function(name, x)
+    cat(sprintf("  %-30s %.2f (%.2f-%.2f)   %s\n",
+                name, x[["HR"]], x[["lo"]], x[["hi"]], fmt_p(x[["p"]])))
+
+  nf  <- lc(setNames(1,       e))
+  fr  <- lc(setNames(c(1, 1), c(e, ef)))
+  int <- lc(setNames(1,       ef))
+
+  # RERI = HR11 - HR10 - HR01 + 1 (delta method)
+  h10  <- exp(b[[e]]); h01 <- exp(b[[f]]); h11 <- exp(b[[e]] + b[[f]] + b[[ef]])
+  reri <- h11 - h10 - h01 + 1
+  g    <- c(h11 - h10, h11 - h01, h11)
+  se_r <- sqrt(drop(t(g) %*% V[c(e, f, ef), c(e, f, ef)] %*% g))
+
+  cat("\n", label, "\n", sep = "")
+  line("Sensory HR, non-frail", nf)
+  line("Sensory HR, frail", fr)
+  line("Interaction (ratio of HRs)", int)
+  cat(sprintf("  %-30s %.2f (%.2f to %.2f)\n", "RERI",
+              reri, reri - z * se_r, reri + z * se_r))
+
+  invisible(data.frame(quantity = c("non-frail", "frail", "interaction"),
+                       rbind(nf, fr, int), row.names = NULL))
+}
+
+int_hearing <- report_int(fit_m4_int_hearing, "hearing_lag", "HEARING x FRAILTY")
+int_vision  <- report_int(fit_m4_int_vision,  "vision_lag",  "VISION x FRAILTY")
+
+# Cross-check for the frail stratum: recode frailty so that "frail" is the
+# reference level. The sensory main effect is then the HR among frail
+# intervals, and summary() prints its robust CI and P directly. It must match
+# the "Sensory HR, frail" line above.
+fit_frail_ref_h <- coxph(
+  Surv(tstart, tstop, event) ~ hearing_lag * I(1 - frailty_lag) +
+    baseline_age + Gender + Race + Education + Marital_status +
+    emp_lag + smoke_lag + alcohol_lag + cluster(idauniq),
+  data = tv_cc, ties = "efron"
+)
+fit_frail_ref_v <- coxph(
+  Surv(tstart, tstop, event) ~ vision_lag * I(1 - frailty_lag) +
+    baseline_age + Gender + Race + Education + Marital_status +
+    emp_lag + smoke_lag + alcohol_lag + cluster(idauniq),
+  data = tv_cc, ties = "efron"
+)
+summary(fit_frail_ref_h)$conf.int["hearing_lag", ]
+summary(fit_frail_ref_h)$coefficients["hearing_lag", ]
+summary(fit_frail_ref_v)$conf.int["vision_lag", ]
+summary(fit_frail_ref_v)$coefficients["vision_lag", ]
+
+```
+
+
+# Model 5 (ELSA): sensory impairment by frailty context and incident dementia
+# Attendance and follow-up, ELSA (Supplementary Table 12)
+```{r}
+wave_step    <- 2
+analytic_ids <- unique(as.character(tv_cc$idauniq))
+
+base_status <- df0_all %>%
+  mutate(idauniq = as.character(idauniq)) %>%
+  filter(idauniq %in% analytic_ids, time == 0) %>%
+  transmute(idauniq,
+            hearing0 = factor(hearing_loss,   0:1, c("No", "Yes")),
+            vision0  = factor(vision_overall, 0:1, c("No", "Yes")),
+            frailty0 = factor(frailty,        0:1, c("No", "Yes")))
+
+att_rows <- df0 %>%
+  mutate(idauniq = as.character(idauniq)) %>%
+  filter(idauniq %in% analytic_ids) %>%
+  arrange(idauniq, time) %>%
+  group_by(idauniq) %>%
+  filter(cumsum(dementia) <= 1) %>%
+  mutate(gap = time - lag(time)) %>%
+  ungroup()
+
+cat("Years between consecutive assessments (ELSA):\n")
+print(table(att_rows$gap, useNA = "no"))
+
+attend <- att_rows %>%
+  group_by(idauniq) %>%
+  summarise(
+    n_assess = n(),
+    fu_years = max(time),
+    n_missed = max(time) / wave_step + 1 - n(),
+    gap_mean = if (n() > 1) mean(gap, na.rm = TRUE) else NA_real_,
+    .groups  = "drop"
+  ) %>%
+  left_join(base_status, by = "idauniq")
+
+stopifnot(nrow(attend) == length(analytic_ids),
+          !anyNA(attend$hearing0), !anyNA(attend$vision0), !anyNA(attend$frailty0),
+          all(attend$n_missed >= 0))
+
+mq <- function(x, d = 0) sprintf(paste0("%.", d, "f (%.", d, "f-%.", d, "f)"),
+                                 median(x), quantile(x, .25), quantile(x, .75))
+summ_att <- function(d) d %>% summarise(
+  n                      = n(),
+  assessments_median_IQR = mq(n_assess),
+  followup_years_med_IQR = mq(fu_years, 1),
+  mean_interval_years    = sprintf("%.2f", mean(gap_mean, na.rm = TRUE)),
+  any_missed_wave_n_pct  = sprintf("%d (%.1f)", sum(n_missed > 0), 100 * mean(n_missed > 0)))
+by_grp <- function(var, label) attend %>%
+  group_by(level = .data[[var]]) %>% summ_att() %>%
+  mutate(group = label, level = as.character(level))
+
+att_tab_elsa <- bind_rows(
+  summ_att(attend) %>% mutate(group = "Overall", level = "All"),
+  by_grp("hearing0", "Hearing impairment at baseline"),
+  by_grp("vision0",  "Vision impairment at baseline"),
+  by_grp("frailty0", "Frailty at baseline")) %>%
+  relocate(group, level)
+print(att_tab_elsa)
+
+p_tab_elsa <- bind_rows(lapply(c("hearing0", "vision0", "frailty0"), function(g) tibble(
+  group      = g,
+  p_assess   = wilcox.test(attend$n_assess ~ attend[[g]])$p.value,
+  p_followup = wilcox.test(attend$fu_years ~ attend[[g]])$p.value,
+  p_missed   = chisq.test(table(attend$n_missed > 0, attend[[g]]))$p.value)))
+print(p_tab_elsa)
+
+cat("ELSA analytic intervals longer than one wave:",
+    sprintf("%.1f%%", 100 * mean(tv_cc$tstop - tv_cc$tstart > wave_step)), "\n")
+
+write.csv(att_tab_elsa, file.path(results_dir, "attendance_ELSA.csv"), row.names = FALSE)
+
+```
+
+
+```{r}
+m5_labels <- function(sensory_label) {
+  c(paste0("No ", sensory_label, " (ref)"),
+    paste0(sensory_label, ", no frailty yet"),
+    paste0(sensory_label, ", frailty present"))
+}
+
+m5_display <- c("No impairment (ref)",
+                "Before frailty onset",
+                "With or after frailty onset")
+
+# ==========================================================================
+# Build the Model 5 interval data
+# ==========================================================================
+build_m5_dataset <- function(sensory_var, sensory_lag, sensory_label,
+                             interval_df = tv_cc,
+                             panel_df    = panel_df_eligible,
+                             frailty_var = "frailty",
+                             frailty_lag = "frailty_lag") {
+
+  # ---- 1) Onset history from every observed wave --------------------------
+  # Frailty history at each wave: recorded frail at this wave or any earlier
+  # one. Waves without a dementia assessment still carry real frailty and
+  # sensory information, so they count towards the history.
+  history <- panel_df %>%
+    mutate(
+      idauniq        = as.character(idauniq),
+      year          = as.integer(year),
+      baseline_year = as.integer(baseline_year),
+      time          = as.numeric(year - baseline_year),
+      .frail        = as.integer(.data[[frailty_var]]),
+      .sensory      = as.integer(.data[[sensory_var]])
+    ) %>%
+    arrange(idauniq, time) %>%
+    group_by(idauniq) %>%
+    mutate(
+      frail_hist = cummax(coalesce(.frail, 0L)),
+      # first wave each condition was observed (used for description only;
+      # an interval in category 2 has both onsets at or before its start)
+      first_sensory_time = if (any(.sensory == 1, na.rm = TRUE))
+                             min(time[.sensory == 1], na.rm = TRUE)
+                           else NA_real_,
+      first_frail_time   = if (any(.frail == 1, na.rm = TRUE))
+                             min(time[.frail == 1], na.rm = TRUE)
+                           else NA_real_
+    ) %>%
+    ungroup() %>%
+    dplyr::select(idauniq, start_year = year, frail_hist_start = frail_hist,
+                  first_sensory_time, first_frail_time)
+
+  # ---- 2) Classify each interval from its opening wave --------------------
+  df_tv <- interval_df %>%
+    mutate(
+      idauniq         = as.character(idauniq),
+      start          = tstart,
+      stop           = tstop,
+      dementia_event = as.integer(event),
+      start_year     = as.integer(round(as.integer(baseline_year) + tstart)),
+      sensory_start  = as.integer(.data[[sensory_lag]]),
+      frail_start    = as.integer(.data[[frailty_lag]])
+    ) %>%
+    left_join(history, by = c("idauniq", "start_year")) %>%
+    mutate(
+      ctx_num = case_when(
+        sensory_start == 0                         ~ 0L,
+        sensory_start == 1 & frail_hist_start == 0 ~ 1L,
+        sensory_start == 1 & frail_hist_start == 1 ~ 2L,
+        TRUE                                       ~ NA_integer_
+      ),
+      ctx_lag = factor(ctx_num, levels = 0:2, labels = m5_labels(sensory_label)),
+      age_start = baseline_age + start
+    )
+
+  # ---- 3) Checks -----------------------------------------------------------
+  stopifnot(
+    !anyNA(df_tv$frail_hist_start),            # every opening wave found
+    !anyNA(df_tv$ctx_lag),                     # tv_cc is complete on these
+    all(df_tv$stop > df_tv$start),
+    # current frailty at start implies frailty history at start
+    all(df_tv$frail_hist_start[df_tv$frail_start == 1] == 1),
+    # at most one event per person, and nothing after it
+    all(tapply(df_tv$dementia_event, df_tv$idauniq, sum) <= 1)
+  )
+
+  df_tv
+}
+
+# ==========================================================================
+# Fit Model 5
+# ==========================================================================
+fit_m5 <- function(dat, label) {
+  fit <- coxph(
+    Surv(start, stop, dementia_event) ~
+      ctx_lag + baseline_age +
+      Gender + Race + Education + Marital_status +
+      emp_lag + smoke_lag + alcohol_lag,
+    data = dat, cluster = idauniq, ties = "efron", na.action = na.omit
+  )
+
+  # counts from the rows the model actually used
+  used <- if (is.null(fit$na.action)) dat else dat[-fit$na.action, ]
+
+  cat("\n============================================================\n")
+  cat(label, "Model 5 (3-level, reference = no sensory impairment)\n")
+  cat("============================================================\n")
+  cat("Fitted sample - intervals:", fit$n,
+      "| persons:", dplyr::n_distinct(used$idauniq),
+      "| events:", fit$nevent, "\n")
+  if (!is.null(fit$na.action))
+    cat("  (", length(fit$na.action), "intervals dropped for missing covariates )\n")
+
+  cat("\n--- Cox fit ---\n")
+  print(summary(fit))
+
+  zph <- cox.zph(fit)
+  cat("\n--- PH check (Schoenfeld residuals) ---\n")
+  print(zph)
+
+  attr(fit, "zph")  <- zph
+  attr(fit, "used") <- used
+  fit
+}
+
+# ==========================================================================
+# Category table: intervals, person-years, persons, events, rate, age, HR
+# ==========================================================================
+m5_category_table <- function(fit, label) {
+  used <- attr(fit, "used")
+  ci   <- summary(fit)$conf.int
+  hr_row <- function(lvl) {
+    nm <- paste0("ctx_lag", lvl)
+    if (!nm %in% rownames(ci)) return("1 (ref)")
+    sprintf("%.2f (%.2f-%.2f)", ci[nm, 1], ci[nm, 3], ci[nm, 4])
+  }
+
+  tab <- used %>%
+    group_by(ctx_lag) %>%
+    summarise(
+      intervals    = n(),
+      person_years = sum(stop - start),
+      persons      = n_distinct(idauniq),
+      events       = sum(dementia_event),
+      mean_age     = mean(age_start),
+      sd_age       = sd(age_start),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      category     = m5_display[as.integer(ctx_lag)],
+      pct_pyrs     = 100 * person_years / sum(person_years),
+      rate_1000py  = 1000 * events / person_years,
+      HR_95CI      = vapply(as.character(ctx_lag), hr_row, character(1))
+    ) %>%
+    dplyr::select(category, intervals, person_years, pct_pyrs, persons,
+                  events, rate_1000py, mean_age, sd_age, HR_95CI)
+
+  cat("\n[", label, "] Model 5 categories (fitted sample)\n", sep = "")
+  cat("  persons: people contributing any interval to the category;",
+      "a person can contribute to more than one category,",
+      "so persons do not add up to the total.\n")
+  print(as.data.frame(tab), digits = 3, row.names = FALSE)
+  invisible(tab)
+}
+
+# ==========================================================================
+# Within-exposed contrast: category 2 vs category 1
+#   A direct comparison of the two sensory contexts (frailty recorded vs not)
+#   among people with sensory impairment. It is not an interaction test:
+#   effect modification by frailty is tested in Model 4 (Supplementary Table 34).
+# ==========================================================================
+contrast_frailty_vs_no_frailty <- function(fit, label) {
+  co <- coef(fit)
+  vc <- vcov(fit)                      # robust (cluster) covariance
+  i_no_fr  <- grep("no frailty yet",  names(co), fixed = TRUE)
+  i_fr_yes <- grep("frailty present", names(co), fixed = TRUE)
+  stopifnot(length(i_no_fr) == 1, length(i_fr_yes) == 1)
+
+  z975 <- qnorm(0.975)
+  L <- numeric(length(co))
+  L[i_fr_yes] <-  1
+  L[i_no_fr]  <- -1
+
+  est <- sum(L * co)
+  se  <- sqrt(drop(t(L) %*% vc %*% L))
+  z   <- est / se
+  p   <- 2 * pnorm(-abs(z))
+  ci  <- exp(est + c(-1, 1) * z975 * se)
+
+  lvl_hr <- function(i) exp(co[i] + c(0, -1, 1) * z975 * sqrt(vc[i, i]))
+  hr1 <- lvl_hr(i_no_fr)
+  hr2 <- lvl_hr(i_fr_yes)
+
+  cat(sprintf("\n[%s] Category HRs vs no sensory impairment:\n", label))
+  cat(sprintf("  Before frailty onset        : %.2f (%.2f-%.2f)\n", hr1[1], hr1[2], hr1[3]))
+  cat(sprintf("  With or after frailty onset : %.2f (%.2f-%.2f)\n", hr2[1], hr2[2], hr2[3]))
+  cat(sprintf("  Ratio (with or after / before) = %.2f (95%% CI %.2f-%.2f), z = %.2f, p = %.4f\n",
+              exp(est), ci[1], ci[2], z, p))
+
+  invisible(list(estimate = est, se = se, z = z, p = p,
+                 ratio = exp(est), ci = ci,
+                 hr_before = hr1, hr_with_after = hr2))
+}
+
+# ==========================================================================
+# Make-up of category 2 by observed order of first onsets (Supplementary
+#   Table 42). Uses only onsets at or before each interval's start.
+# ==========================================================================
+m5_category2_makeup <- function(fit, label) {
+  used <- attr(fit, "used")
+
+  tab <- used %>%
+    filter(as.integer(ctx_lag) == 3L) %>%
+    mutate(
+      sequence = case_when(
+        first_sensory_time == 0 & first_frail_time == 0 ~
+          "Both present at baseline (order unknown)",
+        first_sensory_time == first_frail_time ~
+          "Both first observed at the same wave",
+        first_sensory_time <  first_frail_time ~
+          "Sensory impairment observed first",
+        first_sensory_time >  first_frail_time ~
+          "Frailty observed first"
+      ),
+      sequence = factor(sequence, levels = c(
+        "Both present at baseline (order unknown)",
+        "Both first observed at the same wave",
+        "Sensory impairment observed first",
+        "Frailty observed first"))
+    )
+  stopifnot(!anyNA(tab$sequence))
+
+  out <- tab %>%
+    group_by(sequence, .drop = FALSE) %>%
+    summarise(
+      intervals    = n(),
+      person_years = sum(stop - start),
+      persons      = n_distinct(idauniq),
+      events       = sum(dementia_event),
+      currently_frail_pct = 100 * mean(frail_start == 1),
+      .groups = "drop"
+    ) %>%
+    mutate(pct_pyrs = 100 * person_years / sum(person_years))
+
+  cat("\n[", label, "] Make-up of 'with or after frailty onset' person-time\n", sep = "")
+  cat("  currently_frail_pct: share of intervals still frail at their start",
+      "(the rest had recovered below FI 0.25 but keep their frailty history)\n")
+  print(as.data.frame(out), digits = 3, row.names = FALSE)
+  invisible(out)
+}
+
+# ==========================================================================
+# Movement between categories from one interval to the next
+# ==========================================================================
+m5_transitions <- function(fit, label) {
+  used <- attr(fit, "used") %>%
+    arrange(idauniq, start) %>%
+    group_by(idauniq) %>%
+    mutate(from = lag(as.integer(ctx_lag)),
+           to   = as.integer(ctx_lag)) %>%
+    ungroup() %>%
+    filter(!is.na(from))
+
+  tr <- table(from = factor(m5_display[used$from], levels = m5_display),
+              to   = factor(m5_display[used$to],   levels = m5_display))
+
+  cat("\n[", label, "] Category at consecutive intervals (counts; rows = earlier)\n", sep = "")
+  print(tr)
+  cat("\n  Row percentages:\n")
+  print(round(100 * prop.table(tr, 1), 1))
+  cat("\n  Sensory impairment reported as resolved (category 1 or 2 -> reference):",
+      sum(tr[2:3, 1]), "of", sum(tr[2:3, ]), "transitions from categories 1-2\n")
+  invisible(tr)
+}
+
+# ==========================================================================
+# One example timeline
+#   Picks the first person whose intervals run through categories 0, 1, 2,
+#   to illustrate how intervals are classified. The ID is replaced.
+# ==========================================================================
+m5_example_timeline <- function(fit, label) {
+  used <- attr(fit, "used")
+  ids <- used %>%
+    arrange(idauniq, start) %>%
+    group_by(idauniq) %>%
+    summarise(seq = paste(as.integer(ctx_lag) - 1L, collapse = ""),
+              .groups = "drop") %>%
+    filter(grepl("^0+1+2+$", seq)) %>%
+    pull(idauniq)
+  if (!length(ids)) { cat("\n[", label, "] no 0 -> 1 -> 2 example found\n"); return(invisible(NULL)) }
+
+  ex <- used %>%
+    filter(idauniq == ids[1]) %>%
+    arrange(start) %>%
+    transmute(
+      interval_years = sprintf("(%g, %g]", start, stop),
+      sensory_at_start = sensory_start,
+      frail_at_start   = frail_start,
+      frailty_recorded_by_start = frail_hist_start,
+      category = m5_display[as.integer(ctx_lag)],
+      dementia_event
+    )
+
+  cat("\n[", label, "] Example participant (", length(ids),
+      " people follow a 0 -> 1 -> 2 path)\n", sep = "")
+  print(as.data.frame(ex), row.names = FALSE)
+  invisible(ex)
+}
+
+# ==========================================================================
+# Person-level description of the observed order of first onsets
+#   DESCRIPTIVE ONLY: uses each person's whole follow-up, so it is not, and
+#   must not be, used to classify intervals. Restricted to the people and
+#   waves of the Model 5 sample (assessed waves up to 2018, up to the first
+#   dementia wave).
+# ==========================================================================
+build_person_level <- function(dat, sensory_var, sensory_label,
+                               panel_df = panel_df_eligible) {
+  ids <- unique(dat$idauniq)
+
+  panel_df %>%
+    mutate(
+      idauniq        = as.character(idauniq),
+      year          = as.integer(year),
+      baseline_year = as.integer(baseline_year),
+      time          = as.numeric(year - baseline_year),
+      .sensory      = .data[[sensory_var]]
+    ) %>%
+    filter(idauniq %in% ids, !is.na(dementia), year <= last_wave) %>%
+    group_by(idauniq) %>%
+    filter(time <= suppressWarnings(min(c(time[dementia == 1], Inf)))) %>%
+    summarise(
+      sensory_onset_time = if (any(.sensory == 1, na.rm = TRUE))
+                             min(time[.sensory == 1], na.rm = TRUE)
+                           else NA_real_,
+      frailty_onset_time = if (any(frailty == 1, na.rm = TRUE))
+                             min(time[frailty == 1], na.rm = TRUE)
+                           else NA_real_,
+      .groups = "drop"
+    ) %>%
+    mutate(
+      sequence = case_when(
+        is.na(sensory_onset_time) ~
+          paste0("No ", sensory_label, " observed"),
+        is.na(frailty_onset_time) ~
+          paste0(sensory_label, ", never frail during follow-up"),
+        sensory_onset_time == 0 & frailty_onset_time == 0 ~
+          "Both present at baseline",
+        sensory_onset_time < frailty_onset_time ~
+          paste0(sensory_label, " observed before frailty"),
+        sensory_onset_time == frailty_onset_time ~
+          "Both first observed at the same wave",
+        sensory_onset_time > frailty_onset_time ~
+          paste0(sensory_label, " observed after frailty")
+      )
+    )
+}
+
+# ==========================================================================
+# 1) Build datasets (same rows as Models 1-4)
+# ==========================================================================
+stopifnot(exists("tv_cc"))
+
+df_tv_hearing <- build_m5_dataset(
+  sensory_var   = "hearing_loss",
+  sensory_lag   = "hearing_lag",
+  sensory_label = "Hearing loss"
+)
+
+df_tv_vision <- build_m5_dataset(
+  sensory_var   = "vision_overall",
+  sensory_lag   = "vision_lag",
+  sensory_label = "Vision loss"
+)
+
+# ==========================================================================
+# 2) Fit Model 5
+# ==========================================================================
+fit_m5_hearing <- fit_m5(df_tv_hearing, "HEARING")
+fit_m5_vision  <- fit_m5(df_tv_vision,  "VISION")
+
+# Event reconciliation: Model 5 should use the same events as Model 4
+cat("\nEvents - Model 4 sample:", sum(tv_cc$event),
+    "| Model 5 hearing:", fit_m5_hearing$nevent,
+    "| Model 5 vision:",  fit_m5_vision$nevent, "\n")
+
+# ==========================================================================
+# 3) Category tables and within-exposed contrast
+# ==========================================================================
+m5_tab_hearing <- m5_category_table(fit_m5_hearing, "HEARING")
+m5_tab_vision  <- m5_category_table(fit_m5_vision,  "VISION")
+
+m5_con_hearing <- contrast_frailty_vs_no_frailty(fit_m5_hearing, "HEARING")
+m5_con_vision  <- contrast_frailty_vs_no_frailty(fit_m5_vision,  "VISION")
+
+# ==========================================================================
+# 4) Descriptives of the Model 5 categories
+# ==========================================================================
+m5_mix_hearing <- m5_category2_makeup(fit_m5_hearing, "HEARING")
+m5_mix_vision  <- m5_category2_makeup(fit_m5_vision,  "VISION")
+
+m5_tr_hearing  <- m5_transitions(fit_m5_hearing, "HEARING")
+m5_tr_vision   <- m5_transitions(fit_m5_vision,  "VISION")
+
+m5_example_timeline(fit_m5_hearing, "HEARING")
+
+# ==========================================================================
+# 5) Person-level description (not used in any model)
+# ==========================================================================
+person_hearing <- build_person_level(df_tv_hearing, "hearing_loss",   "Hearing loss")
+person_vision  <- build_person_level(df_tv_vision,  "vision_overall", "Vision loss")
+
+cat("\nObserved order of first onsets, whole follow-up (descriptive) - HEARING:\n")
+print(table(person_hearing$sequence, useNA = "ifany"))
+cat("\nObserved order of first onsets, whole follow-up (descriptive) - VISION:\n")
+print(table(person_vision$sequence, useNA = "ifany"))
+
+m5_category_table(fit_m5_hearing, "HEARING"); m5_category_table(fit_m5_vision, "VISION")
+m5_category2_makeup(fit_m5_hearing, "HEARING"); m5_category2_makeup(fit_m5_vision, "VISION")
+m5_example_timeline(fit_m5_hearing, "HEARING")
+
+```
+
+
+# PAF — Hearing Loss, Vision Loss, Frailty (ELSA)
+```{r}
+# PAF for Models 1-5 (ELSA, dementia outcome)
+# ----------------------------------------------------------------------------
+# Models 1-4 use tv_cc (counting-process: tstart/tstop, *_lag exposures).
+# Model 5 uses df_tv_hearing / df_tv_vision (start/stop, ctx_lag factor).
+# Prevalence = person-time-weighted within each fit's analytic dataset.
+# person-time-weighted exposure prevalence p and the model hazard ratio,
+#   PAF = p(HR - 1) / [1 + p(HR - 1)],
+# and, for the three-level Model 5 exposure,
+#   PAF_total = sum_k p_k(HR_k - 1) / [1 + sum_k p_k(HR_k - 1)],
+#   PAF_k     = p_k(HR_k - 1)       / [1 + sum_j p_j(HR_j - 1)].
+# 95% CIs: 10,000 Monte Carlo draws of the log-HR(s) from their robust
+# (cluster) sampling distribution; p is treated as fixed.
+
+PAF_SEED <- 20260509
+PAF_NSIM <- 10000
+z975     <- qnorm(0.975)
+
+print_df <- function(x, digits = 4) {
+  cat(capture.output(print(as.data.frame(x), row.names = FALSE,
+                           digits = digits)), sep = "\n")
+}
+
+# ---- Formulas ---------------------------------------------------------------
+paf_binary_fn <- function(p, HR) (p * (HR - 1)) / (p * (HR - 1) + 1)   # Levin
+
+# ---- Prevalences --------------------------------------------------------------
+# Person-time-weighted prevalence (binary 0/1 indicator)
+prev_pt_binary <- function(dat, var, ts, tp) {
+  pt <- dat[[tp]] - dat[[ts]]
+  x  <- dat[[var]]
+  sum(pt[x == 1], na.rm = TRUE) / sum(pt, na.rm = TRUE)
+}
+
+# Person-time-weighted prevalence per factor level
+prev_pt_factor <- function(dat, var, ts, tp) {
+  pt    <- dat[[tp]] - dat[[ts]]
+  x     <- dat[[var]]
+  total <- sum(pt, na.rm = TRUE)
+  tibble(
+    level = levels(x),
+    p     = vapply(levels(x),
+                   function(lv) sum(pt[x == lv], na.rm = TRUE) / total,
+                   numeric(1))
+  )
+}
+
+# Rows a fit actually used (Model 5 fits carry them; Models 1-4 use tv_cc)
+fit_rows <- function(fit, dat) {
+  used <- attr(fit, "used")
+  if (!is.null(used)) return(used)
+  if (!is.null(fit$na.action)) dat <- dat[-fit$na.action, ]
+  stopifnot(nrow(dat) == fit$n)
+  dat
+}
+
+# ---- Monte Carlo CIs ---------------------------------------------------------
+paf_ci_binary <- function(fit, term, p, nsim = PAF_NSIM, seed = PAF_SEED) {
+  b <- unname(coef(fit)[term])
+  V <- vcov(fit)[term, term]                 # robust (cluster) variance
+  stopifnot(!is.na(b), V > 0)
+  set.seed(seed)
+  sims <- rnorm(nsim, mean = b, sd = sqrt(V))
+  pafs <- paf_binary_fn(p, exp(sims))
+  tibble(
+    HR     = exp(b),
+    HR_lcl = exp(b - z975 * sqrt(V)),
+    HR_ucl = exp(b + z975 * sqrt(V)),
+    PAF = paf_binary_fn(p, exp(b)),
+    lcl = unname(quantile(pafs, 0.025, na.rm = TRUE)),
+    ucl = unname(quantile(pafs, 0.975, na.rm = TRUE))
+  )
+}
+
+paf_ci_multicat <- function(fit, terms, p_vec, labels, nsim = PAF_NSIM,
+                            seed = PAF_SEED) {
+  b <- unname(coef(fit)[terms])
+  V <- vcov(fit)[terms, terms, drop = FALSE]
+  set.seed(seed)
+  sims <- MASS::mvrnorm(nsim, mu = b, Sigma = V)
+  if (is.vector(sims)) sims <- matrix(sims, ncol = length(terms))
+  HRs <- exp(sims)
+
+  # Levin, partitioned so that components add up to the total
+  comp_mat      <- sweep(HRs - 1, 2, p_vec, `*`)
+  s_all         <- rowSums(comp_mat)
+  paf_total_sim <- s_all / (1 + s_all)
+  paf_comp_sim  <- comp_mat / (1 + s_all)
+
+  HR_est    <- exp(b)
+  se        <- sqrt(diag(V))
+  comp_est  <- p_vec * (HR_est - 1)
+  s_all_est <- sum(comp_est)
+  q <- function(x, pr) unname(quantile(x, pr, na.rm = TRUE))
+
+  tibble(
+    component = c("Total", labels),
+    HR        = c(NA_real_, HR_est),
+    HR_lcl    = c(NA_real_, exp(b - z975 * se)),
+    HR_ucl    = c(NA_real_, exp(b + z975 * se)),
+    PAF       = c(s_all_est / (1 + s_all_est), comp_est / (1 + s_all_est)),
+    lcl       = c(q(paf_total_sim, 0.025), apply(paf_comp_sim, 2, q, 0.025)),
+    ucl       = c(q(paf_total_sim, 0.975), apply(paf_comp_sim, 2, q, 0.975))
+  )
+}
+
+# ============================================================================
+# A) Prevalences in tv_cc (Models 1-4; every fit uses all tv_cc rows)
+# ============================================================================
+for (f in list(fit_m1_hearing, fit_m2_vision, fit_m3_frailty, fit_m4_frailty))
+  stopifnot(f$n == nrow(tv_cc))
+
+p_hearing_14 <- prev_pt_binary(tv_cc, "hearing_lag", "tstart", "tstop")
+p_vision_14  <- prev_pt_binary(tv_cc, "vision_lag",  "tstart", "tstop")
+p_frailty_14 <- prev_pt_binary(tv_cc, "frailty_lag", "tstart", "tstop")
+
+cat("Person-time-weighted prevalence (tv_cc):\n")
+cat(sprintf("  Hearing loss : %.4f\n", p_hearing_14))
+cat(sprintf("  Vision loss  : %.4f\n", p_vision_14))
+cat(sprintf("  Frailty      : %.4f\n", p_frailty_14))
+
+# ============================================================================
+# B) PAF for Models 1-4 (each exposure paired with its own model fit)
+# ============================================================================
+paf_row <- function(fit, term, p, model_label, exposure_label) {
+  res <- paf_ci_binary(fit, term, p)
+  tibble(model = model_label, exposure = exposure_label, p_pt = p) %>%
+    bind_cols(res %>% rename(PAF_lcl = lcl, PAF_ucl = ucl))
+}
+
+paf_models_1_4 <- bind_rows(
+  # Model 1 (unadjusted)
+  paf_row(fit_m1_hearing, "hearing_lag", p_hearing_14, "M1 (unadjusted)", "Hearing loss"),
+  paf_row(fit_m1_vision,  "vision_lag",  p_vision_14,  "M1 (unadjusted)", "Vision loss"),
+  paf_row(fit_m1_frailty, "frailty_lag", p_frailty_14, "M1 (unadjusted)", "Frailty"),
+
+  # Model 2 (+ age)
+  paf_row(fit_m2_hearing, "hearing_lag", p_hearing_14, "M2 (+ age)", "Hearing loss"),
+  paf_row(fit_m2_vision,  "vision_lag",  p_vision_14,  "M2 (+ age)", "Vision loss"),
+  paf_row(fit_m2_frailty, "frailty_lag", p_frailty_14, "M2 (+ age)", "Frailty"),
+
+  # Model 3 (+ sex, race, education, marital status, employment, smoking, alcohol)
+  paf_row(fit_m3_hearing, "hearing_lag", p_hearing_14, "M3 (+ sociodemographic + lifestyle)", "Hearing loss"),
+  paf_row(fit_m3_vision,  "vision_lag",  p_vision_14,  "M3 (+ sociodemographic + lifestyle)", "Vision loss"),
+  paf_row(fit_m3_frailty, "frailty_lag", p_frailty_14, "M3 (+ sociodemographic + lifestyle)", "Frailty"),
+
+  # Model 4 (primary): hearing/vision adjusted for frailty;
+  # frailty from the mutually adjusted Cox
+  paf_row(fit_m4_hearing, "hearing_lag", p_hearing_14, "M4 (hybrid, frailty-adj)", "Hearing loss"),
+  paf_row(fit_m4_vision,  "vision_lag",  p_vision_14,  "M4 (hybrid, frailty-adj)", "Vision loss"),
+  paf_row(fit_m4_frailty, "frailty_lag", p_frailty_14, "M4 (mutually adjusted)",   "Frailty")
+)
+
+# ============================================================================
+# C) PAF for Model 5 (3-level ctx_lag, hearing and vision separately)
+#    Component PAFs for each non-reference level + total PAF.
+#    Model 5 is not adjusted for frailty, so its total is not comparable
+#    with the Model 4 PAF; the level-1 component is negative when HR < 1.
+# ============================================================================
+paf_model5 <- function(fit, dat, model_label) {
+  dat <- fit_rows(fit, dat)
+  stopifnot(is.factor(dat$ctx_lag))
+  exposed_lvls <- levels(dat$ctx_lag)[-1]
+
+  prev_tab  <- prev_pt_factor(dat, "ctx_lag", "start", "stop")
+  p_exposed <- setNames(prev_tab$p[match(exposed_lvls, prev_tab$level)],
+                        exposed_lvls)
+  stopifnot(all(!is.na(p_exposed)), all(p_exposed > 0))
+
+  terms <- paste0("ctx_lag", exposed_lvls)
+  miss  <- setdiff(terms, names(coef(fit)))
+  if (length(miss))
+    stop("Missing coefficients in Model 5 fit: ", paste(miss, collapse = ", "))
+
+  tab <- paf_ci_multicat(fit, terms, p_exposed, exposed_lvls)
+  stopifnot(abs(sum(tab$PAF[-1]) - tab$PAF[1]) < 1e-10)   # components add up
+
+  tab %>%
+    mutate(model  = model_label,
+           exposure = component,
+           p_pt   = c(sum(p_exposed), unname(p_exposed))) %>%
+    dplyr::select(model, exposure, p_pt, HR, HR_lcl, HR_ucl,
+                  PAF, PAF_lcl = lcl, PAF_ucl = ucl)
+}
+
+paf_m5_hearing <- paf_model5(fit_m5_hearing, df_tv_hearing, "M5 (hearing context)")
+paf_m5_vision  <- paf_model5(fit_m5_vision,  df_tv_vision,  "M5 (vision context)")
+
+# ============================================================================
+# D) Combined summary
+# ============================================================================
+fmt_pct <- function(est, lo, hi)
+  sprintf("%.1f (%.1f to %.1f)", 100 * est, 100 * lo, 100 * hi)
+fmt_hr  <- function(est, lo, hi)
+  ifelse(is.na(est), "", sprintf("%.2f (%.2f-%.2f)", est, lo, hi))
+
+paf_all <- bind_rows(paf_models_1_4, paf_m5_hearing, paf_m5_vision) %>%
+  mutate(
+    HR_CI  = fmt_hr(HR, HR_lcl, HR_ucl),
+    PAF_CI = fmt_pct(PAF, PAF_lcl, PAF_ucl)
+  )
+
+cat("\n=== PAF (Levin formula) - Models 1-5 ===\n")
+print_df(paf_all %>% dplyr::select(model, exposure, p_pt, HR_CI, PAF_CI))
+
+
+```
+
+
+# Parametric g-formula PAF (ELSA), Models 1-4: sensitivity analysis for the
+# Levin PAFs
+```{r}
+# Run after the Models 1-4 chunk. Uses tv_cc, panel_df_eligible and
+# baseline_df_eligible.
+#
+# Same set-up as Cox Models 1-4; only the PAF method differs:
+#   - participants: exactly those in tv_cc;
+#   - dementia events and follow-up end: taken from tv_cc itself, so the
+#     events and each person's last interval are the Cox ones;
+#   - covariates: only from waves with an assessed dementia status up to
+#     2018 (the waves in df0), held from the wave that opens an interval,
+#     as hearing_lag, vision_lag, frailty_lag, emp_lag, smoke_lag and
+#     alcohol_lag are;
+#   - time-fixed covariates: baseline_age, Gender, Race, Education,
+#     Marital_status from baseline_df_eligible, as in baseline_invariant;
+#   - censoring: follow-up ends at the last tv_cc interval; loss to
+#     follow-up (including unrecorded deaths: ELSA has no usable mortality
+#     data) and the end of the study are censoring, exactly as in the Cox
+#     models;
+#   - the dementia model is fitted on the tv_cc person-time only, with the
+#     same terms as each Cox formula;
+#   - time scale: years since baseline (k = biennial interval), with a
+#     separate baseline risk for each interval (factor(k)), the discrete
+#     counterpart of the Cox baseline hazard.
+# The one structural addition: the g-formula simulates covariate
+# histories, so it needs an unbroken history per person. Where a Cox
+# interval was dropped because a lagged covariate was missing, that
+# interval is kept only as covariate history (value carried forward); it
+# is not used in the dementia model. Counts are printed by build_gf_data.
+#
+# Estimand. For the intervention g = "eliminate the exposure (hearing
+# impairment, vision impairment or frailty) at every wave",
+#   PAF_g = [Risk(natural course) - Risk(under g)] / Risk(natural course),
+# where Risk is the cumulative risk of dementia by a fixed horizon
+# (default 8 biennial intervals = 16 years) under the same censoring
+# assumption as the Cox models. This is a risk-based PAF, not a
+# hazard-ratio-based one, so the numbers are not expected to equal the
+# Levin PAFs exactly.
+#
+# Method (parametric g-formula; Robins 1986; Taubman et al. 2009;
+# McGrath et al., Patterns 2020, which describes the gfoRmula package):
+#   1. Person-wave data on the biennial grid. Waves without an assessment
+#      are filled forward (last observation carried forward), so a Cox
+#      interval spanning a missed wave becomes two 2-year intervals with
+#      the same covariates and the event (if any) in the second.
+#   2. Pooled logistic models, fitted on the observed data, for each
+#      time-varying covariate given its past (wave k-1) and the covariates
+#      simulated before it at wave k; and for dementia by the next wave
+#      (the discrete-time version of the Cox model). Covariates at the
+#      start of an interval predict the outcome over it (one-wave lag).
+#   3. Monte Carlo simulation of every participant's covariate history
+#      from the observed baseline, under no intervention (natural course)
+#      and with the exposure eliminated; risks are accumulated from the
+#      predicted dementia hazards.
+#   4. Non-parametric bootstrap over participants for 95% CIs.
+#
+# Mapping to the Cox models (adjustment set = variables in the g-formula):
+# (the dementia model uses the same terms as the Cox formula)
+#   M1  hearing_lag | vision_lag | frailty_lag
+#   M2  + baseline_age
+#   M3  + Gender, Race, Education, Marital_status,
+#        emp_lag, smoke_lag, alcohol_lag
+#   M4  hearing:  M3 + frailty_lag          (fit_m4_hearing)
+#       vision:   M3 + frailty_lag          (fit_m4_vision)
+#       frailty:  M3 + hearing_lag + vision_lag (fit_m4_frailty)
+#        In the g-formula the time-varying covariates are also simulated
+#        over time. Frailty is simulated and can respond to earlier
+#        sensory impairment, so the M4 g-formula PAF is a TOTAL effect,
+#        including any pathway through frailty (Cox Model 4 instead
+#        conditions on frailty).
+# Model 5 is not included: its exposure is a joint sensory x frailty-history
+# category, and "removing" a category has no single well-defined
+# intervention (frailty history cannot be undone, and the categories are
+# themselves changed by the intervention). Its PAFs stay with Levin.
+# ==========================================================================
+
+suppressPackageStartupMessages({ library(dplyr); library(tidyr) })
+
+GF <- list(
+  year_end = last_wave,      # last wave with dementia ascertainment
+  K        = 8L,         # intervals simulated (8 x 2 years = 16 years)
+  report_k = c(5L, 8L),  # report risk at 10 and 16 years. Baselines are
+                         # 2002-2008, so every cohort is followed for 10
+                         # years; 16 years rests on the 2002 cohort only
+  B        = 200L,       # bootstrap replicates (0 = point estimates only;
+                         # run once with B = 0 and time it: 12 models x
+                         # (B + 1) fits, so the bootstrap can take hours)
+  seed     = 20260509,
+  # Parallel workers for the bootstrap. Each worker is a full copy of R
+  # (about 1 GB here), so more workers need more memory; 4 is safe on a
+  # 16 GB machine. Use 1 to run in the main session only.
+  cores    = min(4L, max(1L, parallel::detectCores() - 1L)),
+  # Each model's result is saved here when it finishes, so an interrupted
+  # run resumes where it stopped.
+  cache_dir = file.path(results_dir, "gf_cache_ELSA")
+)
+
+gf_print <- function(x, digits = 4)
+  cat(capture.output(print(as.data.frame(x), row.names = FALSE,
+                           digits = digits)), sep = "\n")
+
+to01 <- function(x) {
+  x <- suppressWarnings(as.integer(as.character(x)))
+  stopifnot(all(x %in% c(0L, 1L, NA)))
+  x
+}
+
+TV_ALL <- c("emp", "smoke", "alcohol", "frail", "hearing", "vision")
+
+# ==========================================================================
+# 1) Person-wave data
+# ==========================================================================
+build_gf_data <- function(panel_df    = panel_df_eligible,
+                          baseline_df = baseline_df_eligible,
+                          cox_df      = tv_cc,
+                          year_end    = GF$year_end) {
+
+  ids <- unique(as.character(cox_df$idauniq))
+
+  # Time-fixed covariates, as baseline_invariant in the Cox chunk
+  base <- baseline_df %>%
+    mutate(idauniq = as.character(idauniq)) %>%
+    filter(idauniq %in% ids) %>%
+    distinct(idauniq, .keep_all = TRUE) %>%
+    transmute(
+      idauniq,
+      baseline_age   = as.numeric(age),
+      Gender         = factor(Gender),
+      Race           = factor(Race),
+      Education      = factor(Education),
+      Marital_status = factor(Marital_status)
+    )
+
+  # Follow-up end and dementia event, taken from the Cox sample itself
+  cox_ends <- cox_df %>%
+    mutate(idauniq = as.character(idauniq)) %>%
+    group_by(idauniq) %>%
+    summarise(last_k = as.integer(round(max(tstop) / 2)),
+              dem_k  = if (any(event == 1L))
+                         as.integer(round(max(tstop[event == 1L]) / 2)) else NA_integer_,
+              .groups = "drop")
+  stopifnot(all(is.na(cox_ends$dem_k) | cox_ends$dem_k == cox_ends$last_k))
+
+  # Covariates from the assessed waves the Cox models use (df0)
+  pan <- panel_df %>%
+    mutate(idauniq = as.character(idauniq),
+           year = as.integer(year), baseline_year = as.integer(baseline_year)) %>%
+    filter(idauniq %in% ids, !is.na(dementia), year <= year_end)
+  off_grid <- sum((pan$year - pan$baseline_year) %% 2 != 0)
+  pan <- pan %>%
+    filter((year - baseline_year) %% 2 == 0) %>%
+    transmute(idauniq, baseline_year, k = as.integer((year - baseline_year) / 2),
+              hearing = to01(hearing_loss), vision = to01(vision_overall),
+              frail = to01(frailty), emp = to01(Employment),
+              smoke = to01(Smoking), alcohol = to01(Alcohol))
+
+  ends <- cox_ends %>%
+    left_join(pan %>% distinct(idauniq, baseline_year), by = "idauniq")
+  stopifnot(!anyNA(ends$baseline_year))
+
+  # Grid: intervals k = 0..last_k - 1 (interval k runs from wave k to k + 1)
+  dat <- ends %>%
+    tidyr::uncount(last_k, .id = "k1") %>%
+    mutate(k = k1 - 1L) %>% dplyr::select(-k1) %>%
+    left_join(pan %>% dplyr::select(-baseline_year), by = c("idauniq", "k")) %>%
+    arrange(idauniq, k)
+
+  # Which grid intervals are Cox person-time
+  cox_k <- cox_df %>%
+    mutate(idauniq = as.character(idauniq),
+           k0 = as.integer(round(tstart / 2)), k1 = as.integer(round(tstop / 2))) %>%
+    tidyr::uncount(k1 - k0, .id = "j") %>%
+    transmute(idauniq, k = k0 + j - 1L, in_cox = 1L)
+  dat <- dat %>% left_join(cox_k, by = c("idauniq", "k")) %>%
+    mutate(in_cox = coalesce(in_cox, 0L))
+
+  # cov_obs = 1: all covariates observed at this wave (used to fit the
+  # covariate models); otherwise carried forward, or back from the first
+  # observed wave if missing at baseline
+  dat$cov_obs <- as.integer(complete.cases(dat[, TV_ALL]))
+  n_back <- sum(is.na(dat[dat$k == 0L, TV_ALL]))
+  dat <- dat %>%
+    group_by(idauniq) %>%
+    tidyr::fill(all_of(TV_ALL), .direction = "downup") %>%
+    mutate(
+      frail_hist = cummax(frail),
+      Y = as.integer(!is.na(dem_k) & k + 1L == dem_k)
+    ) %>%
+    mutate(across(c(all_of(TV_ALL), frail_hist), dplyr::lag, .names = "lag1_{.col}")) %>%
+    ungroup() %>%
+    left_join(base, by = "idauniq") %>%
+    dplyr::select(idauniq, k, Y, in_cox, cov_obs, all_of(TV_ALL), frail_hist,
+                  starts_with("lag1_"), baseline_age, Gender, Race,
+                  Education, Marital_status)
+
+  n_cox_iv <- sum(dat$in_cox == 1L)
+  stopifnot(!anyNA(dat[, c("Y", TV_ALL, "baseline_age", "Gender", "Race",
+                           "Education", "Marital_status")]),
+            all(tapply(dat$Y, dat$idauniq, sum) <= 1),
+            n_distinct(dat$idauniq) == length(ids),
+            sum(dat$Y[dat$in_cox == 1L]) == sum(cox_df$event),
+            sum(dat$Y) == sum(cox_df$event),
+            isTRUE(all.equal(2 * n_cox_iv, sum(cox_df$tstop - cox_df$tstart))))
+
+  cat("g-formula data (same participants, events and person-time as Cox Models 1-4):\n")
+  cat("  participants:", n_distinct(dat$idauniq), "(tv_cc:", length(ids), ")",
+      "| dementia events:", sum(dat$Y), "(tv_cc:", sum(cox_df$event), ")\n")
+  cat("  person-years in the dementia model:", round(2 * n_cox_iv),
+      "(tv_cc:", round(sum(cox_df$tstop - cox_df$tstart)), ")\n")
+  cat("  2-year intervals:", n_cox_iv, "used in the dementia model +",
+      sum(dat$in_cox == 0L),
+      "kept only as covariate history (Cox interval dropped for a missing covariate)\n")
+  cat("  covariate values carried forward:", sum(dat$cov_obs == 0L & dat$k > 0L),
+      "rows | back-filled at baseline:", n_back, "values | off-grid waves dropped:",
+      off_grid, "\n")
+  at_risk <- table(factor(dat$k[dat$in_cox == 1L], levels = 0:max(dat$k)))
+  cat("  at risk by interval k:", paste0(names(at_risk), "=", at_risk, collapse = " "), "\n")
+  if (GF$K > max(dat$k) + 1L || at_risk[GF$K] < 1000)
+    warning("Few or no participants are observed in interval k = ", GF$K - 1L,
+            "; consider a smaller GF$K and GF$report_k.")
+  dat
+}
+
+# Observed cumulative risk, 1 - Kaplan-Meier, on the Cox person-time
+# (censoring as in the Cox models), for the natural-course check
+observed_risk <- function(dat, K = GF$K) {
+  at <- dat %>% filter(in_cox == 1L) %>%
+    group_by(k) %>% summarise(n = n(), y = sum(Y), .groups = "drop")
+  h <- at$y[match(0:(K - 1), at$k)] / at$n[match(0:(K - 1), at$k)]
+  1 - cumprod(1 - h)
+}
+
+# ==========================================================================
+# 2) Model specifications (one per Cox model and exposure)
+# ==========================================================================
+B3 <- c("baseline_age", "Gender", "Race", "Education", "Marital_status")
+L3 <- c("emp", "smoke", "alcohol")
+
+mk_spec <- function(model, exposure, tv, base = character(0))
+  list(model = model, exposure = exposure, tv = tv, base = base)
+
+gf_specs <- list(
+  M1_hearing = mk_spec("M1", "hearing", "hearing"),
+  M2_hearing = mk_spec("M2", "hearing", "hearing", "baseline_age"),
+  M3_hearing = mk_spec("M3", "hearing", c(L3, "hearing"), B3),
+  M4_hearing = mk_spec("M4", "hearing", c(L3, "frail", "hearing"), B3),
+
+  M1_vision  = mk_spec("M1", "vision", "vision"),
+  M2_vision  = mk_spec("M2", "vision", "vision", "baseline_age"),
+  M3_vision  = mk_spec("M3", "vision", c(L3, "vision"), B3),
+  M4_vision  = mk_spec("M4", "vision", c(L3, "frail", "vision"), B3),
+
+  M1_frailty = mk_spec("M1", "frail", "frail"),
+  M2_frailty = mk_spec("M2", "frail", "frail", "baseline_age"),
+  M3_frailty = mk_spec("M3", "frail", c(L3, "frail"), B3),
+  M4_frailty = mk_spec("M4", "frail", c(L3, "frail", "hearing", "vision"), B3)
+)
+
+# Intervention (every spec): set the exposure to 0 at every wave, for
+# everyone, from baseline onwards.
+
+# ==========================================================================
+# 3) Fit, simulate, estimate
+# ==========================================================================
+TIME_COV <- c("k", "I(k^2)")   # covariate models
+TIME_OUT <- "factor(k)"        # dementia: one baseline risk per interval,
+                               # like the Cox baseline hazard
+
+# Logistic fit that keeps only what prediction needs (a full glm object
+# stores copies of the data, which multiplies memory across workers)
+lean_glm <- function(formula, data) {
+  f <- glm(formula, family = binomial, data = data, model = FALSE, y = FALSE)
+  b <- coef(f); b[is.na(b)] <- 0
+  list(coef = b, terms = delete.response(terms(f)),
+       xlev = f$xlevels, contrasts = f$contrasts)
+}
+pred_lean <- function(fit, newdata) {
+  mf <- model.frame(fit$terms, newdata, xlev = fit$xlev)
+  X  <- model.matrix(fit$terms, mf, contrasts.arg = fit$contrasts)
+  plogis(drop(X %*% fit$coef[colnames(X)]))
+}
+
+fit_gf_models <- function(dat, spec) {
+  tv <- spec$tv
+  dk <- dat[dat$k >= 1 & dat$cov_obs == 1L, ]   # observed waves only
+  cov_fits <- list()
+  for (i in seq_along(tv)) {
+    v   <- tv[i]
+    rhs <- c(tv[seq_len(i - 1)], paste0("lag1_", tv),
+             if (v == "frail") "lag1_frail_hist", spec$base, TIME_COV)
+    cov_fits[[v]] <- lean_glm(reformulate(rhs, v), dk)
+  }
+  out_rhs <- c(tv, spec$base, TIME_OUT)
+  list(cov = cov_fits,                          # dementia: tv_cc person-time only
+       Y = lean_glm(reformulate(out_rhs, "Y"), dat[dat$in_cox == 1L, ]))
+}
+
+# int_var = NULL: natural course; otherwise the variable set to 0 at every wave
+simulate_gf <- function(fits, spec, start, int_var = NULL, K = GF$K, seed = GF$seed) {
+  set.seed(seed)                       # common random numbers: natural course vs intervention
+  tv  <- spec$tv
+  n   <- nrow(start)
+  cur <- start
+  prev_hist <- rep(0L, n)
+  S <- rep(1, n); cum <- rep(0, n); cif <- numeric(K)
+
+  for (k in 0:(K - 1)) {
+    cur$k <- k
+    if (k > 0) {
+      for (v in tv) cur[[paste0("lag1_", v)]] <- prev[[v]]
+      cur$lag1_frail_hist <- prev$frail_hist
+    }
+    for (v in tv) {
+      if (k > 0) {
+        p <- pred_lean(fits$cov[[v]], cur)
+        cur[[v]] <- rbinom(n, 1L, p)
+      }
+      if (v == "frail") cur$frail_hist <- pmax(prev_hist, cur$frail)
+      if (!is.null(int_var) && int_var == v) {
+        cur[[v]][] <- 0L
+        if (v == "frail") cur$frail_hist <- pmax(prev_hist, cur$frail)
+      }
+    }
+    if ("frail" %in% tv) prev_hist <- cur$frail_hist
+    h <- pred_lean(fits$Y, cur)
+    cum <- cum + S * h
+    S   <- S * (1 - h)
+    cif[k + 1] <- mean(cum)
+    prev <- cur
+  }
+  cif
+}
+
+est_gf <- function(spec, dat, seed = GF$seed) {
+  fits  <- fit_gf_models(dat, spec)
+  start <- dat[dat$k == 0L, ]
+  if (!"frail_hist" %in% names(start)) start$frail_hist <- 0L
+  nc    <- simulate_gf(fits, spec, start, NULL,          seed = seed)
+  r     <- simulate_gf(fits, spec, start, spec$exposure, seed = seed)
+  est   <- tibble(horizon_k = GF$report_k,
+                  risk_nc   = nc[GF$report_k], risk_int = r[GF$report_k],
+                  PAF       = (nc[GF$report_k] - r[GF$report_k]) / nc[GF$report_k])
+  list(est = est, nc = nc)
+}
+
+boot_gf <- function(spec, dat, B = GF$B, cores = GF$cores) {
+  if (B < 1) return(NULL)
+  idx <- split(seq_len(nrow(dat)), dat$idauniq)
+  one <- function(b) {
+    set.seed(GF$seed + b)
+    pick <- sample(names(idx), length(idx), replace = TRUE)
+    rows <- unlist(idx[pick], use.names = FALSE)
+    bd   <- dat[rows, ]
+    bd$idauniq <- rep(seq_along(pick), lengths(idx[pick]))
+    out <- tryCatch(est_gf(spec, bd, seed = GF$seed + b)$est,
+                    error = function(e) NULL)
+    if (!is.null(out)) out$b <- b
+    rm(bd); invisible(gc(verbose = FALSE))
+    out
+  }
+  if (cores <= 1) {
+    res <- lapply(seq_len(B), one)
+  } else if (.Platform$OS.type != "windows") {
+    res <- parallel::mclapply(seq_len(B), one, mc.cores = cores)
+  } else {                             # Windows: socket cluster
+    cl <- parallel::makeCluster(cores)
+    on.exit(parallel::stopCluster(cl), add = TRUE)
+    parallel::clusterEvalQ(cl, suppressPackageStartupMessages(library(dplyr)))
+    parallel::clusterExport(cl, c("GF", "TIME_COV", "TIME_OUT", "lean_glm", "pred_lean",
+                                  "fit_gf_models", "simulate_gf", "est_gf"),
+                            envir = globalenv())
+    res <- parallel::parLapply(cl, seq_len(B), one)
+  }
+  bind_rows(res)
+}
+
+run_gf <- function(spec, dat, B = GF$B) {
+  t0  <- Sys.time()
+  pe  <- est_gf(spec, dat)
+  bs  <- boot_gf(spec, dat, B)
+  out <- pe$est %>% mutate(model = spec$model, exposure = spec$exposure, .before = 1)
+  if (!is.null(bs) && nrow(bs)) {
+    ci <- bs %>% group_by(horizon_k) %>%
+      summarise(PAF_lcl = quantile(PAF, 0.025), PAF_ucl = quantile(PAF, 0.975),
+                n_boot = n(), .groups = "drop")
+    out <- out %>% left_join(ci, by = "horizon_k")
+  } else out <- out %>% mutate(PAF_lcl = NA_real_, PAF_ucl = NA_real_, n_boot = 0L)
+  cat(sprintf("  %-12s done in %.1f min\n", paste(spec$model, spec$exposure),
+              as.numeric(difftime(Sys.time(), t0, units = "mins"))))
+  list(table = out, nc = pe$nc)
+}
+
+# ==========================================================================
+# 4) Run
+# ==========================================================================
+gf_dat <- build_gf_data()
+
+# Quick timing check before committing to the bootstrap:
+#   system.time(est_gf(gf_specs$M4_frailty, gf_dat))
+dir.create(GF$cache_dir, showWarnings = FALSE)
+gf_res <- setNames(lapply(names(gf_specs), function(nm) {
+  f <- file.path(GF$cache_dir, sprintf("%s_B%d.rds", nm, GF$B))
+  if (file.exists(f)) { cat("  ", nm, "loaded from", f, "\n"); return(readRDS(f)) }
+  r <- run_gf(gf_specs[[nm]], gf_dat)
+  saveRDS(r, f)
+  r
+}), names(gf_specs))
+
+# ---- Natural-course check: simulated vs observed cumulative incidence ----
+obs <- observed_risk(gf_dat)
+nc_check <- bind_rows(lapply(names(gf_res), function(nm) tibble(
+  spec = nm, horizon_k = GF$report_k,
+  observed  = obs[GF$report_k],
+  simulated = gf_res[[nm]]$nc[GF$report_k]))) %>%
+  mutate(diff_pp = 100 * (simulated - observed))
+cat("\n=== Natural course vs observed cumulative incidence of dementia ===\n")
+cat("  (large differences point to misspecified models)\n")
+gf_print(nc_check)
+
+# ---- PAF table ----
+gf_paf <- bind_rows(lapply(gf_res, `[[`, "table")) %>%
+  mutate(
+    years    = 2 * horizon_k,
+    exposure = recode(exposure, hearing = "Hearing impairment",
+                      vision = "Vision impairment", frail = "Frailty"),
+    risk_nc  = sprintf("%.1f", 100 * risk_nc),
+    risk_int = sprintf("%.1f", 100 * risk_int),
+    PAF_CI   = ifelse(is.na(PAF_lcl), sprintf("%.1f", 100 * PAF),
+                      sprintf("%.1f (%.1f to %.1f)", 100 * PAF,
+                              100 * PAF_lcl, 100 * PAF_ucl))
+  ) %>%
+  dplyr::select(model, exposure, years, risk_nc, risk_int, PAF_CI, n_boot)
+
+cat("\n=== g-formula PAF (%), Models 1-4: cumulative risk of dementia ===\n")
+cat("  risk_nc = natural course, risk_int = exposure eliminated at every wave (%)\n")
+gf_print(gf_paf)
+
+```
+
+
+```{r}
+library(survival)
+library(survminer)
+library(dplyr)
+library(ggplot2)
+library(scales)
+
+KM_OUT_DIR <- output_dir   # figures; the data behind them go to results_dir
+
+stopifnot(exists("tv_cc"), exists("baseline_df_eligible"))
+
+to01 <- function(x) as.integer(as.character(x))
+
+# ---- 0) One row per person: baseline status, follow-up end, event ----------
+km_base <- tv_cc %>%
+  mutate(idauniq = as.character(idauniq)) %>%
+  group_by(idauniq) %>%
+  summarise(t_event = max(tstop),               # last assessed wave <= 2018
+            event   = as.integer(max(event)),   # follow-up stops at the event
+            .groups = "drop") %>%
+  left_join(baseline_df_eligible %>%
+              mutate(idauniq = as.character(idauniq)) %>%
+              distinct(idauniq, .keep_all = TRUE) %>%
+              transmute(idauniq,
+                        hearing_base = to01(hearing_loss),
+                        vision_base  = to01(vision_overall),
+                        frailty_base = to01(frailty)),
+            by = "idauniq")
+
+# Checks: same people and events as the Cox models; baseline status equals
+# the exposure of each person's first interval (tstart = 0)
+first_iv <- tv_cc %>%
+  mutate(idauniq = as.character(idauniq)) %>%
+  filter(tstart == 0) %>%
+  transmute(idauniq, h0 = to01(hearing_lag), v0 = to01(vision_lag), f0 = to01(frailty_lag))
+chk <- inner_join(km_base, first_iv, by = "idauniq")
+stopifnot(
+  "a tv_cc person has no baseline status" =
+    !anyNA(km_base[c("hearing_base", "vision_base", "frailty_base")]),
+  "KM data and tv_cc have different people" =
+    nrow(km_base) == n_distinct(tv_cc$idauniq),
+  "KM data and tv_cc have different events" =
+    sum(km_base$event) == sum(tv_cc$event),
+  "baseline status differs from the first tv_cc interval" =
+    all(chk$hearing_base == chk$h0, chk$vision_base == chk$v0, chk$frailty_base == chk$f0)
+)
+cat("KM data: persons =", nrow(km_base), "| events =", sum(km_base$event),
+    "| person-years to the last assessed wave =", round(sum(km_base$t_event)), "\n")
+rm(first_iv, chk)
+
+# ---- 1) One plot per exposure --------------------------------------------------
+plot_cum_inc <- function(var, labs, legend_title, title, file) {
+  d <- km_base %>%
+    mutate(group = factor(.data[[var]], levels = c(0, 1), labels = labs))
+
+  # Unadjusted HR for baseline status, and the log-rank test
+  ci <- summary(coxph(Surv(t_event, event) ~ group, data = d))$conf.int
+  hr_text <- sprintf("Unadjusted HR (95%% CI): %.2f (%.2f–%.2f)",
+                     ci[1, "exp(coef)"], ci[1, "lower .95"], ci[1, "upper .95"])
+  sd   <- survdiff(Surv(t_event, event) ~ group, data = d)
+  p_lr <- pchisq(sd$chisq, df = length(sd$n) - 1, lower.tail = FALSE)
+  p_text <- if (p_lr < 0.001) "Log-rank p < 0.001" else sprintf("Log-rank p = %.3f", p_lr)
+
+  fit_km <- surv_fit(Surv(t_event, event) ~ group, data = d)
+
+  p <- ggsurvplot(
+    fit_km,
+    data           = d,
+    fun            = "event",
+    conf.int       = TRUE,
+    conf.int.style = "ribbon",
+    censor         = FALSE,
+    risk.table     = TRUE,
+    risk.table.col = "strata",
+    break.time.by  = 4,
+    palette        = c("#00BFC4", "#F8766D"),
+    legend.title   = legend_title,
+    legend.labs    = labs,
+    xlab           = "Follow-up time (years)",
+    ylab           = "Cumulative incidence of dementia",
+    title          = title
+  )
+  p$plot <- p$plot +
+    annotate("text", x = Inf, y = -Inf,
+             label = paste(hr_text, p_text, sep = "\n"),
+             hjust = 1.02, vjust = -0.25, size = 4.5) +
+    coord_cartesian(clip = "off") +
+    theme(plot.margin = margin(10, 20, 25, 10))
+
+  print(p)
+  tiff(file.path(KM_OUT_DIR, file),
+       width = 8, height = 7, units = "in", res = 300, compression = "lzw")
+  print(p)
+  dev.off()
+
+  counts <- d %>%
+    group_by(group) %>%
+    summarise(persons = n(), events = sum(event),
+              person_years = round(sum(t_event)), .groups = "drop")
+  cat("\n", title, "\n", sep = "")
+  print(as.data.frame(counts), row.names = FALSE)
+  cat(hr_text, "|", p_text, "\n")
+
+  invisible(list(plot = p, fit = fit_km, counts = counts,
+                 HR = ci[1, c("exp(coef)", "lower .95", "upper .95")], p_logrank = p_lr))
+}
+
+km_hearing <- plot_cum_inc("hearing_base", c("No hearing loss", "Hearing loss"),
+                           "Baseline hearing",
+                           "Cumulative Incidence of Dementia by Hearing Status (ELSA)",
+                           "KM_hearing_cumincidence_ELSA.tiff")
+km_vision  <- plot_cum_inc("vision_base", c("No vision loss", "Vision loss"),
+                           "Baseline vision",
+                           "Cumulative Incidence of Dementia by Vision Status (ELSA)",
+                           "KM_vision_cumincidence_ELSA.tiff")
+km_frailty <- plot_cum_inc("frailty_base", c("Non-frail", "Frail"),
+                           "Baseline frailty",
+                           "Cumulative Incidence of Dementia by Frailty Status (ELSA)",
+                           "KM_frailty_cumincidence_ELSA.tiff")
+
+# ---- 2) Save the data and numbers behind the plots -----------------------------
+saveRDS(list(data    = km_base,
+             hearing = km_hearing[c("fit", "counts", "HR", "p_logrank")],
+             vision  = km_vision[c("fit", "counts", "HR", "p_logrank")],
+             frailty = km_frailty[c("fit", "counts", "HR", "p_logrank")]),
+        file.path(results_dir, "KM_cumincidence_ELSA.rds"))
+cat("\nSaved 3 TIFFs to", KM_OUT_DIR, "and KM_cumincidence_ELSA.rds to", results_dir, "\n")
+
+```
+
+
+# Sensitivity analysis: attained age as the time scale (ELSA)
+#   - Time scale: attained age in years, from calendar years. The ELSA End
+#     User Licence files have no interview or birth month, so age at each
+#     wave is wave year - birth year (birth_year in elsa_long.csv). For
+#     people without a birth year (top-coded or missing indobyr) it is
+#     baseline year - baseline age, then + years since baseline. Each interval
+#     (tstart, tstop] becomes (age at the opening wave, age at the closing
+#     wave], so entry is delayed to the age at baseline and every risk set
+#     compares people of the same attained age. HRS uses age in months from
+#     the interview dates.
+#   - Baseline age is removed as a covariate (age is controlled by the
+#     time scale).
+#   - Everything else is unchanged: the same rows (tv_cc and the Model 5
+#     data built from it), the same events, the same one-wave-lagged
+#     exposures and covariates, robust (cluster) variance, Efron ties.
+```{r}
+# Models:
+#   Model 2 (age scale): exposure only. On the age scale the exposure-only
+#     model is already age-adjusted, so it is the counterpart of Model 2;
+#     Model 1 (unadjusted for age) has no age-scale counterpart.
+#   Model 3: + sex, race, education, marital status, employment, smoking,
+#     alcohol.
+#   Model 4: hearing / vision + frailty; frailty + hearing + vision.
+#   Model 4 interaction: sensory x frailty (as Supplementary Table 34).
+#   Model 5: three-level frailty-context exposure, Model 3 covariates.
+# Proportional hazards: cox.zph(transform = "identity") tests whether each
+# log-HR changes linearly with attained age; the plots show the estimated
+# log-HR of the exposure as a function of age.
+
+suppressPackageStartupMessages({ library(dplyr); library(survival) })
+
+age_print <- function(x, digits = 4)
+  cat(capture.output(print(as.data.frame(x), row.names = FALSE,
+                           digits = digits)), sep = "\n")
+
+# ==========================================================================
+# 1) Add the age time scale to an interval data set
+# ==========================================================================
+# One birth year per person, taken from the waves that report it. ELSA top-
+# codes respondents aged 90+ (indager and indobyr = -7), so in those waves
+# birth_year is NA and the age in elsa_long.csv is not a real age
+# (imputed, or the code 99). The birth year from earlier waves gives the
+# right calendar-year age for them. Fallback for people with no birth year
+# in any wave (aged 90+ at baseline): baseline year - baseline age.
+birth_tbl <- panel_df_eligible %>%
+  transmute(idauniq = as.character(idauniq), birth_year = as.numeric(birth_year)) %>%
+  group_by(idauniq) %>%
+  summarise(n_by  = n_distinct(birth_year[!is.na(birth_year)]),
+            by_el = if (all(is.na(birth_year))) NA_real_
+                    else as.numeric(names(which.max(table(birth_year)))),
+            .groups = "drop") %>%
+  left_join(baseline_df_eligible %>%
+              transmute(idauniq = as.character(idauniq),
+                        by_fb = as.numeric(year) - as.numeric(age)),
+            by = "idauniq") %>%
+  mutate(birth_year_used = coalesce(by_el, by_fb))
+stopifnot(!anyNA(birth_tbl$birth_year_used))
+cat(sprintf("Birth year: %d people | %d with >1 distinct birth_year across waves (most common used) | %d without birth_year (baseline year - baseline age used)\n",
+            nrow(birth_tbl), sum(birth_tbl$n_by > 1), sum(is.na(birth_tbl$by_el))))
+birth_tbl <- birth_tbl %>% dplyr::select(idauniq, birth_year_used)
+
+# Adds age_in / age_out (years): calendar year of the opening / closing wave
+# (baseline_year + tstart / tstop) - birth year.
+add_age_scale <- function(dat, ts = "tstart", tp = "tstop", label = "") {
+  d <- dat %>%
+    mutate(idauniq = as.character(idauniq)) %>%
+    left_join(birth_tbl, by = "idauniq") %>%
+    mutate(age_in  = as.numeric(baseline_year) + .data[[ts]] - birth_year_used,
+           age_out = as.numeric(baseline_year) + .data[[tp]] - birth_year_used) %>%
+    dplyr::select(-birth_year_used)
+  stopifnot(nrow(d) == nrow(dat))
+  cat(sprintf("[%s] %d intervals | age at entry %.0f-%.0f | age at exit %.0f-%.0f\n",
+              label, nrow(d), min(d$age_in), max(d$age_in),
+              min(d$age_out), max(d$age_out)))
+  stopifnot(!anyNA(d$age_in), all(d$age_out > d$age_in))
+  d
+}
+
+# ==========================================================================
+# 2) Build the age-scale data (same rows as the primary models)
+# ==========================================================================
+stopifnot(exists("tv_cc"), exists("df_tv_hearing"), exists("df_tv_vision"),
+          exists("report_int"))
+
+tv_age    <- add_age_scale(tv_cc,         label = "Models 2-4")
+m5_age_h  <- add_age_scale(df_tv_hearing, label = "Model 5 hearing")
+m5_age_v  <- add_age_scale(df_tv_vision,  label = "Model 5 vision")
+
+# Check against the age reported at the closing wave, for waves with a
+# reported birth year (top-coded 90+ waves have no real age to compare).
+# The difference should be -1, 0 or 1: ELSA fieldwork for a wave runs into
+# the next calendar year, and the interview can fall before or after the
+# birthday.
+age_reported <- panel_df_eligible %>%
+  filter(!is.na(birth_year)) %>%
+  transmute(idauniq = as.character(idauniq), .y1 = as.integer(year),
+            age_rep = as.numeric(age)) %>%
+  distinct(idauniq, .y1, .keep_all = TRUE)
+age_chk <- tv_age %>%
+  mutate(.y1 = as.integer(round(as.integer(baseline_year) + tstop))) %>%
+  left_join(age_reported, by = c("idauniq", ".y1"))
+stopifnot(nrow(age_chk) == nrow(tv_age))
+age_diff <- age_chk$age_out - age_chk$age_rep
+cat(sprintf("Age at exit (wave year - birth year) minus reported age: %.1f%% within 1 year | %d intervals beyond 1 year | %d closing waves top-coded (no reported birth year)\n",
+            100 * mean(abs(age_diff) <= 1, na.rm = TRUE),
+            sum(abs(age_diff) > 1, na.rm = TRUE), sum(is.na(age_diff))))
+print(table(pmax(pmin(age_diff, 3), -3), useNA = "ifany", dnn = "difference (capped at +/-3)"))
+cat(sprintf("Tied event ages: %d of %d events\n",
+            sum(duplicated(tv_age$age_out[tv_age$event == 1])),
+            sum(tv_age$event)))
+rm(age_reported, age_chk, age_diff)
+
+
+# ==========================================================================
+# 3) Models on the age time scale
+# ==========================================================================
+# ---- Model 2 (age scale): exposure only ----
+fit_a2_hearing <- coxph(Surv(age_in, age_out, event) ~ hearing_lag + cluster(idauniq),
+                        data = tv_age, ties = "efron")
+fit_a2_vision  <- coxph(Surv(age_in, age_out, event) ~ vision_lag + cluster(idauniq),
+                        data = tv_age, ties = "efron")
+fit_a2_frailty <- coxph(Surv(age_in, age_out, event) ~ frailty_lag + cluster(idauniq),
+                        data = tv_age, ties = "efron")
+
+# ---- Model 3: + sociodemographic and lifestyle (no baseline age) ----
+fit_a3_hearing <- coxph(
+  Surv(age_in, age_out, event) ~ hearing_lag +
+    Gender + Race + Education + Marital_status +
+    emp_lag + smoke_lag + alcohol_lag + cluster(idauniq),
+  data = tv_age, ties = "efron")
+fit_a3_vision <- coxph(
+  Surv(age_in, age_out, event) ~ vision_lag +
+    Gender + Race + Education + Marital_status +
+    emp_lag + smoke_lag + alcohol_lag + cluster(idauniq),
+  data = tv_age, ties = "efron")
+fit_a3_frailty <- coxph(
+  Surv(age_in, age_out, event) ~ frailty_lag +
+    Gender + Race + Education + Marital_status +
+    emp_lag + smoke_lag + alcohol_lag + cluster(idauniq),
+  data = tv_age, ties = "efron")
+
+# ---- Model 4: hybrid, as in the primary analysis ----
+fit_a4_hearing <- coxph(
+  Surv(age_in, age_out, event) ~ hearing_lag +
+    Gender + Race + Education + Marital_status +
+    emp_lag + smoke_lag + alcohol_lag + frailty_lag + cluster(idauniq),
+  data = tv_age, ties = "efron")
+fit_a4_vision <- coxph(
+  Surv(age_in, age_out, event) ~ vision_lag +
+    Gender + Race + Education + Marital_status +
+    emp_lag + smoke_lag + alcohol_lag + frailty_lag + cluster(idauniq),
+  data = tv_age, ties = "efron")
+fit_a4_frailty <- coxph(
+  Surv(age_in, age_out, event) ~ hearing_lag + vision_lag + frailty_lag +
+    Gender + Race + Education + Marital_status +
+    emp_lag + smoke_lag + alcohol_lag + cluster(idauniq),
+  data = tv_age, ties = "efron")
+
+# ---- Model 4 + sensory x frailty interaction ----
+fit_a4_int_hearing <- coxph(
+  Surv(age_in, age_out, event) ~ hearing_lag * frailty_lag +
+    Gender + Race + Education + Marital_status +
+    emp_lag + smoke_lag + alcohol_lag + cluster(idauniq),
+  data = tv_age, ties = "efron")
+fit_a4_int_vision <- coxph(
+  Surv(age_in, age_out, event) ~ vision_lag * frailty_lag +
+    Gender + Race + Education + Marital_status +
+    emp_lag + smoke_lag + alcohol_lag + cluster(idauniq),
+  data = tv_age, ties = "efron")
+
+# ---- Model 5: frailty context, Model 3 covariates (no frailty term) ----
+fit_a5_hearing <- coxph(
+  Surv(age_in, age_out, dementia_event) ~ ctx_lag +
+    Gender + Race + Education + Marital_status +
+    emp_lag + smoke_lag + alcohol_lag,
+  data = m5_age_h, cluster = idauniq, ties = "efron", na.action = na.omit)
+fit_a5_vision <- coxph(
+  Surv(age_in, age_out, dementia_event) ~ ctx_lag +
+    Gender + Race + Education + Marital_status +
+    emp_lag + smoke_lag + alcohol_lag,
+  data = m5_age_v, cluster = idauniq, ties = "efron", na.action = na.omit)
+
+age_fits <- list(
+  M2_hearing = fit_a2_hearing, M2_vision = fit_a2_vision, M2_frailty = fit_a2_frailty,
+  M3_hearing = fit_a3_hearing, M3_vision = fit_a3_vision, M3_frailty = fit_a3_frailty,
+  M4_hearing = fit_a4_hearing, M4_vision = fit_a4_vision, M4_frailty = fit_a4_frailty,
+  M4int_hearing = fit_a4_int_hearing, M4int_vision = fit_a4_int_vision,
+  M5_hearing = fit_a5_hearing, M5_vision = fit_a5_vision)
+
+# Same sample and events as the primary models
+for (nm in names(age_fits)) {
+  f <- age_fits[[nm]]
+  stopifnot(f$n == nrow(tv_cc), f$nevent == sum(tv_cc$event))
+}
+cat("All age-scale fits:", nrow(tv_cc), "intervals,", sum(tv_cc$event),
+    "events (identical to the primary models)\n")
+
+# ==========================================================================
+# 4) Hazard ratios: time on study (primary) vs attained age
+# ==========================================================================
+z975 <- qnorm(0.975)
+lin_hr <- function(fit, w) {                 # w: named weights on coefficients
+  b <- coef(fit); V <- vcov(fit)             # robust (cluster) variance
+  est <- sum(w * b[names(w)])
+  se  <- sqrt(drop(t(w) %*% V[names(w), names(w)] %*% w))
+  c(HR = exp(est), lo = exp(est - z975 * se), hi = exp(est + z975 * se),
+    p = 2 * pnorm(-abs(est / se)))
+}
+fmt_hr_p <- function(x)
+  sprintf("%.2f (%.2f-%.2f); %s", x[["HR"]], x[["lo"]], x[["hi"]],
+          if (x[["p"]] < 0.001) "P < 0.001" else sprintf("P = %.3f", x[["p"]]))
+
+m5_terms <- function(fit) {
+  nm <- names(coef(fit))
+  c(before = grep("no frailty yet",  nm, fixed = TRUE, value = TRUE),
+    after  = grep("frailty present", nm, fixed = TRUE, value = TRUE))
+}
+
+# rows: model, exposure, primary fit, age-scale fit, weights builder
+cmp_rows <- list(
+  list("Model 2", "Hearing impairment", fit_m2_hearing, fit_a2_hearing, function(f) c(hearing_lag = 1)),
+  list("Model 2", "Vision impairment",  fit_m2_vision,  fit_a2_vision,  function(f) c(vision_lag = 1)),
+  list("Model 2", "Frailty",            fit_m2_frailty, fit_a2_frailty, function(f) c(frailty_lag = 1)),
+  list("Model 3", "Hearing impairment", fit_m3_hearing, fit_a3_hearing, function(f) c(hearing_lag = 1)),
+  list("Model 3", "Vision impairment",  fit_m3_vision,  fit_a3_vision,  function(f) c(vision_lag = 1)),
+  list("Model 3", "Frailty",            fit_m3_frailty, fit_a3_frailty, function(f) c(frailty_lag = 1)),
+  list("Model 4", "Hearing impairment", fit_m4_hearing, fit_a4_hearing, function(f) c(hearing_lag = 1)),
+  list("Model 4", "Vision impairment",  fit_m4_vision,  fit_a4_vision,  function(f) c(vision_lag = 1)),
+  list("Model 4", "Frailty",            fit_m4_frailty, fit_a4_frailty, function(f) c(frailty_lag = 1)),
+  list("Model 4 interaction", "Hearing, non-frail", fit_m4_int_hearing, fit_a4_int_hearing,
+       function(f) c(hearing_lag = 1)),
+  list("Model 4 interaction", "Hearing, frail", fit_m4_int_hearing, fit_a4_int_hearing,
+       function(f) c(hearing_lag = 1, "hearing_lag:frailty_lag" = 1)),
+  list("Model 4 interaction", "Hearing x frailty (ratio of HRs)", fit_m4_int_hearing, fit_a4_int_hearing,
+       function(f) c("hearing_lag:frailty_lag" = 1)),
+  list("Model 4 interaction", "Vision, non-frail", fit_m4_int_vision, fit_a4_int_vision,
+       function(f) c(vision_lag = 1)),
+  list("Model 4 interaction", "Vision, frail", fit_m4_int_vision, fit_a4_int_vision,
+       function(f) c(vision_lag = 1, "vision_lag:frailty_lag" = 1)),
+  list("Model 4 interaction", "Vision x frailty (ratio of HRs)", fit_m4_int_vision, fit_a4_int_vision,
+       function(f) c("vision_lag:frailty_lag" = 1)),
+  list("Model 5", "Hearing, before frailty onset", fit_m5_hearing, fit_a5_hearing,
+       function(f) setNames(1, m5_terms(f)[["before"]])),
+  list("Model 5", "Hearing, with or after frailty onset", fit_m5_hearing, fit_a5_hearing,
+       function(f) setNames(1, m5_terms(f)[["after"]])),
+  list("Model 5", "Hearing, with or after / before", fit_m5_hearing, fit_a5_hearing,
+       function(f) setNames(c(1, -1), m5_terms(f)[c("after", "before")])),
+  list("Model 5", "Vision, before frailty onset", fit_m5_vision, fit_a5_vision,
+       function(f) setNames(1, m5_terms(f)[["before"]])),
+  list("Model 5", "Vision, with or after frailty onset", fit_m5_vision, fit_a5_vision,
+       function(f) setNames(1, m5_terms(f)[["after"]])),
+  list("Model 5", "Vision, with or after / before", fit_m5_vision, fit_a5_vision,
+       function(f) setNames(c(1, -1), m5_terms(f)[c("after", "before")]))
+)
+
+hr_compare <- bind_rows(lapply(cmp_rows, function(r) {
+  p <- lin_hr(r[[3]], r[[5]](r[[3]]))
+  a <- lin_hr(r[[4]], r[[5]](r[[4]]))
+  tibble(model = r[[1]], exposure = r[[2]],
+         HR_time_on_study = fmt_hr_p(p), HR_attained_age = fmt_hr_p(a),
+         HR_tos = p[["HR"]], HR_age = a[["HR"]])
+}))
+
+cat("\n=== Hazard ratios: time since baseline (primary) vs attained age ===\n")
+cat("  Primary: time since baseline, adjusted for baseline age.\n")
+cat("  Attained age: age time scale with delayed entry, no age covariate.\n")
+age_print(hr_compare %>% dplyr::select(model, exposure, HR_time_on_study, HR_attained_age))
+
+# Interaction and RERI on the age scale, in the same format as Supplementary Table 34
+int_age_hearing <- report_int(fit_a4_int_hearing, "hearing_lag", "AGE SCALE: HEARING x FRAILTY")
+int_age_vision  <- report_int(fit_a4_int_vision,  "vision_lag",  "AGE SCALE: VISION x FRAILTY")
+
+# ==========================================================================
+# 5) Proportional hazards on the age scale: do the HRs vary with age?
+# ==========================================================================
+# transform = "identity": the test is for a linear trend of each log-HR in
+# attained age. A small P means the HR changes with age; the plot shows how.
+exposure_terms <- function(nm, fit) {
+  co <- names(coef(fit))
+  if (grepl("^M5", nm)) return(m5_terms(fit))
+  if (grepl("^M4int", nm)) return(grep("(hearing|vision)_lag(:frailty_lag)?$", co, value = TRUE))
+  ex <- sub("^M[0-9]_", "", nm)
+  paste0(ex, "_lag")
+}
+
+zph_age <- lapply(names(age_fits), function(nm) {
+  f <- age_fits[[nm]]
+  z <- cox.zph(f, transform = "identity", terms = FALSE)
+  tab <- z$table
+  terms <- exposure_terms(nm, f)
+  tibble(fit = nm, term = c(terms, "GLOBAL"),
+         chisq = tab[c(terms, "GLOBAL"), "chisq"],
+         df = tab[c(terms, "GLOBAL"), "df"],
+         p = tab[c(terms, "GLOBAL"), "p"]) %>%
+    mutate(zph = list(z))
+})
+zph_tab <- bind_rows(zph_age)
+
+cat("\n=== Proportional hazards on the age time scale (cox.zph, transform = identity) ===\n")
+cat("  Exposure terms and global test; P < 0.05 = HR changes with attained age\n")
+age_print(zph_tab %>% dplyr::select(fit, term, chisq, df, p) %>%
+            mutate(p = signif(p, 3), chisq = round(chisq, 2)))
+
+# Estimated log-HR of each exposure term as a function of attained age.
+# The dashed line is the constant (proportional-hazards) estimate.
+for (i in seq_len(nrow(zph_tab))) {
+  if (zph_tab$term[i] == "GLOBAL") next
+  z  <- zph_tab$zph[[i]]
+  tm <- zph_tab$term[i]
+  j  <- match(tm, colnames(z$y))
+  if (is.na(j)) next
+  plot(z[j], resid = FALSE, se = TRUE, xlab = "Attained age (years)",
+       ylab = "log hazard ratio",
+       main = sprintf("%s: %s (PH test P = %.3f)", zph_tab$fit[i], tm, zph_tab$p[i]))
+  abline(h = coef(age_fits[[zph_tab$fit[i]]])[tm], lty = 2, col = "grey40")
+}
+
+```
+
+
+# Sensitivity analysis: Levin PAFs from the attained-age HRs (ELSA), Models 2-5
+```{r}
+suppressPackageStartupMessages({ library(dplyr); library(tibble) })
+
+stopifnot(exists("tv_cc"), exists("df_tv_hearing"), exists("df_tv_vision"),
+          exists("fit_a2_hearing"), exists("fit_a5_vision"),
+          exists("fit_m2_hearing"), exists("fit_m5_vision"))
+
+if (!exists("age_print"))                    # defined in the attained-age chunk
+  age_print <- function(x, digits = 4)
+    cat(capture.output(print(as.data.frame(x), row.names = FALSE,
+                             digits = digits)), sep = "\n")
+
+AGE_PAF_SEED <- if (exists("PAF_SEED")) PAF_SEED else 20260509
+AGE_PAF_NSIM <- if (exists("PAF_NSIM")) PAF_NSIM else 10000
+
+# ---- Helpers (copies of the primary PAF chunk, renamed) --------------------
+age_levin <- function(p, HR) (p * (HR - 1)) / (p * (HR - 1) + 1)
+
+age_prev_binary <- function(dat, var, ts, tp) {
+  pt <- dat[[tp]] - dat[[ts]]
+  x  <- dat[[var]]
+  sum(pt[x == 1], na.rm = TRUE) / sum(pt, na.rm = TRUE)
+}
+
+age_prev_factor <- function(dat, var, ts, tp) {
+  pt    <- dat[[tp]] - dat[[ts]]
+  x     <- dat[[var]]
+  total <- sum(pt, na.rm = TRUE)
+  setNames(vapply(levels(x), function(lv) sum(pt[x == lv], na.rm = TRUE) / total,
+                  numeric(1)), levels(x))
+}
+
+age_paf_binary <- function(fit, term, p, nsim = AGE_PAF_NSIM, seed = AGE_PAF_SEED) {
+  b <- unname(coef(fit)[term])
+  V <- vcov(fit)[term, term]                 # robust (cluster) variance
+  stopifnot(!is.na(b), V > 0)
+  set.seed(seed)
+  pafs <- age_levin(p, exp(rnorm(nsim, mean = b, sd = sqrt(V))))
+  tibble(HR     = exp(b),
+         HR_lcl = exp(b - qnorm(0.975) * sqrt(V)),
+         HR_ucl = exp(b + qnorm(0.975) * sqrt(V)),
+         PAF     = age_levin(p, exp(b)),
+         PAF_lcl = unname(quantile(pafs, 0.025)),
+         PAF_ucl = unname(quantile(pafs, 0.975)))
+}
+
+age_paf_multicat <- function(fit, terms, p_vec, labels,
+                             nsim = AGE_PAF_NSIM, seed = AGE_PAF_SEED) {
+  b <- unname(coef(fit)[terms])
+  V <- vcov(fit)[terms, terms, drop = FALSE]
+  set.seed(seed)
+  sims <- MASS::mvrnorm(nsim, mu = b, Sigma = V)
+  if (is.vector(sims)) sims <- matrix(sims, ncol = length(terms))
+
+  comp_sim  <- sweep(exp(sims) - 1, 2, p_vec, `*`)
+  s_sim     <- rowSums(comp_sim)
+  comp_est  <- p_vec * (exp(b) - 1)
+  s_est     <- sum(comp_est)
+  se        <- sqrt(diag(V))
+  q <- function(x, pr) unname(quantile(x, pr))
+
+  tibble(exposure = c("Total", labels),
+         HR       = c(NA_real_, exp(b)),
+         HR_lcl   = c(NA_real_, exp(b - qnorm(0.975) * se)),
+         HR_ucl   = c(NA_real_, exp(b + qnorm(0.975) * se)),
+         PAF      = c(s_est / (1 + s_est), comp_est / (1 + s_est)),
+         PAF_lcl  = c(q(s_sim / (1 + s_sim), 0.025),
+                      apply(comp_sim / (1 + s_sim), 2, q, 0.025)),
+         PAF_ucl  = c(q(s_sim / (1 + s_sim), 0.975),
+                      apply(comp_sim / (1 + s_sim), 2, q, 0.975)))
+}
+
+# ==========================================================================
+# 1) Prevalences (primary data, primary time scale)
+# ==========================================================================
+for (f in list(fit_a2_hearing, fit_a3_vision, fit_a4_frailty, fit_a5_hearing, fit_a5_vision))
+  stopifnot(f$n == nrow(tv_cc))
+stopifnot(nrow(df_tv_hearing) == nrow(tv_cc), nrow(df_tv_vision) == nrow(tv_cc))
+
+age_p <- c(
+  hearing = age_prev_binary(tv_cc, "hearing_lag", "tstart", "tstop"),
+  vision  = age_prev_binary(tv_cc, "vision_lag",  "tstart", "tstop"),
+  frailty = age_prev_binary(tv_cc, "frailty_lag", "tstart", "tstop"))
+
+cat("Person-time-weighted prevalence (tv_cc), used for both time scales:\n")
+cat(sprintf("  %-8s %.4f\n", names(age_p), age_p), sep = "")
+
+# For information only: the same prevalence weighted by person-time on the
+# age scale (age_out - age_in). Not used; it should differ only slightly.
+if (exists("tv_age")) {
+  p_agept <- c(hearing = age_prev_binary(tv_age, "hearing_lag", "age_in", "age_out"),
+               vision  = age_prev_binary(tv_age, "vision_lag",  "age_in", "age_out"),
+               frailty = age_prev_binary(tv_age, "frailty_lag", "age_in", "age_out"))
+  cat("  (weighted by age-scale person-time instead:",
+      paste(sprintf("%s %.4f", names(p_agept), p_agept), collapse = ", "), ")\n")
+}
+
+# ==========================================================================
+# 2) PAFs, Models 2-4: primary fit and age-scale fit, same p
+# ==========================================================================
+# Model labels and exposure names follow paf_all, so the two tables line up.
+age_spec_14 <- tribble(
+  ~model,                                 ~exposure,      ~term,         ~p_key,    ~fit_tos,         ~fit_age,
+  "M2 (+ age)",                           "Hearing loss", "hearing_lag", "hearing", "fit_m2_hearing", "fit_a2_hearing",
+  "M2 (+ age)",                           "Vision loss",  "vision_lag",  "vision",  "fit_m2_vision",  "fit_a2_vision",
+  "M2 (+ age)",                           "Frailty",      "frailty_lag", "frailty", "fit_m2_frailty", "fit_a2_frailty",
+  "M3 (+ sociodemographic + lifestyle)",  "Hearing loss", "hearing_lag", "hearing", "fit_m3_hearing", "fit_a3_hearing",
+  "M3 (+ sociodemographic + lifestyle)",  "Vision loss",  "vision_lag",  "vision",  "fit_m3_vision",  "fit_a3_vision",
+  "M3 (+ sociodemographic + lifestyle)",  "Frailty",      "frailty_lag", "frailty", "fit_m3_frailty", "fit_a3_frailty",
+  "M4 (hybrid, frailty-adj)",             "Hearing loss", "hearing_lag", "hearing", "fit_m4_hearing", "fit_a4_hearing",
+  "M4 (hybrid, frailty-adj)",             "Vision loss",  "vision_lag",  "vision",  "fit_m4_vision",  "fit_a4_vision",
+  "M4 (mutually adjusted)",               "Frailty",      "frailty_lag", "frailty", "fit_m4_frailty", "fit_a4_frailty"
+)
+
+age_paf_14 <- bind_rows(lapply(seq_len(nrow(age_spec_14)), function(i) {
+  s <- age_spec_14[i, ]
+  p <- age_p[[s$p_key]]
+  bind_rows(
+    tibble(scale = "time_since_baseline", model = s$model, exposure = s$exposure, p_pt = p) %>%
+      bind_cols(age_paf_binary(get(s$fit_tos), s$term, p)),
+    tibble(scale = "attained_age", model = s$model, exposure = s$exposure, p_pt = p) %>%
+      bind_cols(age_paf_binary(get(s$fit_age), s$term, p)))
+}))
+
+# ==========================================================================
+# 3) PAFs, Model 5: three-level context, primary fit and age-scale fit
+# ==========================================================================
+# Prevalence of each context level from the primary Model 5 data (start/stop);
+# the age-scale data have the same rows and the same ctx_lag.
+age_paf_m5 <- function(fit_tos, fit_age, dat, model_label) {
+  stopifnot(is.factor(dat$ctx_lag), fit_age$n == nrow(dat))
+  lv    <- levels(dat$ctx_lag)[-1]
+  p_vec <- age_prev_factor(dat, "ctx_lag", "start", "stop")[lv]
+  terms <- paste0("ctx_lag", lv)
+  stopifnot(all(terms %in% names(coef(fit_tos))), all(terms %in% names(coef(fit_age))))
+
+  one <- function(fit, scale) {
+    tab <- age_paf_multicat(fit, terms, p_vec, lv)
+    stopifnot(abs(sum(tab$PAF[-1]) - tab$PAF[1]) < 1e-10)   # components add up
+    tibble(scale = scale, model = model_label) %>%
+      bind_cols(tab) %>%
+      mutate(p_pt = c(sum(p_vec), unname(p_vec)), .after = exposure)
+  }
+  bind_rows(one(fit_tos, "time_since_baseline"), one(fit_age, "attained_age"))
+}
+
+age_paf_5 <- bind_rows(
+  age_paf_m5(fit_m5_hearing, fit_a5_hearing, df_tv_hearing, "M5 (hearing context)"),
+  age_paf_m5(fit_m5_vision,  fit_a5_vision,  df_tv_vision,  "M5 (vision context)"))
+
+age_paf_long <- bind_rows(age_paf_14, age_paf_5)
+
+# The time-since-baseline rows reproduce the primary PAF table exactly
+# (same fits, p, seed and draws), which checks that the helpers match.
+if (exists("paf_all")) {
+  chk <- age_paf_long %>%
+    filter(scale == "time_since_baseline") %>%
+    inner_join(paf_all %>% dplyr::select(model, exposure, PAF_primary = PAF,
+                                         lcl_primary = PAF_lcl),
+               by = c("model", "exposure"))
+  stopifnot(nrow(chk) == nrow(age_paf_long) / 2,
+            max(abs(chk$PAF - chk$PAF_primary)) < 1e-8,
+            max(abs(chk$PAF_lcl - chk$lcl_primary)) < 1e-8)
+  cat("\nCheck: time-since-baseline PAFs match the primary PAF table (paf_all).\n")
+}
+
+# ==========================================================================
+# 4) Side-by-side table
+# ==========================================================================
+age_fmt_hr  <- function(est, lo, hi)
+  ifelse(is.na(est), "", sprintf("%.2f (%.2f-%.2f)", est, lo, hi))
+age_fmt_pct <- function(est, lo, hi) {
+  r <- function(x) round(100 * x, 1) + 0      # + 0 avoids printing "-0.0"
+  sprintf("%.1f (%.1f to %.1f)", r(est), r(lo), r(hi))
+}
+
+# Short model names for printing
+age_short_model <- function(x)
+  case_when(x == "M4 (mutually adjusted)" ~ "M4 (mutual)",
+            x == "M5 (hearing context)"   ~ "M5 hearing",
+            x == "M5 (vision context)"    ~ "M5 vision",
+            TRUE ~ sub(" .*$", "", x))
+
+# Model 5 rows: readable names for the two context levels
+age_m5_label <- function(x)
+  case_when(grepl("no frailty yet",  x, fixed = TRUE) ~ "Before frailty onset",
+            grepl("frailty present", x, fixed = TRUE) ~ "With or after frailty onset",
+            TRUE ~ x)
+
+paf_age_compare <- age_paf_long %>%
+  mutate(HR_CI  = age_fmt_hr(HR, HR_lcl, HR_ucl),
+         PAF_CI = age_fmt_pct(PAF, PAF_lcl, PAF_ucl)) %>%
+  dplyr::select(scale, model, exposure, p_pt, HR, PAF, HR_CI, PAF_CI) %>%
+  tidyr::pivot_wider(names_from = scale, values_from = c(HR, PAF, HR_CI, PAF_CI)) %>%
+  mutate(exposure = age_m5_label(exposure),
+         PAF_diff_points = 100 * (PAF_attained_age - PAF_time_since_baseline))
+
+cat("\n=== Levin PAF: time since baseline (primary) vs attained age, Models 2-5 ===\n")
+cat("  Same person-time prevalence p for both; only the HR differs.\n")
+cat("  Model 5: components add up to the total; a component is negative when its HR < 1.\n")
+age_print(paf_age_compare %>%
+            transmute(model = age_short_model(model), exposure, p = round(p_pt, 3),
+                      HR_primary  = HR_CI_time_since_baseline,
+                      PAF_primary = PAF_CI_time_since_baseline,
+                      HR_age      = HR_CI_attained_age,
+                      PAF_age     = PAF_CI_attained_age,
+                      diff_pts    = round(PAF_diff_points, 1)))
+
+# HRs as numbers (both time scales), same rows as hr_compare
+hr_compare_num <- bind_rows(lapply(cmp_rows, function(r) {
+  p <- lin_hr(r[[3]], r[[5]](r[[3]]))
+  a <- lin_hr(r[[4]], r[[5]](r[[4]]))
+  bind_rows(
+    tibble(scale = "time_since_baseline", model = r[[1]], exposure = r[[2]],
+           HR = p[["HR"]], HR_lcl = p[["lo"]], HR_ucl = p[["hi"]], P = p[["p"]]),
+    tibble(scale = "attained_age", model = r[[1]], exposure = r[[2]],
+           HR = a[["HR"]], HR_lcl = a[["lo"]], HR_ucl = a[["hi"]], P = a[["p"]]))
+}))
+saveRDS(list(hr_compare      = hr_compare,        # formatted HR (95% CI); P
+             hr_compare_num  = hr_compare_num,    # numbers for forest plots
+             interaction     = list(hearing = int_age_hearing, vision = int_age_vision),
+             ph_tests        = zph_tab %>% dplyr::select(fit, term, chisq, df, p),
+             zph             = setNames(lapply(zph_age, function(x) x$zph[[1]]),
+                                        names(age_fits)),   # for the log-HR-by-age plots
+             paf_long        = age_paf_long,      # numbers, both time scales
+             paf_compare     = paf_age_compare),  # side-by-side table
+        file.path(results_dir, "age_timescale_sensitivity_ELSA.rds"))
+write.csv(hr_compare_num, file.path(results_dir, "age_timescale_HR_ELSA.csv"),  row.names = FALSE)
+write.csv(age_paf_long,   file.path(results_dir, "age_timescale_PAF_ELSA.csv"), row.names = FALSE)
+cat("Saved to results/age_timescale_sensitivity_ELSA.rds (+ HR and PAF csv)\n")
+
+```
+
+
+# Subgroup analysis by baseline age and sex (ELSA)
+```{r}
+library(survival); library(dplyr); library(purrr); library(tibble); library(tidyr)
+
+stopifnot(exists("tv_cc"), exists("df_tv_hearing"), exists("df_tv_vision"),
+          exists("fit_m4_hearing"), exists("fit_m5_hearing"))
+
+add_subgroup_factors <- function(d) {
+  d %>% mutate(
+    age_cat = factor(if_else(as.numeric(baseline_age) < 65, "<65", "≥65"),
+                     levels = c("<65", "≥65")),
+    sex_cat = factor(case_when(
+      as.character(Gender) %in% c("1","Male","male","M")     ~ "Male",
+      as.character(Gender) %in% c("2","Female","female","F") ~ "Female"
+    ), levels = c("Male","Female"))
+  )
+}
+tv_cc         <- add_subgroup_factors(tv_cc)
+df_tv_hearing <- add_subgroup_factors(df_tv_hearing)
+df_tv_vision  <- add_subgroup_factors(df_tv_vision)
+
+# Every interval must fall in exactly one stratum of each subgrouping
+for (d in list(tv_cc, df_tv_hearing, df_tv_vision))
+  stopifnot(!anyNA(d$age_cat), !anyNA(d$sex_cat))
+
+subgroup_specs <- tribble(~label,~var,
+                          "Age at baseline","age_cat",
+                          "Sex","sex_cat")
+# Covariate dropped within each stratum: only one that is constant there.
+# Age strata keep baseline_age (age still varies within <65 and >=65).
+drop_in_strata <- c(age_cat = NA_character_, sex_cat = "Gender")
+base_covs <- c("baseline_age","Gender","Race","Education","Marital_status",
+               "emp_lag","smoke_lag","alcohol_lag")
+tv_time <- c("tstart","tstop","event")
+m5_time <- c("start","stop","dementia_event")
+
+fit_cox <- function(data, rhs_terms, time_vars) {
+  fml <- reformulate(rhs_terms,
+                     response = sprintf("Surv(%s, %s, %s)",
+                                        time_vars[1], time_vars[2], time_vars[3]))
+  tryCatch(coxph(fml, data = data, cluster = idauniq,
+                 ties = "efron", na.action = na.omit),
+           error = function(e) {
+             warning("Cox fit failed (", deparse(fml, width.cutoff = 500L), "): ",
+                     conditionMessage(e), call. = FALSE)
+             NULL
+           })
+}
+
+# Model 5 terms, found by name
+m5_term <- function(fit, which = c("before", "after")) {
+  which <- match.arg(which)
+  pat <- if (which == "before") "no frailty yet" else "frailty present"
+  nm  <- names(coef(fit))
+  hit <- nm[startsWith(nm, "ctx_lag") & !grepl(":", nm, fixed = TRUE) &
+              grepl(pat, nm, fixed = TRUE)]
+  if (length(hit) == 1) hit else NA_character_
+}
+
+# Same specification as the primary models, checked on the full sample
+chk_m4 <- fit_cox(tv_cc, c("hearing_lag", base_covs, "frailty_lag"), tv_time)
+chk_m5 <- fit_cox(df_tv_hearing, c("ctx_lag", base_covs), m5_time)
+stopifnot(isTRUE(all.equal(coef(chk_m4)[["hearing_lag"]],
+                           coef(fit_m4_hearing)[["hearing_lag"]], tolerance = 1e-8)),
+          isTRUE(all.equal(unname(coef(chk_m5)[m5_term(chk_m5, "after")]),
+                           unname(coef(fit_m5_hearing)[m5_term(fit_m5_hearing, "after")]),
+                           tolerance = 1e-8)))
+cat("Check: unstratified refits reproduce the primary Model 4 and Model 5 estimates.\n")
+rm(chk_m4, chk_m5)
+
+# Exposure x subgroup interaction: pooled model with the same covariates,
+# joint robust Wald test of all product terms (1 df; 2 df for Model 5)
+p_interaction <- function(data, exposure, gv, extra_rhs, time_vars) {
+  cv  <- setdiff(c(base_covs, extra_rhs), drop_in_strata[[gv]])
+  rhs <- unique(c(paste0(exposure," * ",gv), cv))
+  fit <- fit_cox(data, rhs, time_vars); if (is.null(fit)) return(NA_real_)
+  nm <- names(coef(fit))
+  ix <- which(grepl(":", nm, fixed = TRUE) & startsWith(nm, exposure) &
+                grepl(gv, nm, fixed = TRUE))
+  if (!length(ix)) return(NA_real_)
+  b <- coef(fit)[ix]; V <- vcov(fit)[ix, ix, drop = FALSE]
+  pchisq(as.numeric(t(b) %*% solve(V) %*% b), df = length(ix), lower.tail = FALSE)
+}
+
+run_m4_binary <- function(data, exposure, time_vars, extra_rhs) {
+  map_dfr(seq_len(nrow(subgroup_specs)), function(k) {
+    g <- subgroup_specs$label[k]; gv <- subgroup_specs$var[k]
+    pi <- p_interaction(data, exposure, gv, extra_rhs, time_vars)
+    map_dfr(levels(droplevels(data[[gv]])), function(lv) {
+      sub <- data %>% filter(.data[[gv]] == lv)
+      cv  <- setdiff(c(base_covs, extra_rhs), drop_in_strata[[gv]])
+      fit <- fit_cox(sub, unique(c(exposure, cv)), time_vars)
+      if (is.null(fit) || !(exposure %in% names(coef(fit))))
+        return(tibble(group=g, stratum=lv, n_int=nrow(sub),
+                      n_ev=sum(sub[[time_vars[3]]]==1, na.rm=TRUE),
+                      HR=NA_real_, lo=NA_real_, hi=NA_real_, p_int=pi))
+      cf <- summary(fit)$conf.int
+      tibble(group=g, stratum=lv, n_int=fit$n, n_ev=fit$nevent,
+             HR=cf[exposure,1], lo=cf[exposure,3], hi=cf[exposure,4], p_int=pi)
+    })
+  }) %>% group_by(group) %>%
+    mutate(p_int=if_else(row_number()==1, p_int, NA_real_)) %>% ungroup()
+}
+run_m4_frailty <- function(data, time_vars)
+  run_m4_binary(data, "frailty_lag", time_vars,
+                extra_rhs = c("hearing_lag","vision_lag"))
+
+run_m5 <- function(data, time_vars = m5_time) {
+  exposure <- "ctx_lag"
+  map_dfr(seq_len(nrow(subgroup_specs)), function(k) {
+    g <- subgroup_specs$label[k]; gv <- subgroup_specs$var[k]
+    pi <- p_interaction(data, exposure, gv, NULL, time_vars)
+    map_dfr(levels(droplevels(data[[gv]])), function(lv) {
+      sub <- data %>% filter(.data[[gv]] == lv)
+      sub[[exposure]] <- droplevels(sub[[exposure]])
+      cv <- setdiff(base_covs, drop_in_strata[[gv]])
+      fit <- fit_cox(sub, c(exposure, cv), time_vars)
+      out <- tibble(group=g, stratum=lv,
+                    n_int=if (is.null(fit)) nrow(sub) else fit$n,
+                    n_ev =if (is.null(fit))
+                      sum(sub[[time_vars[3]]]==1, na.rm=TRUE) else fit$nevent,
+                    HR_1=NA_real_,lo_1=NA_real_,hi_1=NA_real_,
+                    HR_2=NA_real_,lo_2=NA_real_,hi_2=NA_real_, p_int=pi)
+      if (!is.null(fit)) {
+        cf <- summary(fit)$conf.int
+        t1 <- m5_term(fit, "before"); t2 <- m5_term(fit, "after")
+        if (!is.na(t1)) { out$HR_1 <- cf[t1,1]; out$lo_1 <- cf[t1,3]; out$hi_1 <- cf[t1,4] }
+        if (!is.na(t2)) { out$HR_2 <- cf[t2,1]; out$lo_2 <- cf[t2,3]; out$hi_2 <- cf[t2,4] }
+      }
+      out
+    })
+  }) %>% group_by(group) %>%
+    mutate(p_int=if_else(row_number()==1, p_int, NA_real_)) %>% ungroup()
+}
+
+res_m4_hearing <- run_m4_binary(tv_cc, "hearing_lag", tv_time, extra_rhs="frailty_lag")
+res_m4_vision  <- run_m4_binary(tv_cc, "vision_lag",  tv_time, extra_rhs="frailty_lag")
+res_m4_frailty <- run_m4_frailty(tv_cc, tv_time)
+res_m5_hearing <- run_m5(df_tv_hearing)
+res_m5_vision  <- run_m5(df_tv_vision)
+
+# Sanity check: within each subgrouping, the strata add up to the full sample
+chk_strata <- function(res, dat, ev, label) {
+  tot <- res %>% group_by(group) %>%
+    summarise(n_int = sum(n_int), n_ev = sum(n_ev), .groups = "drop")
+  stopifnot(all(tot$n_int == nrow(dat)), all(tot$n_ev == sum(dat[[ev]])))
+  cat(sprintf("Check [%s]: strata add up to %d intervals and %d events\n",
+              label, nrow(dat), sum(dat[[ev]])))
+}
+chk_strata(res_m4_hearing, tv_cc, "event", "M4 hearing")
+chk_strata(res_m4_vision,  tv_cc, "event", "M4 vision")
+chk_strata(res_m4_frailty, tv_cc, "event", "M4 frailty")
+chk_strata(res_m5_hearing, df_tv_hearing, "dementia_event", "M5 hearing")
+chk_strata(res_m5_vision,  df_tv_vision,  "dementia_event", "M5 vision")
+
+```
+
+
+# Calculate PAF for subgroup analysis
+```{r}
+# Subgroup PAF — Models 1-5 (ELSA, dementia outcome)
+# For every subgroup level we:
+#   (1) subset the analytic dataset to that stratum,
+#   (2) refit the model on that stratum (dropping the stratifier from RHS),
+#   (3) recompute person-time-weighted exposure prevalence in that stratum,
+#   (4) compute PAF (+ 95% CI via parametric bootstrap on log-HR).
+#
+# Dependencies expected in the environment:
+#   tv_cc, df_tv_hearing, df_tv_vision (already augmented with
+#   age_cat / sex_cat by add_subgroup_factors above).
+# ============================================================================
+
+library(survival); library(dplyr); library(purrr); library(tibble); library(tidyr)
+set.seed(20260509)
+
+stopifnot(exists("res_m4_hearing"), "age_cat" %in% names(tv_cc))
+
+SG_SEED <- if (exists("PAF_SEED")) PAF_SEED else 20260509
+SG_NSIM <- if (exists("PAF_NSIM")) PAF_NSIM else 10000
+
+# ---- PAF helpers (own names, so the primary helpers stay intact) -----------
+sg_levin <- function(p, HR) (p * (HR - 1)) / (p * (HR - 1) + 1)
+
+sg_paf_ci_binary <- function(fit, term, p, nsim = SG_NSIM, seed = SG_SEED) {
+  b <- unname(coef(fit)[term])
+  V <- vcov(fit)[term, term]                 # robust (cluster) variance
+  if (is.na(b) || !is.finite(V) || V <= 0)
+    return(tibble(HR = NA_real_, PAF = NA_real_, lcl = NA_real_, ucl = NA_real_))
+  set.seed(seed)
+  pafs <- sg_levin(p, exp(rnorm(nsim, mean = b, sd = sqrt(V))))
+  tibble(HR  = exp(b),
+         PAF = sg_levin(p, exp(b)),
+         lcl = unname(quantile(pafs, 0.025)),
+         ucl = unname(quantile(pafs, 0.975)))
+}
+
+sg_paf_ci_multicat <- function(fit, terms, p_vec, labels,
+                               nsim = SG_NSIM, seed = SG_SEED) {
+  b <- unname(coef(fit)[terms])
+  V <- vcov(fit)[terms, terms, drop = FALSE]
+  if (any(is.na(b)) || any(!is.finite(diag(V))))
+    return(tibble(component = c("Total", labels),
+                  HR  = NA_real_, PAF = NA_real_, lcl = NA_real_, ucl = NA_real_))
+  set.seed(seed)
+  sims <- MASS::mvrnorm(nsim, mu = b, Sigma = V)
+  if (is.vector(sims)) sims <- matrix(sims, ncol = length(terms))
+  comp_sim <- sweep(exp(sims) - 1, 2, p_vec, `*`)
+  s_sim    <- rowSums(comp_sim)
+  comp_est <- p_vec * (exp(b) - 1)
+  s_est    <- sum(comp_est)
+  q <- function(x, pr) unname(quantile(x, pr))
+  tibble(component = c("Total", labels),
+         HR  = c(NA_real_, exp(b)),
+         PAF = c(s_est / (1 + s_est), comp_est / (1 + s_est)),
+         lcl = c(q(s_sim / (1 + s_sim), 0.025), apply(comp_sim / (1 + s_sim), 2, q, 0.025)),
+         ucl = c(q(s_sim / (1 + s_sim), 0.975), apply(comp_sim / (1 + s_sim), 2, q, 0.975)))
+}
+
+sg_prev_binary <- function(dat, var, ts, tp) {
+  pt <- dat[[tp]] - dat[[ts]]
+  x  <- dat[[var]]
+  ok <- !is.na(x) & !is.na(pt)
+  if (!any(ok)) return(NA_real_)
+  sum(pt[ok][x[ok] == 1]) / sum(pt[ok])
+}
+
+sg_prev_factor <- function(dat, var, ts, tp) {
+  pt    <- dat[[tp]] - dat[[ts]]
+  x     <- dat[[var]]
+  total <- sum(pt, na.rm = TRUE)
+  setNames(vapply(levels(x), function(lv) sum(pt[x == lv], na.rm = TRUE) / total,
+                  numeric(1)), levels(x))
+}
+
+# ----- Models 1-4: binary exposure -----
+# For M4, hearing/vision get frailty_lag as a covariate; frailty uses the
+# mutually adjusted Cox (as in the primary analysis).
+build_rhs_14 <- function(model_id, exposure, gv) {
+  drop <- drop_in_strata[[gv]]
+  if (model_id == "M1") return(exposure)
+  if (model_id == "M2") return(unique(c(exposure, setdiff("baseline_age", drop))))
+  if (model_id == "M3") return(unique(c(exposure, setdiff(base_covs, drop))))
+  if (model_id == "M4") {
+    if (exposure == "frailty_lag")
+      return(unique(c("hearing_lag", "vision_lag", "frailty_lag", setdiff(base_covs, drop))))
+    return(unique(c(exposure, "frailty_lag", setdiff(base_covs, drop))))
+  }
+  stop("Unknown model_id: ", model_id)
+}
+
+paf_subgroup_14 <- function(data, exposure, time_vars, model_id, exposure_label) {
+  map_dfr(seq_len(nrow(subgroup_specs)), function(k) {
+    g  <- subgroup_specs$label[k]
+    gv <- subgroup_specs$var[k]
+    map_dfr(levels(droplevels(data[[gv]])), function(lv) {
+      sub <- data %>% filter(.data[[gv]] == lv)
+      p   <- sg_prev_binary(sub, exposure, time_vars[1], time_vars[2])
+      fit <- fit_cox(sub, build_rhs_14(model_id, exposure, gv), time_vars)
+      if (is.null(fit) || !(exposure %in% names(coef(fit))) || is.na(p) || p <= 0)
+        return(tibble(model = model_id, exposure = exposure_label,
+                      group = g, stratum = lv,
+                      n_int = nrow(sub),
+                      n_ev  = sum(sub[[time_vars[3]]] == 1, na.rm = TRUE),
+                      p_pt = p, HR = NA_real_, PAF = NA_real_,
+                      PAF_lcl = NA_real_, PAF_ucl = NA_real_))
+      res <- sg_paf_ci_binary(fit, exposure, p)
+      tibble(model = model_id, exposure = exposure_label,
+             group = g, stratum = lv,
+             n_int = fit$n, n_ev = fit$nevent,
+             p_pt = p, HR = res$HR,
+             PAF = res$PAF, PAF_lcl = res$lcl, PAF_ucl = res$ucl)
+    })
+  })
+}
+
+# ----- Model 5: 3-level ctx_lag -----
+paf_subgroup_5 <- function(data, model_label, time_vars = m5_time) {
+  map_dfr(seq_len(nrow(subgroup_specs)), function(k) {
+    g  <- subgroup_specs$label[k]
+    gv <- subgroup_specs$var[k]
+    map_dfr(levels(droplevels(data[[gv]])), function(lv) {
+      sub <- data %>% filter(.data[[gv]] == lv)
+      sub$ctx_lag <- droplevels(sub$ctx_lag)
+      cv  <- setdiff(base_covs, drop_in_strata[[gv]])
+      fit <- fit_cox(sub, c("ctx_lag", cv), time_vars)
+
+      empty <- function(n_int, n_ev)
+        tibble(model = model_label, exposure = "Total", group = g, stratum = lv,
+               n_int = n_int, n_ev = n_ev, p_pt = NA_real_, HR = NA_real_,
+               PAF = NA_real_, PAF_lcl = NA_real_, PAF_ucl = NA_real_)
+      if (is.null(fit))
+        return(empty(nrow(sub), sum(sub[[time_vars[3]]] == 1, na.rm = TRUE)))
+
+      terms        <- intersect(paste0("ctx_lag", levels(sub$ctx_lag)[-1]), names(coef(fit)))
+      exposed_lvls <- sub("^ctx_lag", "", terms)
+      p_exposed    <- sg_prev_factor(sub, "ctx_lag", time_vars[1], time_vars[2])[exposed_lvls]
+      if (!length(terms) || any(is.na(p_exposed)) || any(p_exposed <= 0))
+        return(empty(fit$n, fit$nevent))
+
+      sg_paf_ci_multicat(fit, terms, p_exposed, exposed_lvls) %>%
+        mutate(model = model_label,
+               exposure = component,
+               group = g, stratum = lv,
+               n_int = fit$n, n_ev = fit$nevent,
+               p_pt = c(sum(p_exposed), unname(p_exposed))) %>%
+        dplyr::select(model, exposure, group, stratum, n_int, n_ev,
+                      p_pt, HR, PAF, PAF_lcl = lcl, PAF_ucl = ucl)
+    })
+  })
+}
+
+# ============================================================================
+# Run Models 1-4 by subgroup
+# ============================================================================
+paf_sg_14 <- bind_rows(lapply(c("M1", "M2", "M3", "M4"), function(m) bind_rows(
+  paf_subgroup_14(tv_cc, "hearing_lag", tv_time, m, "Hearing loss"),
+  paf_subgroup_14(tv_cc, "vision_lag",  tv_time, m, "Vision loss"),
+  paf_subgroup_14(tv_cc, "frailty_lag", tv_time, m, "Frailty"))))
+
+# ============================================================================
+# Run Model 5 by subgroup (hearing context + vision context)
+# ============================================================================
+paf_sg_5 <- bind_rows(
+  paf_subgroup_5(df_tv_hearing, "M5 (hearing context)"),
+  paf_subgroup_5(df_tv_vision,  "M5 (vision context)")
+)
+
+# The M4 and M5 HRs here come from the same stratum fits as CHUNK 1
+stopifnot(isTRUE(all.equal(
+  paf_sg_14 %>% filter(model == "M4", exposure == "Hearing loss") %>% pull(HR),
+  res_m4_hearing$HR, tolerance = 1e-8)))
+
+# ============================================================================
+# Combined subgroup PAF table
+# ============================================================================
+paf_subgroup_all <- bind_rows(paf_sg_14, paf_sg_5) %>%
+  mutate(
+    HR_fmt  = ifelse(is.na(HR), NA_character_, sprintf("%.2f", HR)),
+    PAF_fmt = ifelse(is.na(PAF), NA_character_,
+                     sprintf("%.1f%% (%.1f%%, %.1f%%)",
+                             100 * PAF, 100 * PAF_lcl, 100 * PAF_ucl))
+  ) %>%
+  dplyr::select(model, exposure, group, stratum,
+                n_int, n_ev, p_pt, HR, HR_fmt,
+                PAF, PAF_lcl, PAF_ucl, PAF_fmt)
+
+cat("\n=== Subgroup PAF: Models 1-5 (ELSA) ===\n")
+print(paf_subgroup_all, n = Inf)
+
+
+# ============================================================================
+# Combine Cox subgroup HRs + PAFs into one tidy table for forest plots
+# ============================================================================
+# ---- 1) Cox subgroup HRs in a common long format ---------------------------
+tidy_m4 <- function(d, exposure_label) {
+  d %>%
+    transmute(model = "M4", exposure = exposure_label,
+              group, stratum, n_int, n_ev,
+              HR, HR_lcl = lo, HR_ucl = hi, p_int)
+}
+
+tidy_m5 <- function(d, ctx) {
+  # ctx is "hearing" or "vision"; level 1 = before frailty onset,
+  # level 2 = with or after frailty onset (matched by name in run_m5)
+  d %>%
+    pivot_longer(cols = c(HR_1, lo_1, hi_1, HR_2, lo_2, hi_2),
+                 names_to = c(".value", "lvl"), names_pattern = "(HR|lo|hi)_(\\d)") %>%
+    mutate(model    = paste0("M5 (", ctx, " context)"),
+           exposure = if_else(lvl == "1", paste0(ctx, ", no frailty yet"),
+                                          paste0(ctx, ", frailty present"))) %>%
+    transmute(model, exposure, group, stratum, n_int, n_ev,
+              HR, HR_lcl = lo, HR_ucl = hi, p_int)
+}
+
+hr_long <- bind_rows(
+  tidy_m4(res_m4_hearing, "Hearing loss"),
+  tidy_m4(res_m4_vision,  "Vision loss"),
+  tidy_m4(res_m4_frailty, "Frailty"),
+  tidy_m5(res_m5_hearing, "hearing"),
+  tidy_m5(res_m5_vision,  "vision")
+)
+
+# ---- 2) PAF labels in the short form used by hr_long -----------------------
+paf_join <- paf_subgroup_all %>%
+  filter(model %in% c("M4", "M5 (hearing context)", "M5 (vision context)")) %>%
+  mutate(exposure = case_when(
+    grepl("^Hearing loss, ", exposure) ~ sub("^Hearing loss", "hearing", exposure),
+    grepl("^Vision loss, ",  exposure) ~ sub("^Vision loss",  "vision",  exposure),
+    TRUE ~ exposure)) %>%
+  dplyr::select(model, exposure, group, stratum, n_int, n_ev,
+                p_pt, PAF, PAF_lcl, PAF_ucl)
+
+# ---- 3) Master long table (HR + PAF); M5 totals kept as PAF-only rows -------
+forest_long <- hr_long %>%
+  left_join(paf_join %>% dplyr::select(-n_int, -n_ev),
+            by = c("model", "exposure", "group", "stratum")) %>%
+  bind_rows(paf_join %>% filter(exposure == "Total") %>%
+              mutate(HR = NA_real_, HR_lcl = NA_real_, HR_ucl = NA_real_,
+                     p_int = NA_real_)) %>%
+  mutate(
+    HR_fmt  = ifelse(is.na(HR),  NA_character_,
+                     sprintf("%.2f (%.2f-%.2f)", HR,  HR_lcl,  HR_ucl)),
+    PAF_fmt = ifelse(is.na(PAF), NA_character_,
+                     sprintf("%.1f%% (%.1f%%, %.1f%%)",
+                             100*PAF, 100*PAF_lcl, 100*PAF_ucl)),
+    p_int_fmt = ifelse(is.na(p_int), NA_character_,
+                       ifelse(p_int < 0.001, "<0.001", sprintf("%.3f", p_int)))
+  ) %>%
+  arrange(factor(model, levels = c("M4", "M5 (hearing context)", "M5 (vision context)")),
+          factor(exposure, levels = unique(c(hr_long$exposure, "Total"))),
+          group, factor(stratum, levels = c(levels(tv_cc$age_cat), levels(tv_cc$sex_cat)))) %>%
+  dplyr::select(model, exposure, group, stratum,
+                n_int, n_ev, p_pt,
+                HR, HR_lcl, HR_ucl, HR_fmt,
+                PAF, PAF_lcl, PAF_ucl, PAF_fmt,
+                p_int, p_int_fmt)
+
+stopifnot(!anyNA(forest_long$PAF))   # every HR row found its PAF
+
+cat("\n=== Combined subgroup HR + PAF (forest-plot ready) ===\n")
+print(forest_long, n = Inf)
+
+# ---- 4) Save everything in one place ---------------------------------------
+
+subgroup_ELSA <- list(
+  cox = list(m4_h = res_m4_hearing, m4_v = res_m4_vision, m4_f = res_m4_frailty,
+             m5_h = res_m5_hearing, m5_v = res_m5_vision),
+  paf    = paf_subgroup_all,
+  forest = forest_long
+)
+
+saveRDS(subgroup_ELSA, file.path(results_dir, "subgroup_ELSA.rds"))
+write.csv(forest_long,       file.path(results_dir, "subgroup_ELSA_forest.csv"), row.names = FALSE)
+write.csv(paf_subgroup_all,  file.path(results_dir, "subgroup_ELSA_paf.csv"),    row.names = FALSE)
+
+```
+
+
+# ELSA sensitivity analysis: exposures lagged by two waves (~4 years)
+```{r}
+# 1) Two-wave lag data
+# ELSA waves are biennial -> 2 waves = 4 years on the (year - baseline_year)
+# scale used for Models 1-5.
+LAG_WAVES <- 2
+
+# The primary interval build (tv_dat -> tv_cc) with lag(x, k) for the
+# time-varying variables. k = 1 gives tv_cc back (checked below).
+build_tv_wave_lag <- function(k) {
+  out <- df0 %>%
+    group_by(idauniq) %>%
+    mutate(
+      tstart      = lag(time),
+      tstop       = time,
+      event       = dementia,
+
+      # status k assessed waves before the outcome wave
+      exp_year    = lag(year, k),
+      hearing_lag = lag(hearing_loss, k),
+      vision_lag  = lag(vision_overall, k),
+      frailty_lag = lag(frailty, k),
+
+      emp_lag     = lag(Employment, k),
+      smoke_lag   = lag(Smoking, k),
+      alcohol_lag = lag(Alcohol, k)
+    ) %>%
+    ungroup() %>%
+    filter(!is.na(tstart), tstop > tstart) %>%
+    group_by(idauniq) %>%
+    mutate(event_cum = cumsum(event)) %>%
+    filter(event_cum <= 1) %>%
+    ungroup() %>%
+    dplyr::select(-event_cum) %>%
+    filter(
+      !is.na(hearing_lag), !is.na(vision_lag), !is.na(frailty_lag),
+      !is.na(emp_lag),    !is.na(smoke_lag),  !is.na(alcohol_lag),
+      !is.na(baseline_age),
+      !is.na(Gender), !is.na(Race), !is.na(Education), !is.na(Marital_status)
+    )
+  stopifnot(!anyNA(out$event))
+  out
+}
+
+# Frailty history at each wave, from every observed wave (as in
+# build_m5_dataset(): recorded frail at this wave or any earlier one)
+frail_history <- panel_df_eligible %>%
+  mutate(
+    idauniq        = as.character(idauniq),
+    year          = as.integer(year),
+    baseline_year = as.integer(baseline_year),
+    time          = as.numeric(year - baseline_year),
+    .frail        = as.integer(frailty)
+  ) %>%
+  arrange(idauniq, time) %>%
+  group_by(idauniq) %>%
+  mutate(frail_hist = cummax(coalesce(.frail, 0L))) %>%
+  ungroup() %>%
+  dplyr::select(idauniq, exp_year = year, frail_hist_exp = frail_hist)
+stopifnot(!anyDuplicated(frail_history[c("idauniq", "exp_year")]))
+
+# Model 5 data: sensory status and frailty history at the exposure wave
+build_m5_wave_lag <- function(dat, sensory_lag, sensory_label) {
+  out <- dat %>%
+    left_join(frail_history, by = c("idauniq", "exp_year")) %>%
+    mutate(
+      start          = tstart,
+      stop           = tstop,
+      dementia_event = as.integer(event),
+      sensory_exp    = as.integer(.data[[sensory_lag]]),
+      ctx_num = case_when(
+        sensory_exp == 0                       ~ 0L,
+        sensory_exp == 1 & frail_hist_exp == 0 ~ 1L,
+        sensory_exp == 1 & frail_hist_exp == 1 ~ 2L,
+        TRUE                                   ~ NA_integer_
+      ),
+      ctx_lag   = factor(ctx_num, levels = 0:2, labels = m5_labels(sensory_label)),
+      age_start = baseline_age + start
+    )
+  stopifnot(
+    nrow(out) == nrow(dat),
+    !anyNA(out$ctx_lag),
+    all(out$frail_hist_exp[out$frailty_lag == 1] == 1),
+    all(tapply(out$dementia_event, out$idauniq, sum) <= 1)
+  )
+  out
+}
+
+# ---- Checks against the main analysis ----------------------------------------
+chk_key <- c("idauniq", "tstart", "tstop", "event", "hearing_lag", "vision_lag",
+             "frailty_lag", "emp_lag", "smoke_lag", "alcohol_lag")
+chk <- build_tv_wave_lag(1)
+stopifnot(
+  "lag(x, 1) does not reproduce tv_cc: rerun the primary data build" =
+    nrow(chk) == nrow(tv_cc) &&
+    isTRUE(all.equal(as.data.frame(chk[chk_key]), as.data.frame(tv_cc[chk_key]),
+                     check.attributes = FALSE)),
+  "Model 5 builder does not reproduce df_tv_hearing / df_tv_vision: rerun the primary Model 5 chunk" =
+    identical(as.character(build_m5_wave_lag(chk, "hearing_lag", "Hearing loss")$ctx_lag),
+              as.character(df_tv_hearing$ctx_lag)) &&
+    identical(as.character(build_m5_wave_lag(chk, "vision_lag", "Vision loss")$ctx_lag),
+              as.character(df_tv_vision$ctx_lag))
+)
+rm(chk, chk_key)
+
+# ---- Analytic sample ---------------------------------------------------------
+tv_cc_lag <- build_tv_wave_lag(LAG_WAVES)
+
+sens_counts <- function(dat, label)
+  cat(sprintf("%-30s intervals = %s | persons = %s | events = %s | person-years = %s\n",
+              label,
+              format(nrow(dat), big.mark = ","),
+              format(n_distinct(dat$idauniq), big.mark = ","),
+              format(sum(dat$event == 1), big.mark = ","),
+              format(round(sum(dat$tstop - dat$tstart)), big.mark = ",")))
+
+cat("\n=== Exposures lagged by", LAG_WAVES, "waves ===\n")
+sens_counts(tv_cc,     "Main analysis (1-wave lag)")
+sens_counts(tv_cc_lag, "Two-wave lag (tv_cc_lag)")
+
+cat("\nYears from exposure wave to outcome wave (intervals):\n")
+cat("  Main analysis:\n");  print(table(tv_cc$tstop - tv_cc$tstart))
+cat("  Two-wave lag:\n")
+print(table(tv_cc_lag$baseline_year + tv_cc_lag$tstop - tv_cc_lag$exp_year))
+
+
+# ============================================================================
+# 2) Models 1-5 on the two-wave lag data (formulas as in the main analysis)
+# ============================================================================
+fit_m1_hearing_lag <- coxph(
+  Surv(tstart, tstop, event) ~ hearing_lag + cluster(idauniq),
+  data = tv_cc_lag, ties = "efron")
+fit_m1_vision_lag <- coxph(
+  Surv(tstart, tstop, event) ~ vision_lag + cluster(idauniq),
+  data = tv_cc_lag, ties = "efron")
+fit_m1_frailty_lag <- coxph(
+  Surv(tstart, tstop, event) ~ frailty_lag + cluster(idauniq),
+  data = tv_cc_lag, ties = "efron")
+
+fit_m2_hearing_lag <- coxph(
+  Surv(tstart, tstop, event) ~ hearing_lag + baseline_age + cluster(idauniq),
+  data = tv_cc_lag, ties = "efron")
+fit_m2_vision_lag <- coxph(
+  Surv(tstart, tstop, event) ~ vision_lag + baseline_age + cluster(idauniq),
+  data = tv_cc_lag, ties = "efron")
+fit_m2_frailty_lag <- coxph(
+  Surv(tstart, tstop, event) ~ frailty_lag + baseline_age + cluster(idauniq),
+  data = tv_cc_lag, ties = "efron")
+
+fit_m3_hearing_lag <- coxph(
+  Surv(tstart, tstop, event) ~ hearing_lag +
+    baseline_age + Gender + Race + Education + Marital_status +
+    emp_lag + smoke_lag + alcohol_lag + cluster(idauniq),
+  data = tv_cc_lag, ties = "efron")
+fit_m3_vision_lag <- coxph(
+  Surv(tstart, tstop, event) ~ vision_lag +
+    baseline_age + Gender + Race + Education + Marital_status +
+    emp_lag + smoke_lag + alcohol_lag + cluster(idauniq),
+  data = tv_cc_lag, ties = "efron")
+fit_m3_frailty_lag <- coxph(
+  Surv(tstart, tstop, event) ~ frailty_lag +
+    baseline_age + Gender + Race + Education + Marital_status +
+    emp_lag + smoke_lag + alcohol_lag + cluster(idauniq),
+  data = tv_cc_lag, ties = "efron")
+
+fit_m4_hearing_lag <- coxph(
+  Surv(tstart, tstop, event) ~ hearing_lag +
+    baseline_age + Gender + Race + Education + Marital_status +
+    emp_lag + smoke_lag + alcohol_lag + frailty_lag + cluster(idauniq),
+  data = tv_cc_lag, ties = "efron")
+fit_m4_vision_lag <- coxph(
+  Surv(tstart, tstop, event) ~ vision_lag +
+    baseline_age + Gender + Race + Education + Marital_status +
+    emp_lag + smoke_lag + alcohol_lag + frailty_lag + cluster(idauniq),
+  data = tv_cc_lag, ties = "efron")
+fit_m4_frailty_lag <- coxph(
+  Surv(tstart, tstop, event) ~
+    hearing_lag + vision_lag + frailty_lag +
+    baseline_age + Gender + Race + Education + Marital_status +
+    emp_lag + smoke_lag + alcohol_lag + cluster(idauniq),
+  data = tv_cc_lag, ties = "efron")
+
+cat("\n--- PH check, Model 4 (two-wave lag), global test ---\n")
+print(rbind(
+  hearing = cox.zph(fit_m4_hearing_lag)$table["GLOBAL", ],
+  vision  = cox.zph(fit_m4_vision_lag)$table["GLOBAL", ],
+  frailty = cox.zph(fit_m4_frailty_lag)$table["GLOBAL", ]
+))
+
+# ---- Model 5 -------------------------------------------------------------------
+df_tv_hearing_lag <- build_m5_wave_lag(tv_cc_lag, "hearing_lag", "Hearing loss")
+df_tv_vision_lag  <- build_m5_wave_lag(tv_cc_lag, "vision_lag",  "Vision loss")
+
+fit_m5_hearing_lag <- fit_m5(df_tv_hearing_lag, "HEARING (two-wave lag)")
+fit_m5_vision_lag  <- fit_m5(df_tv_vision_lag,  "VISION (two-wave lag)")
+
+stopifnot(
+  "Model 5 and Model 4 use different events" =
+    fit_m5_hearing_lag$nevent == fit_m4_hearing_lag$nevent &&
+    fit_m5_vision_lag$nevent  == fit_m4_hearing_lag$nevent
+)
+
+m5_tab_hearing_lag <- m5_category_table(fit_m5_hearing_lag, "HEARING (two-wave lag)")
+m5_tab_vision_lag  <- m5_category_table(fit_m5_vision_lag,  "VISION (two-wave lag)")
+
+m5_con_hearing_lag <- contrast_frailty_vs_no_frailty(fit_m5_hearing_lag, "HEARING (two-wave lag)")
+m5_con_vision_lag  <- contrast_frailty_vs_no_frailty(fit_m5_vision_lag,  "VISION (two-wave lag)")
+
+```
+
+
+```{r}
+# ============================================================================
+# 3) HR, P and Levin PAF 
+#    sens_ helpers are copies of the primary PAF helpers, so a later chunk
+#    that redefines paf_ci_binary() etc. cannot change these results.
+# ============================================================================
+sens_levin <- function(p, HR) (p * (HR - 1)) / (p * (HR - 1) + 1)
+
+sens_prev_binary <- function(dat, var, ts, tp) {
+  pt <- dat[[tp]] - dat[[ts]]
+  x  <- dat[[var]]
+  sum(pt[x == 1], na.rm = TRUE) / sum(pt, na.rm = TRUE)
+}
+
+sens_prev_factor <- function(dat, var, ts, tp) {
+  pt    <- dat[[tp]] - dat[[ts]]
+  x     <- dat[[var]]
+  total <- sum(pt, na.rm = TRUE)
+  setNames(vapply(levels(x), function(lv) sum(pt[x == lv], na.rm = TRUE) / total,
+                  numeric(1)), levels(x))
+}
+
+sens_paf_binary <- function(fit, term, p, nsim = PAF_NSIM, seed = PAF_SEED) {
+  b <- unname(coef(fit)[term])
+  V <- vcov(fit)[term, term]                 # robust (cluster) variance
+  stopifnot(!is.na(b), V > 0)
+  set.seed(seed)
+  sims <- rnorm(nsim, mean = b, sd = sqrt(V))
+  pafs <- sens_levin(p, exp(sims))
+  z    <- qnorm(0.975)
+  tibble(
+    HR      = exp(b),
+    HR_lcl  = exp(b - z * sqrt(V)),
+    HR_ucl  = exp(b + z * sqrt(V)),
+    P       = summary(fit)$coefficients[term, "Pr(>|z|)"],
+    PAF     = sens_levin(p, exp(b)),
+    PAF_lcl = unname(quantile(pafs, 0.025, na.rm = TRUE)),
+    PAF_ucl = unname(quantile(pafs, 0.975, na.rm = TRUE))
+  )
+}
+
+sens_paf_multicat <- function(fit, terms, p_vec, labels,
+                              nsim = PAF_NSIM, seed = PAF_SEED) {
+  b <- unname(coef(fit)[terms])
+  V <- vcov(fit)[terms, terms, drop = FALSE]
+  set.seed(seed)
+  sims <- MASS::mvrnorm(nsim, mu = b, Sigma = V)
+  if (is.vector(sims)) sims <- matrix(sims, ncol = length(terms))
+  HRs <- exp(sims)
+
+  # Levin, partitioned so that components add up to the total
+  comp_mat      <- sweep(HRs - 1, 2, p_vec, `*`)
+  s_all         <- rowSums(comp_mat)
+  paf_total_sim <- s_all / (1 + s_all)
+  paf_comp_sim  <- comp_mat / (1 + s_all)
+
+  HR_est    <- exp(b)
+  se        <- sqrt(diag(V))
+  comp_est  <- p_vec * (HR_est - 1)
+  s_all_est <- sum(comp_est)
+  z <- qnorm(0.975)
+  q <- function(x, pr) unname(quantile(x, pr, na.rm = TRUE))
+
+  tibble(
+    component = c("Total", labels),
+    HR      = c(NA_real_, HR_est),
+    HR_lcl  = c(NA_real_, exp(b - z * se)),
+    HR_ucl  = c(NA_real_, exp(b + z * se)),
+    P       = c(NA_real_, summary(fit)$coefficients[terms, "Pr(>|z|)"]),
+    PAF     = c(s_all_est / (1 + s_all_est), comp_est / (1 + s_all_est)),
+    PAF_lcl = c(q(paf_total_sim, 0.025), apply(paf_comp_sim, 2, q, 0.025)),
+    PAF_ucl = c(q(paf_total_sim, 0.975), apply(paf_comp_sim, 2, q, 0.975))
+  )
+}
+
+# Check: the helpers give the main-analysis Model 4 hearing PAF exactly
+ref <- paf_models_1_4 %>% filter(grepl("^M4", model), exposure == "Hearing loss")
+chk <- sens_paf_binary(fit_m4_hearing, "hearing_lag",
+                       sens_prev_binary(tv_cc, "hearing_lag", "tstart", "tstop"))
+stopifnot(
+  "PAF helpers do not reproduce the main-analysis PAF" =
+    nrow(ref) == 1 &&
+    isTRUE(all.equal(c(ref$HR, ref$PAF, ref$PAF_lcl, ref$PAF_ucl),
+                     c(chk$HR, chk$PAF, chk$PAF_lcl, chk$PAF_ucl)))
+)
+rm(ref, chk)
+
+# ---- Models 1-4 --------------------------------------------------------------
+m14_spec <- tribble(
+  ~model,    ~exposure,            ~fit,                 ~term,
+  "Model 1", "Hearing impairment", "fit_m1_hearing_lag", "hearing_lag",
+  "Model 1", "Vision impairment",  "fit_m1_vision_lag",  "vision_lag",
+  "Model 1", "Frailty",            "fit_m1_frailty_lag", "frailty_lag",
+  "Model 2", "Hearing impairment", "fit_m2_hearing_lag", "hearing_lag",
+  "Model 2", "Vision impairment",  "fit_m2_vision_lag",  "vision_lag",
+  "Model 2", "Frailty",            "fit_m2_frailty_lag", "frailty_lag",
+  "Model 3", "Hearing impairment", "fit_m3_hearing_lag", "hearing_lag",
+  "Model 3", "Vision impairment",  "fit_m3_vision_lag",  "vision_lag",
+  "Model 3", "Frailty",            "fit_m3_frailty_lag", "frailty_lag",
+  "Model 4", "Hearing impairment", "fit_m4_hearing_lag", "hearing_lag",
+  "Model 4", "Vision impairment",  "fit_m4_vision_lag",  "vision_lag",
+  "Model 4", "Frailty",            "fit_m4_frailty_lag", "frailty_lag"
+)
+
+paf_models_1_4_lag <- bind_rows(lapply(seq_len(nrow(m14_spec)), function(i) {
+  fit <- get(m14_spec$fit[i]); term <- m14_spec$term[i]
+  stopifnot(fit$n == nrow(tv_cc_lag))        # every model on the same rows
+  p <- sens_prev_binary(tv_cc_lag, term, "tstart", "tstop")
+  tibble(model = m14_spec$model[i], exposure = m14_spec$exposure[i], p_pt = p) %>%
+    bind_cols(sens_paf_binary(fit, term, p))
+}))
+
+# ---- Model 5 -----------------------------------------------------------------
+paf_model5_lag <- function(fit, label) {
+  dat     <- attr(fit, "used")                 # rows the model used
+  exposed <- levels(dat$ctx_lag)[-1]
+  p_exp   <- sens_prev_factor(dat, "ctx_lag", "start", "stop")[exposed]
+  terms   <- paste0("ctx_lag", exposed)
+  stopifnot(all(terms %in% names(coef(fit))), all(p_exp > 0))
+  tab <- sens_paf_multicat(fit, terms, p_exp, exposed)
+  stopifnot(abs(sum(tab$PAF[-1]) - tab$PAF[1]) < 1e-10)   # components add up
+  tab %>%
+    transmute(model = label,
+              exposure = ifelse(component == "Total", "Total context PAF", component),
+              p_pt = c(sum(p_exp), unname(p_exp)),
+              HR, HR_lcl, HR_ucl, P, PAF, PAF_lcl, PAF_ucl)
+}
+
+paf_m5_hearing_lag <- paf_model5_lag(fit_m5_hearing_lag, "Model 5 (hearing context)")
+paf_m5_vision_lag  <- paf_model5_lag(fit_m5_vision_lag,  "Model 5 (vision context)")
+
+# ---- Combined, formatted as in the supplement -------------------------------
+paf_all_lag <- bind_rows(paf_models_1_4_lag, paf_m5_hearing_lag, paf_m5_vision_lag) %>%
+  mutate(
+    HR_CI  = ifelse(is.na(HR), "", sprintf("%.2f (%.2f-%.2f)", HR, HR_lcl, HR_ucl)),
+    P_fmt  = ifelse(is.na(P), "", ifelse(P < 0.001, "P < 0.001", sprintf("P = %.3f", P))),
+    PAF_CI = sprintf("%.1f%% (%.1f to %.1f)", 100 * PAF, 100 * PAF_lcl, 100 * PAF_ucl)
+  )
+
+local({
+  op <- options(width = 200); on.exit(options(op))
+  cat("\n=== Supplementary Table 45 (ELSA): exposures lagged by two waves, Models 1-4 ===\n")
+  print(as.data.frame(paf_all_lag %>% filter(!grepl("^Model 5", model)) %>%
+                        dplyr::select(model, exposure, HR_CI, P_fmt, PAF_CI)),
+        row.names = FALSE, right = FALSE)
+  cat("\n=== Supplementary Table 46 (ELSA): exposures lagged by two waves, Model 5 ===\n")
+  print(as.data.frame(paf_all_lag %>% filter(grepl("^Model 5", model)) %>%
+                        dplyr::select(model, exposure, HR_CI, P_fmt, PAF_CI)),
+        row.names = FALSE, right = FALSE)
+})
+
+
+# ============================================================================
+# 4) How much of any change is the lag and how much the sample?
+#    Model 4 with the one-wave and the two-wave lag on the same intervals
+#    (two-wave lag rows that are also in tv_cc).
+# ============================================================================
+lag1_vals <- tv_cc %>%
+  dplyr::select(idauniq, tstop, hearing_lag, vision_lag, frailty_lag,
+                emp_lag, smoke_lag, alcohol_lag)
+common_lag2 <- tv_cc_lag %>% semi_join(lag1_vals, by = c("idauniq", "tstop"))
+common_lag1 <- common_lag2 %>%
+  dplyr::select(-c(hearing_lag, vision_lag, frailty_lag, emp_lag, smoke_lag, alcohol_lag)) %>%
+  left_join(lag1_vals, by = c("idauniq", "tstop"))
+
+m4_rhs <- c(
+  hearing_lag = "hearing_lag + frailty_lag",
+  vision_lag  = "vision_lag + frailty_lag",
+  frailty_lag = "hearing_lag + vision_lag + frailty_lag"
+)
+m4_on <- function(dat, term)
+  coxph(as.formula(paste("Surv(tstart, tstop, event) ~", m4_rhs[[term]],
+                         "+ baseline_age + Gender + Race + Education + Marital_status",
+                         "+ emp_lag + smoke_lag + alcohol_lag + cluster(idauniq)")),
+        data = dat, ties = "efron")
+hr_line <- function(fit, term, label) {
+  ci <- summary(fit)$conf.int
+  tibble(exposure = term, analysis = label, intervals = fit$n, events = fit$nevent,
+         HR_CI = sprintf("%.2f (%.2f-%.2f)", ci[term, 1], ci[term, 3], ci[term, 4]))
+}
+
+m4_compare_lag <- bind_rows(lapply(names(m4_rhs), function(term) {
+  stem <- sub("_lag$", "", term)
+  bind_rows(
+    hr_line(get(paste0("fit_m4_", stem)),           term, "Main analysis, all rows"),
+    hr_line(m4_on(common_lag1, term),                term, "One-wave lag, common rows"),
+    hr_line(m4_on(common_lag2, term),                term, "Two-wave lag, common rows"),
+    hr_line(get(paste0("fit_m4_", stem, "_lag")),   term, "Two-wave lag, reported")
+  )
+}))
+
+local({
+  op <- options(width = 200); on.exit(options(op))
+  cat("\n=== Model 4: one- vs two-wave lag ===\n")
+  print(as.data.frame(m4_compare_lag), row.names = FALSE, right = FALSE)
+})
+
+
+# ---- Save for Supplementary Tables 45-46 and Supplementary Figs 12-13 --------
+saveRDS(list(paf_all_lag   = paf_all_lag,
+             m5_categories = list(hearing = m5_tab_hearing_lag, vision = m5_tab_vision_lag),
+             m5_contrast   = list(hearing = m5_con_hearing_lag, vision = m5_con_vision_lag),
+             m4_compare    = m4_compare_lag),
+        file.path(results_dir, "lag2_sensitivity_ELSA.rds"))
+write.csv(paf_all_lag, file.path(results_dir, "lag2_sensitivity_ELSA.csv"), row.names = FALSE)
+
+```
+
+
+# ELSA reduced frailty index: (I)ADL items and affective CES-D items removed
+<!-- The reduced index is built from the core files in ELSA_extractdata.Rmd, which writes data/elsa_fi_reduced.csv and data/elsa_fi_item_counts.csv. -->
+
+
+```{r}
+# ============================================================================
+# 0) Reduced index: read and attach to the panel
+# ============================================================================
+library(survival)
+library(dplyr)
+library(tibble)
+library(readr)
+library(ggplot2)
+
+elsa_fi_reduced <- read_csv(
+  file.path(data_dir, "elsa_fi_reduced.csv"),
+  col_types = cols(idauniq = col_character(), year = col_integer(),
+                   fi_score_reduced = col_double(),
+                   frailty_reduced = col_integer(),
+                   fi_n_answered_reduced = col_integer())
+) %>%
+  distinct()
+stopifnot(
+  "elsa_fi_reduced.csv has two different values for one person-wave" =
+    !anyDuplicated(elsa_fi_reduced[c("idauniq", "year")])
+)
+fi_item_counts <- read_csv(file.path(data_dir, "elsa_fi_item_counts.csv"),
+                           show_col_types = FALSE)
+n_items_reduced <- fi_item_counts$items_reduced[1]
+lab_main <- "Main (49 items)"
+lab_red  <- sprintf("Reduced (%d items)", n_items_reduced)
+
+panel_red <- panel_df_eligible %>%
+  mutate(idauniq = as.character(idauniq), year = as.integer(year)) %>%
+  dplyr::select(-any_of(c("fi_score_reduced", "frailty_reduced",
+                          "fi_n_answered_reduced"))) %>%
+  left_join(elsa_fi_reduced, by = c("idauniq", "year"))
+
+stopifnot(
+  "elsa_fi_reduced.csv has a duplicated person-wave" =
+    nrow(panel_red) == nrow(panel_df_eligible),
+  "some panel person-waves are missing from elsa_fi_reduced.csv: rerun the reduced-index build chunk" =
+    nrow(semi_join(panel_red, elsa_fi_reduced, by = c("idauniq", "year"))) == nrow(panel_red)
+)
+
+
+# ============================================================================
+# 1) Analytic data: tv_cc with frailty from the reduced index
+# ============================================================================
+# Frailty status at each wave, joined to the interval that opens at that wave
+frail_at_wave <- panel_red %>%
+  transmute(idauniq,
+            start_year      = year,
+            frailty_lag_red = as.integer(frailty_reduced),
+            frailty_lag_chk = as.integer(frailty))
+
+tv_red_all <- tv_cc %>%
+  mutate(start_year = as.integer(round(as.integer(baseline_year) + tstart))) %>%
+  left_join(frail_at_wave, by = c("idauniq", "start_year"))
+
+stopifnot(
+  "joining by opening wave changed the number of intervals" =
+    nrow(tv_red_all) == nrow(tv_cc),
+  "the main index joined by opening wave does not reproduce tv_cc$frailty_lag" =
+    isTRUE(all(tv_red_all$frailty_lag_chk == as.integer(tv_red_all$frailty_lag)))
+)
+
+# Same formulas as the main analysis: frailty_lag holds the reduced
+# index; frailty_lag_full keeps the main index for the comparisons below.
+tv_cc_red <- tv_red_all %>%
+  filter(!is.na(frailty_lag_red)) %>%
+  mutate(frailty_lag_full = frailty_lag,
+         frailty_lag      = frailty_lag_red) %>%
+  dplyr::select(-frailty_lag_red, -frailty_lag_chk)
+
+same_rows <- nrow(tv_cc_red) == nrow(tv_cc)
+
+sens_counts <- function(dat, label)
+  cat(sprintf("%-38s intervals = %s | persons = %s | events = %s | person-years = %s\n",
+              label,
+              format(nrow(dat), big.mark = ","),
+              format(n_distinct(dat$idauniq), big.mark = ","),
+              format(sum(dat$event == 1), big.mark = ","),
+              format(round(sum(dat$tstop - dat$tstart)), big.mark = ",")))
+
+cat("\n=== Reduced frailty index (", n_items_reduced, " items) ===\n", sep = "")
+sens_counts(tv_cc,     "Main analysis (tv_cc)")
+sens_counts(tv_cc_red, "Reduced index (tv_cc_red)")
+cat("Intervals dropped (no valid reduced index at the opening wave):",
+    nrow(tv_cc) - nrow(tv_cc_red),
+    "| events in them:", sum(tv_red_all$event[is.na(tv_red_all$frailty_lag_red)]), "\n")
+
+
+# ============================================================================
+# 2) Models 1-5 with the reduced index (formulas as in the main analysis)
+# ============================================================================
+fit_m1_hearing_red <- coxph(
+  Surv(tstart, tstop, event) ~ hearing_lag + cluster(idauniq),
+  data = tv_cc_red, ties = "efron")
+fit_m1_vision_red <- coxph(
+  Surv(tstart, tstop, event) ~ vision_lag + cluster(idauniq),
+  data = tv_cc_red, ties = "efron")
+fit_m1_frailty_red <- coxph(
+  Surv(tstart, tstop, event) ~ frailty_lag + cluster(idauniq),
+  data = tv_cc_red, ties = "efron")
+
+fit_m2_hearing_red <- coxph(
+  Surv(tstart, tstop, event) ~ hearing_lag + baseline_age + cluster(idauniq),
+  data = tv_cc_red, ties = "efron")
+fit_m2_vision_red <- coxph(
+  Surv(tstart, tstop, event) ~ vision_lag + baseline_age + cluster(idauniq),
+  data = tv_cc_red, ties = "efron")
+fit_m2_frailty_red <- coxph(
+  Surv(tstart, tstop, event) ~ frailty_lag + baseline_age + cluster(idauniq),
+  data = tv_cc_red, ties = "efron")
+
+fit_m3_hearing_red <- coxph(
+  Surv(tstart, tstop, event) ~ hearing_lag +
+    baseline_age + Gender + Race + Education + Marital_status +
+    emp_lag + smoke_lag + alcohol_lag + cluster(idauniq),
+  data = tv_cc_red, ties = "efron")
+fit_m3_vision_red <- coxph(
+  Surv(tstart, tstop, event) ~ vision_lag +
+    baseline_age + Gender + Race + Education + Marital_status +
+    emp_lag + smoke_lag + alcohol_lag + cluster(idauniq),
+  data = tv_cc_red, ties = "efron")
+fit_m3_frailty_red <- coxph(
+  Surv(tstart, tstop, event) ~ frailty_lag +
+    baseline_age + Gender + Race + Education + Marital_status +
+    emp_lag + smoke_lag + alcohol_lag + cluster(idauniq),
+  data = tv_cc_red, ties = "efron")
+
+fit_m4_hearing_red <- coxph(
+  Surv(tstart, tstop, event) ~ hearing_lag +
+    baseline_age + Gender + Race + Education + Marital_status +
+    emp_lag + smoke_lag + alcohol_lag + frailty_lag + cluster(idauniq),
+  data = tv_cc_red, ties = "efron")
+fit_m4_vision_red <- coxph(
+  Surv(tstart, tstop, event) ~ vision_lag +
+    baseline_age + Gender + Race + Education + Marital_status +
+    emp_lag + smoke_lag + alcohol_lag + frailty_lag + cluster(idauniq),
+  data = tv_cc_red, ties = "efron")
+fit_m4_frailty_red <- coxph(
+  Surv(tstart, tstop, event) ~
+    hearing_lag + vision_lag + frailty_lag +
+    baseline_age + Gender + Race + Education + Marital_status +
+    emp_lag + smoke_lag + alcohol_lag + cluster(idauniq),
+  data = tv_cc_red, ties = "efron")
+
+# Models 1-3 for hearing and vision have no frailty term: on the same rows
+# they must equal the main analysis
+if (same_rows) {
+  for (m in c("m1", "m2", "m3")) for (e in c("hearing", "vision")) {
+    a <- get(paste0("fit_", m, "_", e)); b <- get(paste0("fit_", m, "_", e, "_red"))
+    if (!isTRUE(all.equal(coef(a), coef(b))) || !isTRUE(all.equal(vcov(a), vcov(b),
+                                                                  check.attributes = FALSE)))
+      stop("fit_", m, "_", e, "_red differs from the main analysis on the same rows")
+  }
+}
+
+cat("\n--- PH check, Model 4 (reduced index), global test ---\n")
+print(rbind(
+  hearing = cox.zph(fit_m4_hearing_red)$table["GLOBAL", ],
+  vision  = cox.zph(fit_m4_vision_red)$table["GLOBAL", ],
+  frailty = cox.zph(fit_m4_frailty_red)$table["GLOBAL", ]
+))
+
+# ---- Model 5 -------------------------------------------------------------------
+build_m5_red <- function(sensory_var, sensory_lag, sensory_label, index = c("reduced", "main")) {
+  index <- match.arg(index)
+  build_m5_dataset(
+    sensory_var   = sensory_var,
+    sensory_lag   = sensory_lag,
+    sensory_label = sensory_label,
+    interval_df   = tv_cc_red,
+    panel_df      = panel_red,
+    frailty_var   = if (index == "reduced") "frailty_reduced" else "frailty",
+    frailty_lag   = if (index == "reduced") "frailty_lag" else "frailty_lag_full"
+  )
+}
+
+df_tv_hearing_red <- build_m5_red("hearing_loss",   "hearing_lag", "Hearing loss")
+df_tv_vision_red  <- build_m5_red("vision_overall", "vision_lag",  "Vision loss")
+
+# Main index on the same rows (Part 4); equals the primary data if no row dropped
+df_tv_hearing_redrows_main <- build_m5_red("hearing_loss",   "hearing_lag", "Hearing loss", "main")
+df_tv_vision_redrows_main  <- build_m5_red("vision_overall", "vision_lag",  "Vision loss",  "main")
+if (same_rows)
+  stopifnot(
+    "Model 5 with the main index does not reproduce df_tv_hearing / df_tv_vision" =
+      identical(as.character(df_tv_hearing_redrows_main$ctx_lag), as.character(df_tv_hearing$ctx_lag)) &&
+      identical(as.character(df_tv_vision_redrows_main$ctx_lag),  as.character(df_tv_vision$ctx_lag))
+  )
+
+fit_m5_hearing_red <- fit_m5(df_tv_hearing_red, "HEARING (reduced FI)")
+fit_m5_vision_red  <- fit_m5(df_tv_vision_red,  "VISION (reduced FI)")
+
+stopifnot(
+  "Model 5 and Model 4 use different events" =
+    fit_m5_hearing_red$nevent == fit_m4_hearing_red$nevent &&
+    fit_m5_vision_red$nevent  == fit_m4_hearing_red$nevent
+)
+
+m5_tab_hearing_red <- m5_category_table(fit_m5_hearing_red, "HEARING (reduced FI)")
+m5_tab_vision_red  <- m5_category_table(fit_m5_vision_red,  "VISION (reduced FI)")
+
+m5_con_hearing_red <- contrast_frailty_vs_no_frailty(fit_m5_hearing_red, "HEARING (reduced FI)")
+m5_con_vision_red  <- contrast_frailty_vs_no_frailty(fit_m5_vision_red,  "VISION (reduced FI)")
+
+```
+
+
+```{r}
+# ============================================================================
+# 3) HR, P and Levin PAF (Supplementary Tables 47-48)
+#    sens_ helpers: the same copies of the primary PAF helpers as in the
+#    two-wave lag section, defined again so this section runs on its own.
+# ============================================================================
+sens_levin <- function(p, HR) (p * (HR - 1)) / (p * (HR - 1) + 1)
+
+sens_prev_binary <- function(dat, var, ts, tp) {
+  pt <- dat[[tp]] - dat[[ts]]
+  x  <- dat[[var]]
+  sum(pt[x == 1], na.rm = TRUE) / sum(pt, na.rm = TRUE)
+}
+
+sens_prev_factor <- function(dat, var, ts, tp) {
+  pt    <- dat[[tp]] - dat[[ts]]
+  x     <- dat[[var]]
+  total <- sum(pt, na.rm = TRUE)
+  setNames(vapply(levels(x), function(lv) sum(pt[x == lv], na.rm = TRUE) / total,
+                  numeric(1)), levels(x))
+}
+
+sens_paf_binary <- function(fit, term, p, nsim = PAF_NSIM, seed = PAF_SEED) {
+  b <- unname(coef(fit)[term])
+  V <- vcov(fit)[term, term]                 # robust (cluster) variance
+  stopifnot(!is.na(b), V > 0)
+  set.seed(seed)
+  sims <- rnorm(nsim, mean = b, sd = sqrt(V))
+  pafs <- sens_levin(p, exp(sims))
+  z    <- qnorm(0.975)
+  tibble(
+    HR      = exp(b),
+    HR_lcl  = exp(b - z * sqrt(V)),
+    HR_ucl  = exp(b + z * sqrt(V)),
+    P       = summary(fit)$coefficients[term, "Pr(>|z|)"],
+    PAF     = sens_levin(p, exp(b)),
+    PAF_lcl = unname(quantile(pafs, 0.025, na.rm = TRUE)),
+    PAF_ucl = unname(quantile(pafs, 0.975, na.rm = TRUE))
+  )
+}
+
+sens_paf_multicat <- function(fit, terms, p_vec, labels,
+                              nsim = PAF_NSIM, seed = PAF_SEED) {
+  b <- unname(coef(fit)[terms])
+  V <- vcov(fit)[terms, terms, drop = FALSE]
+  set.seed(seed)
+  sims <- MASS::mvrnorm(nsim, mu = b, Sigma = V)
+  if (is.vector(sims)) sims <- matrix(sims, ncol = length(terms))
+  HRs <- exp(sims)
+
+  # Levin, partitioned so that components add up to the total
+  comp_mat      <- sweep(HRs - 1, 2, p_vec, `*`)
+  s_all         <- rowSums(comp_mat)
+  paf_total_sim <- s_all / (1 + s_all)
+  paf_comp_sim  <- comp_mat / (1 + s_all)
+
+  HR_est    <- exp(b)
+  se        <- sqrt(diag(V))
+  comp_est  <- p_vec * (HR_est - 1)
+  s_all_est <- sum(comp_est)
+  z <- qnorm(0.975)
+  q <- function(x, pr) unname(quantile(x, pr, na.rm = TRUE))
+
+  tibble(
+    component = c("Total", labels),
+    HR      = c(NA_real_, HR_est),
+    HR_lcl  = c(NA_real_, exp(b - z * se)),
+    HR_ucl  = c(NA_real_, exp(b + z * se)),
+    P       = c(NA_real_, summary(fit)$coefficients[terms, "Pr(>|z|)"]),
+    PAF     = c(s_all_est / (1 + s_all_est), comp_est / (1 + s_all_est)),
+    PAF_lcl = c(q(paf_total_sim, 0.025), apply(paf_comp_sim, 2, q, 0.025)),
+    PAF_ucl = c(q(paf_total_sim, 0.975), apply(paf_comp_sim, 2, q, 0.975))
+  )
+}
+
+# Check: the helpers give the main-analysis Model 4 hearing PAF exactly
+ref <- paf_models_1_4 %>% filter(grepl("^M4", model), exposure == "Hearing loss")
+chk <- sens_paf_binary(fit_m4_hearing, "hearing_lag",
+                       sens_prev_binary(tv_cc, "hearing_lag", "tstart", "tstop"))
+stopifnot(
+  "PAF helpers do not reproduce the main-analysis PAF" =
+    nrow(ref) == 1 &&
+    isTRUE(all.equal(c(ref$HR, ref$PAF, ref$PAF_lcl, ref$PAF_ucl),
+                     c(chk$HR, chk$PAF, chk$PAF_lcl, chk$PAF_ucl)))
+)
+rm(ref, chk)
+
+# ---- Models 1-4 --------------------------------------------------------------
+m14_spec_red <- tribble(
+  ~model,    ~exposure,            ~fit,                 ~term,
+  "Model 1", "Hearing impairment", "fit_m1_hearing_red", "hearing_lag",
+  "Model 1", "Vision impairment",  "fit_m1_vision_red",  "vision_lag",
+  "Model 1", "Frailty",            "fit_m1_frailty_red", "frailty_lag",
+  "Model 2", "Hearing impairment", "fit_m2_hearing_red", "hearing_lag",
+  "Model 2", "Vision impairment",  "fit_m2_vision_red",  "vision_lag",
+  "Model 2", "Frailty",            "fit_m2_frailty_red", "frailty_lag",
+  "Model 3", "Hearing impairment", "fit_m3_hearing_red", "hearing_lag",
+  "Model 3", "Vision impairment",  "fit_m3_vision_red",  "vision_lag",
+  "Model 3", "Frailty",            "fit_m3_frailty_red", "frailty_lag",
+  "Model 4", "Hearing impairment", "fit_m4_hearing_red", "hearing_lag",
+  "Model 4", "Vision impairment",  "fit_m4_vision_red",  "vision_lag",
+  "Model 4", "Frailty",            "fit_m4_frailty_red", "frailty_lag"
+)
+
+paf_models_1_4_red <- bind_rows(lapply(seq_len(nrow(m14_spec_red)), function(i) {
+  fit <- get(m14_spec_red$fit[i]); term <- m14_spec_red$term[i]
+  stopifnot(fit$n == nrow(tv_cc_red))        # every model on the same rows
+  p <- sens_prev_binary(tv_cc_red, term, "tstart", "tstop")
+  tibble(model = m14_spec_red$model[i], exposure = m14_spec_red$exposure[i], p_pt = p) %>%
+    bind_cols(sens_paf_binary(fit, term, p))
+}))
+
+# ---- Model 5 -----------------------------------------------------------------
+paf_model5_red <- function(fit, label) {
+  dat     <- attr(fit, "used")                 # rows the model used
+  exposed <- levels(dat$ctx_lag)[-1]
+  p_exp   <- sens_prev_factor(dat, "ctx_lag", "start", "stop")[exposed]
+  terms   <- paste0("ctx_lag", exposed)
+  stopifnot(all(terms %in% names(coef(fit))), all(p_exp > 0))
+  tab <- sens_paf_multicat(fit, terms, p_exp, exposed)
+  stopifnot(abs(sum(tab$PAF[-1]) - tab$PAF[1]) < 1e-10)   # components add up
+  tab %>%
+    transmute(model = label,
+              exposure = ifelse(component == "Total", "Total context PAF", component),
+              p_pt = c(sum(p_exp), unname(p_exp)),
+              HR, HR_lcl, HR_ucl, P, PAF, PAF_lcl, PAF_ucl)
+}
+
+paf_m5_hearing_red <- paf_model5_red(fit_m5_hearing_red, "Model 5 (hearing context)")
+paf_m5_vision_red  <- paf_model5_red(fit_m5_vision_red,  "Model 5 (vision context)")
+
+# ---- Combined, formatted as in the supplement -------------------------------
+paf_all_red <- bind_rows(paf_models_1_4_red, paf_m5_hearing_red, paf_m5_vision_red) %>%
+  mutate(
+    HR_CI  = ifelse(is.na(HR), "", sprintf("%.2f (%.2f-%.2f)", HR, HR_lcl, HR_ucl)),
+    P_fmt  = ifelse(is.na(P), "", ifelse(P < 0.001, "P < 0.001", sprintf("P = %.3f", P))),
+    PAF_CI = sprintf("%.1f%% (%.1f to %.1f)", 100 * PAF, 100 * PAF_lcl, 100 * PAF_ucl)
+  )
+
+local({
+  op <- options(width = 200); on.exit(options(op))
+  cat("\n=== Supplementary Table 47 (ELSA): reduced frailty index, Models 1-4 ===\n")
+  print(as.data.frame(paf_all_red %>% filter(!grepl("^Model 5", model)) %>%
+                        dplyr::select(model, exposure, HR_CI, P_fmt, PAF_CI)),
+        row.names = FALSE, right = FALSE)
+  cat("\n=== Supplementary Table 48 (ELSA): reduced frailty index, Model 5 ===\n")
+  print(as.data.frame(paf_all_red %>% filter(grepl("^Model 5", model)) %>%
+                        dplyr::select(model, exposure, HR_CI, P_fmt, PAF_CI)),
+        row.names = FALSE, right = FALSE)
+})
+
+
+# ============================================================================
+# 4) Main vs reduced index on the same intervals
+#    Separates the effect of the index from the (small) change in rows.
+# ============================================================================
+m4_rhs_red <- c(
+  hearing_lag = "hearing_lag + %s",
+  vision_lag  = "vision_lag + %s",
+  frailty_lag = "hearing_lag + vision_lag + %s"
+)
+m4_on_red <- function(term, frail_var) {
+  rhs <- sprintf(m4_rhs_red[[term]], frail_var)
+  coxph(as.formula(paste("Surv(tstart, tstop, event) ~", rhs,
+                         "+ baseline_age + Gender + Race + Education + Marital_status",
+                         "+ emp_lag + smoke_lag + alcohol_lag + cluster(idauniq)")),
+        data = tv_cc_red, ties = "efron")
+}
+hr_text <- function(fit, term) {
+  ci <- summary(fit)$conf.int
+  sprintf("%.2f (%.2f-%.2f)", ci[term, 1], ci[term, 3], ci[term, 4])
+}
+
+m4_compare_red <- bind_rows(lapply(names(m4_rhs_red), function(term) {
+  fit_main <- m4_on_red(term, "frailty_lag_full")
+  fit_red  <- get(paste0("fit_m4_", sub("_lag$", "", term), "_red"))
+  tibble(model    = "Model 4",
+         exposure = term,
+         main_index_same_rows = hr_text(fit_main, if (term == "frailty_lag") "frailty_lag_full" else term),
+         reduced_index        = hr_text(fit_red, term))
+}))
+
+m5_compare_red <- bind_rows(lapply(c("hearing", "vision"), function(s) {
+  invisible(capture.output(
+    fit_main <- fit_m5(get(paste0("df_tv_", s, "_redrows_main")), s)))
+  fit_red <- get(paste0("fit_m5_", s, "_red"))
+  lv <- levels(attr(fit_red, "used")$ctx_lag)[-1]
+  tibble(model    = paste0("Model 5 (", s, ")"),
+         exposure = lv,
+         main_index_same_rows = vapply(paste0("ctx_lag", lv), hr_text, "", fit = fit_main),
+         reduced_index        = vapply(paste0("ctx_lag", lv), hr_text, "", fit = fit_red))
+}))
+
+local({
+  op <- options(width = 200); on.exit(options(op))
+  cat("\n=== Main (49-item) vs reduced (", n_items_reduced, "-item) index, same intervals ===\n", sep = "")
+  print(as.data.frame(bind_rows(m4_compare_red, m5_compare_red)),
+        row.names = FALSE, right = FALSE)
+})
+
+
+# ============================================================================
+# 5) Describing the reduced index: item counts, score distribution,
+#    frailty prevalence, agreement with the main index
+# ============================================================================
+cat("\n=== Items per wave (main / (I)ADL removed / reduced) and 80% cutoff ===\n")
+print(as.data.frame(fi_item_counts), row.names = FALSE)
+
+# Scores at baseline (persons in the analysis) and at the opening wave of
+# every analytic interval
+fi_scores_at_wave <- panel_red %>%
+  transmute(idauniq, start_year = year,
+            FI_full = fi_score, FI_reduced = fi_score_reduced,
+            frail_full = as.integer(frailty),
+            frail_reduced = as.integer(frailty_reduced))
+
+fi_baseline_red <- panel_red %>%
+  filter(year == baseline_year, idauniq %in% tv_cc_red$idauniq) %>%
+  transmute(idauniq,
+            FI_full = fi_score, FI_reduced = fi_score_reduced,
+            frail_full = as.integer(frailty),
+            frail_reduced = as.integer(frailty_reduced))
+stopifnot(!anyDuplicated(fi_baseline_red$idauniq))
+
+fi_intervals_red <- tv_cc_red %>%
+  dplyr::select(idauniq, start_year, tstart, tstop) %>%
+  left_join(fi_scores_at_wave, by = c("idauniq", "start_year"))
+stopifnot(nrow(fi_intervals_red) == nrow(tv_cc_red))
+
+dist_row <- function(x, index, level) {
+  tibble(level = level, index = index,
+         n = sum(!is.na(x)), missing = sum(is.na(x)),
+         mean = mean(x, na.rm = TRUE), sd = sd(x, na.rm = TRUE),
+         median = median(x, na.rm = TRUE),
+         q1 = unname(quantile(x, 0.25, na.rm = TRUE)),
+         q3 = unname(quantile(x, 0.75, na.rm = TRUE)),
+         min = min(x, na.rm = TRUE), max = max(x, na.rm = TRUE),
+         pct_zero = 100 * mean(x == 0, na.rm = TRUE))
+}
+fi_distribution_red <- bind_rows(
+  dist_row(fi_baseline_red$FI_full,     lab_main,    "Baseline (persons)"),
+  dist_row(fi_baseline_red$FI_reduced,  lab_red, "Baseline (persons)"),
+  dist_row(fi_intervals_red$FI_full,    lab_main,    "Interval opening waves"),
+  dist_row(fi_intervals_red$FI_reduced, lab_red, "Interval opening waves")
+)
+
+pt <- fi_intervals_red$tstop - fi_intervals_red$tstart
+fi_prevalence_red <- tibble(
+  index = c(lab_main, lab_red),
+  baseline_frail_n   = c(sum(fi_baseline_red$frail_full == 1, na.rm = TRUE),
+                         sum(fi_baseline_red$frail_reduced == 1, na.rm = TRUE)),
+  baseline_valid_n   = c(sum(!is.na(fi_baseline_red$frail_full)),
+                         sum(!is.na(fi_baseline_red$frail_reduced))),
+  baseline_frail_pct = 100 * baseline_frail_n / baseline_valid_n,
+  intervals_frail_pct = 100 * c(mean(tv_cc_red$frailty_lag_full == 1),
+                                mean(tv_cc_red$frailty_lag == 1)),
+  person_time_frail_pct = 100 * c(sens_prev_binary(tv_cc_red, "frailty_lag_full", "tstart", "tstop"),
+                                  sens_prev_binary(tv_cc_red, "frailty_lag", "tstart", "tstop"))
+)
+
+cohen_kappa <- function(a, b) {
+  ok <- !is.na(a) & !is.na(b); a <- a[ok]; b <- b[ok]
+  po <- mean(a == b)
+  pe <- mean(a == 1) * mean(b == 1) + mean(a == 0) * mean(b == 0)
+  (po - pe) / (1 - pe)
+}
+agree_row <- function(d, level) {
+  ok <- !is.na(d$frail_full) & !is.na(d$frail_reduced)
+  tibble(level = level, n = sum(ok),
+         both_frail     = sum(d$frail_full[ok] == 1 & d$frail_reduced[ok] == 1),
+         main_only      = sum(d$frail_full[ok] == 1 & d$frail_reduced[ok] == 0),
+         reduced_only   = sum(d$frail_full[ok] == 0 & d$frail_reduced[ok] == 1),
+         neither        = sum(d$frail_full[ok] == 0 & d$frail_reduced[ok] == 0),
+         kappa          = cohen_kappa(d$frail_full, d$frail_reduced),
+         pearson_r      = cor(d$FI_full, d$FI_reduced, use = "complete.obs"),
+         spearman_rho   = cor(d$FI_full, d$FI_reduced, use = "complete.obs", method = "spearman"))
+}
+fi_agreement_red <- bind_rows(
+  agree_row(fi_baseline_red,  "Baseline (persons)"),
+  agree_row(fi_intervals_red, "Interval opening waves")
+)
+
+local({
+  op <- options(width = 200); on.exit(options(op))
+  cat("\n=== Frailty index score distribution ===\n")
+  print(as.data.frame(fi_distribution_red), digits = 3, row.names = FALSE)
+  cat("\n=== Frailty prevalence (FI >= 0.25) ===\n")
+  print(as.data.frame(fi_prevalence_red), digits = 3, row.names = FALSE)
+  cat("\n=== Agreement between the main and reduced index ===\n")
+  print(as.data.frame(fi_agreement_red), digits = 3, row.names = FALSE)
+})
+
+# Baseline score distribution, main vs reduced 
+fig_fi_distribution_red <- fi_baseline_red %>%
+  dplyr::select(idauniq, FI_full, FI_reduced) %>%
+  tidyr::pivot_longer(-idauniq, names_to = "index", values_to = "FI") %>%
+  mutate(index = factor(index, levels = c("FI_full", "FI_reduced"),
+                        labels = paste("Index:", c(lab_main, lab_red)))) %>%
+  filter(!is.na(FI)) %>%
+  ggplot(aes(x = FI)) +
+  geom_histogram(binwidth = 0.025, boundary = 0, fill = "grey60", colour = "white") +
+  geom_vline(xintercept = 0.25, linetype = "dashed") +
+  facet_wrap(~ index, ncol = 1) +
+  labs(x = "Frailty index score at baseline", y = "Participants") +
+  theme_classic()
+
+
+# ---- Save for Supplementary Tables 47-48 and Supplementary Figs 14-15 --------
+ggsave(file.path(output_dir, "reducedFI_score_distribution_ELSA.png"), fig_fi_distribution_red,
+       width = 6, height = 6, dpi = 300)
+saveRDS(list(paf_all_red   = paf_all_red,
+             m5_categories = list(hearing = m5_tab_hearing_red, vision = m5_tab_vision_red),
+             m5_contrast   = list(hearing = m5_con_hearing_red, vision = m5_con_vision_red),
+             compare_main  = bind_rows(m4_compare_red, m5_compare_red),
+             item_counts   = fi_item_counts,
+             distribution  = fi_distribution_red,
+             prevalence    = fi_prevalence_red,
+             agreement     = fi_agreement_red),
+        file.path(results_dir, "reducedFI_sensitivity_ELSA.rds"))
+write.csv(paf_all_red, file.path(results_dir, "reducedFI_sensitivity_ELSA.csv"), row.names = FALSE)
+
+```
+
+

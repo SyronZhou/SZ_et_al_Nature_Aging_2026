@@ -1,11 +1,20 @@
 ---
-title: "R Notebook"
+title: "HRS: harmonised person-wave data, frailty index and dementia status"
 output: html_notebook
 ---
 
+<!--
+  Analysis code for the manuscript on sensory impairment, frailty, and incident
+  dementia in the HRS (United States) and ELSA (England) cohorts.
+
+  DATA NOT INCLUDED. HRS and ELSA are restricted-access and cannot be
+  redistributed. Obtain the source data from the data providers and place them
+  under data/ (git-ignored) so the relative paths in this notebook resolve.
+  See README.md for setup and run order.
+-->
+
 ```{r setup-libraries, message=FALSE, warning=FALSE}
-# FIX E: load every package this notebook uses. Previously the only library()
-# call was purrr, at the very end -- so a clean session failed immediately.
+# Load every package this notebook uses.
 library(haven)      # read_dta
 library(readr)      # read_csv / write_csv
 library(dplyr)      # transmute, mutate, joins, case_when, ...
@@ -26,8 +35,9 @@ library(lattice)    # densityplot / stripplot in the MICE diagnostics
 repo_root <- if (basename(getwd()) == "code") normalizePath("..") else normalizePath(".")
 cat("Repository root:", repo_root, "\n")
 
-# Shared output location -- MUST match `data_dir` in HRS_analysis.Rmd so the
-# analysis notebook reads exactly what this notebook writes.
+# Shared output location -- MUST match `data_dir` in HRS_analysis_MSM.Rmd and
+# HRS_analysis_Cox.Rmd so the analysis notebooks read exactly what this
+# notebook writes.
 data_dir <- file.path(repo_root, "data")
 dir.create(data_dir, recursive = TRUE, showWarnings = FALSE)
 ```
@@ -128,7 +138,6 @@ cat("  death-year range       :",
     paste(range(death_track$death_year, na.rm = TRUE), collapse = "-"), "\n")
 
 ```
-
 
 
 # HRS database
@@ -252,8 +261,7 @@ lw_2004 <- hrs_LangaWeir %>%
 ```
 
 
-
-# FAT 2004 file (UPDATE PATH to your 2004 file)
+# FAT 2004 file
 ```{r}
 # FAT 2004 file
 fat_path_04 <- file.path(repo_root, "data/HRS/h04f1c_STATA/h04f1c.dta")
@@ -495,8 +503,6 @@ hrs_fi_2004_final <- hrs_fi_2004_orig %>%
 ```
 
 
-
-
 ```{r}
 # 6. Merge 2004 data
 hrs_2004 <- hrs_cov_2004 %>%
@@ -525,14 +531,10 @@ hrs_2004 <- hrs_cov_2004 %>%
 
 # 7. Imputation (consistent with ELSA approach)
 # ---- 1. Prepare dataset for imputation -----------------------------
-# FIX (specification): FI_score, Frailty_status and dementia were carried here
-# as "auxiliary predictors" with method "" while remaining in the predictor
-# matrix. mice never fills the missing cells of a non-imputed variable, so
-# their NAs were entering the design matrix of every imputation model. They are
-# removed rather than imputed: the Methods state that the primary study
-# variables were not imputed, and waves 2006-2020 (and ELSA) never included
-# them, so dropping them also makes 2004 consistent with every other wave.
-# FI_score and Frailty_status were additionally collinear by construction.
+# The primary study variables (FI_score, Frailty_status, dementia) are neither
+# imputed nor used as predictors, as in waves 2006-2020 and in ELSA. mice never
+# fills the missing cells of a non-imputed variable, so keeping them in the
+# predictor matrix would feed NAs into every imputation model.
 imp04 <- hrs_2004 %>%
   mutate(hhidpn = as.character(hhidpn)) %>%
   transmute(
@@ -546,7 +548,7 @@ imp04 <- hrs_2004 %>%
            ~ factor(.x, levels = c(0, 1)))
   )
 
-# ---- 2. Quantify missingness (for methods text) --------------------
+# ---- 2. Quantify missingness -----------------------------------------
 miss_pct <- sapply(imp04, function(x) mean(is.na(x)) * 100)
 miss_cov <- miss_pct[miss_pct > 0]
 cat("Percentage missing per variable:\n"); print(round(miss_pct, 2))
@@ -559,7 +561,7 @@ if (length(miss_cov) > 0) {
 }
 
 # ---- 3. Imputation method per variable -----------------------------
-# FIX (specification): Gender and Race are now imputed INSIDE the fully
+# Gender and Race are imputed INSIDE the fully
 # conditional specification so that no predictor carries NAs into the design
 # matrix. They are NOT carried back into the analysis data -- vars_imputed
 # below excludes them -- so hrs_2004 retains its original Gender and Race,
@@ -647,11 +649,9 @@ diag_tables  <- lapply(vars_imputed, compare_summaries, mids_obj = imp_mice04)
 print(diag_tables)
 
 # ---- 8. Extract ONE completed dataset (consistent with 2006-2020 waves) ----
-# FIX: previously this pulled complete(imp_mice04, action = "long") and kept
-# .imp/.id all the way into HRS_2004, giving every 2004 person 20 rows while
-# every other wave has 1. mice() above still runs m = 20 so the convergence
-# and density/strip-plot diagnostics above stay valid -- we just now take a
-# single completed dataset (imputation #1), matching 2006-2020 exactly.
+# One completed dataset (imputation #1) is carried forward, as in 2006-2020,
+# so every person has one row per wave. mice() above still runs m = 20 for the
+# convergence and density/strip-plot diagnostics.
 imp04_complete1 <- complete(imp_mice04, 1)
 
 hrs04_clean <- hrs_2004 %>%
@@ -674,7 +674,6 @@ HRS_2004 <- hrs04_clean %>%
   )
 
 ```
-
 
 
 ```{r}
@@ -717,7 +716,7 @@ hrs_cov_2006 <- df_4 %>%
     across(all_of(cov_actual_2006))
   ) %>%
   mutate(
-    # FIX: prefer R8AGEY_E; fall back to year - birth_year
+    # prefer R8AGEY_E; fall back to year - birth_year
     age_2006 = coalesce(
       as.numeric(R8AGEY_E),
       if_else(!is.na(birth_year), as.numeric(year - birth_year), NA_real_)
@@ -728,7 +727,7 @@ hrs_cov_2006 <- df_4 %>%
       TRUE ~ NA_integer_
     ),
 
-    # FIX: HS grad (3) belongs with HS tier, not college
+    # HS grad (3) belongs with HS tier, not college
     Education = case_when(
       is.na(RAEDUC)       ~ NA_integer_,
       RAEDUC == 1         ~ 0L,    # < HS
@@ -737,7 +736,7 @@ hrs_cov_2006 <- df_4 %>%
       TRUE ~ NA_integer_
     ),
 
-    # FIX: include partnered/spouse-absent (codes 2, 3) as married/partnered
+    # include partnered/spouse-absent (codes 2, 3) as married/partnered
     Marital_status = case_when(
       R8MSTAT %in% c(1, 2, 3)       ~ 1L,
       R8MSTAT %in% c(4, 5, 6, 7, 8) ~ 0L,
@@ -762,7 +761,7 @@ hrs_cov_2006 <- df_4 %>%
       TRUE ~ NA_integer_
     ),
 
-    # FIX: NH White still classified when RAHISPAN missing
+    # NH White still classified when RAHISPAN missing
     Race = case_when(
       (RAHISPAN == 0 | is.na(RAHISPAN)) & RARACEM == 1 ~ 0L,
       RAHISPAN == 1 | RARACEM %in% c(2, 3)              ~ 1L,
@@ -793,8 +792,6 @@ lw_2006 <- hrs_LangaWeir %>%
   )
 
 ```
-
-
 
 
 ```{r}
@@ -843,7 +840,7 @@ sensory_2006 <- fat06 %>%
       kc095 %in% c(4, 5, 6) ~ 1L,    # 6 = Legally Blind → impaired
       TRUE ~ NA_integer_
     ),
-    # FIX: legally blind (kc095==6) → impaired for far/near (skip-coded)
+    # legally blind (kc095==6) → impaired for far/near (skip-coded)
     vision_far = case_when(
       kc095 == 6            ~ 1L,
       kc096 %in% c(1, 2, 3) ~ 0L,
@@ -856,7 +853,7 @@ sensory_2006 <- fat06 %>%
       kc097 %in% c(4, 5)    ~ 1L,
       TRUE ~ NA_integer_
     ),
-    # FIX: skip-pattern (no diagnosis) NaN → 0
+    # skip-pattern (no diagnosis) NaN → 0
     cataract_surgery = case_when(
       kc098 == 1         ~ 1L,
       kc098 == 5         ~ 0L,
@@ -1021,8 +1018,6 @@ hrs_fi_2006_final <- hrs_fi_2006_orig %>%
 ```
 
 
-
-
 ```{r}
 # 6. Merge 2006 data
 hrs_2006 <- hrs_cov_2006 %>%
@@ -1066,11 +1061,10 @@ imp06 <- hrs_2006 %>%
   mutate(Gender = factor(Gender, levels = c(1, 2)))
 
 # Define imputation methods
-# FIX (specification): Gender and Race previously had method "" while remaining
-# in the predictor matrix, so mice never filled their missing cells and NAs were
-# fed into every imputation model. They are now imputed INSIDE the FCS but are
-# NOT carried back (imputed_vars below excludes them), so the analysis data
-# keeps its original Gender and Race, including missing values.
+# Gender and Race are imputed INSIDE the FCS so that no predictor carries NAs
+# into the imputation models. They are NOT carried back (imputed_vars below
+# excludes them), so the analysis data keeps its original Gender and Race,
+# including missing values.
 meth <- make.method(imp06)
 meth["hhidpn"]    <- ""              # ID: never imputed
 meth["age_2006"]  <- "pmm"
@@ -1130,8 +1124,6 @@ HRS_2006 <- hrs06_clean %>%
 ```
 
 
-
-
 ```{r}
 # hrs data 2008
 df_5 <- hrs_2022summary
@@ -1172,7 +1164,7 @@ hrs_cov_2008 <- df_5 %>%
     across(all_of(cov_actual_2008))
   ) %>%
   mutate(
-    # FIX: prefer R9AGEY_E; fall back to year - birth_year
+    # prefer R9AGEY_E; fall back to year - birth_year
     age_2008 = coalesce(
       as.numeric(R9AGEY_E),
       if_else(!is.na(birth_year), as.numeric(year - birth_year), NA_real_)
@@ -1183,7 +1175,7 @@ hrs_cov_2008 <- df_5 %>%
       TRUE ~ NA_integer_
     ),
 
-    # FIX: HS grad (3) belongs with HS tier, not college
+    # HS grad (3) belongs with HS tier, not college
     Education = case_when(
       is.na(RAEDUC)       ~ NA_integer_,
       RAEDUC == 1         ~ 0L,
@@ -1192,7 +1184,7 @@ hrs_cov_2008 <- df_5 %>%
       TRUE ~ NA_integer_
     ),
 
-    # FIX: include partnered/spouse-absent (codes 2, 3) as married/partnered
+    # include partnered/spouse-absent (codes 2, 3) as married/partnered
     Marital_status = case_when(
       R9MSTAT %in% c(1, 2, 3)       ~ 1L,
       R9MSTAT %in% c(4, 5, 6, 7, 8) ~ 0L,
@@ -1217,7 +1209,7 @@ hrs_cov_2008 <- df_5 %>%
       TRUE ~ NA_integer_
     ),
 
-    # FIX: NH White still classified when RAHISPAN missing
+    # NH White still classified when RAHISPAN missing
     Race = case_when(
       (RAHISPAN == 0 | is.na(RAHISPAN)) & RARACEM == 1 ~ 0L,
       RAHISPAN == 1 | RARACEM %in% c(2, 3)              ~ 1L,
@@ -1248,8 +1240,6 @@ lw_2008 <- hrs_LangaWeir %>%
   )
 
 ```
-
-
 
 
 ```{r}
@@ -1298,7 +1288,7 @@ sensory_2008 <- fat08 %>%
       lc095 %in% c(4, 5, 6) ~ 1L,    # 6 = Legally Blind → impaired
       TRUE ~ NA_integer_
     ),
-    # FIX: legally blind (lc095==6) → impaired for far/near (skip-coded)
+    # legally blind (lc095==6) → impaired for far/near (skip-coded)
     vision_far = case_when(
       lc095 == 6            ~ 1L,
       lc096 %in% c(1, 2, 3) ~ 0L,
@@ -1311,7 +1301,7 @@ sensory_2008 <- fat08 %>%
       lc097 %in% c(4, 5)    ~ 1L,
       TRUE ~ NA_integer_
     ),
-    # FIX: skip-pattern (no diagnosis) NaN → 0
+    # skip-pattern (no diagnosis) NaN → 0
     cataract_surgery = case_when(
       lc098 == 1         ~ 1L,
       lc098 == 5         ~ 0L,
@@ -1475,8 +1465,6 @@ hrs_fi_2008_final <- hrs_fi_2008_orig %>%
 ```
 
 
-
-
 ```{r}
 # 6. Merge 2008 data
 hrs_2008 <- hrs_cov_2008 %>%
@@ -1520,11 +1508,10 @@ imp08 <- hrs_2008 %>%
   mutate(Gender = factor(Gender, levels = c(1, 2)))
 
 # Define imputation methods
-# FIX (specification): Gender and Race previously had method "" while remaining
-# in the predictor matrix, so mice never filled their missing cells and NAs were
-# fed into every imputation model. They are now imputed INSIDE the FCS but are
-# NOT carried back (imputed_vars below excludes them), so the analysis data
-# keeps its original Gender and Race, including missing values.
+# Gender and Race are imputed INSIDE the FCS so that no predictor carries NAs
+# into the imputation models. They are NOT carried back (imputed_vars below
+# excludes them), so the analysis data keeps its original Gender and Race,
+# including missing values.
 meth <- make.method(imp08)
 meth["hhidpn"]    <- ""              # ID: never imputed
 meth["age_2008"]  <- "pmm"
@@ -1584,8 +1571,6 @@ HRS_2008 <- hrs08_clean %>%
 ```
 
 
-
-
 ```{r}
 # HRS data 2010 (Wave 10)
 df_6 <- hrs_2022summary
@@ -1626,7 +1611,7 @@ hrs_cov_2010 <- df_6 %>%
     across(all_of(cov_actual_2010))
   ) %>%
   mutate(
-    # FIX: prefer R10AGEY_E; fall back to year - birth_year
+    # prefer R10AGEY_E; fall back to year - birth_year
     age_2010 = coalesce(
       as.numeric(R10AGEY_E),
       if_else(!is.na(birth_year), as.numeric(year - birth_year), NA_real_)
@@ -1637,7 +1622,7 @@ hrs_cov_2010 <- df_6 %>%
       TRUE ~ NA_integer_
     ),
 
-    # FIX: HS grad (3) belongs with HS tier, not college
+    # HS grad (3) belongs with HS tier, not college
     Education = case_when(
       is.na(RAEDUC)       ~ NA_integer_,
       RAEDUC == 1         ~ 0L,
@@ -1646,7 +1631,7 @@ hrs_cov_2010 <- df_6 %>%
       TRUE ~ NA_integer_
     ),
 
-    # FIX: include partnered/spouse-absent (codes 2, 3) as married/partnered
+    # include partnered/spouse-absent (codes 2, 3) as married/partnered
     Marital_status = case_when(
       R10MSTAT %in% c(1, 2, 3)       ~ 1L,
       R10MSTAT %in% c(4, 5, 6, 7, 8) ~ 0L,
@@ -1671,7 +1656,7 @@ hrs_cov_2010 <- df_6 %>%
       TRUE ~ NA_integer_
     ),
 
-    # FIX: NH White still classified when RAHISPAN missing
+    # NH White still classified when RAHISPAN missing
     Race = case_when(
       (RAHISPAN == 0 | is.na(RAHISPAN)) & RARACEM == 1 ~ 0L,
       RAHISPAN == 1 | RARACEM %in% c(2, 3)              ~ 1L,
@@ -1703,7 +1688,6 @@ lw_2010 <- hrs_LangaWeir %>%
 
 
 ```
-
 
 
 ```{r}
@@ -1752,7 +1736,7 @@ sensory_2010 <- fat10 %>%
       mc095 %in% c(4, 5, 6) ~ 1L,    # 6 = Legally Blind → impaired
       TRUE ~ NA_integer_
     ),
-    # FIX: legally blind (mc095==6) → impaired for far/near (skip-coded)
+    # legally blind (mc095==6) → impaired for far/near (skip-coded)
     vision_far = case_when(
       mc095 == 6            ~ 1L,
       mc096 %in% c(1, 2, 3) ~ 0L,
@@ -1765,7 +1749,7 @@ sensory_2010 <- fat10 %>%
       mc097 %in% c(4, 5)    ~ 1L,
       TRUE ~ NA_integer_
     ),
-    # FIX: skip-pattern (no diagnosis) NaN → 0
+    # skip-pattern (no diagnosis) NaN → 0
     cataract_surgery = case_when(
       mc098 == 1         ~ 1L,
       mc098 == 5         ~ 0L,
@@ -1929,7 +1913,6 @@ hrs_fi_2010_final <- hrs_fi_2010_orig %>%
 ```
 
 
-
 ```{r}
 # 6. Merge 2010 data
 hrs_2010 <- hrs_cov_2010 %>%
@@ -1973,11 +1956,10 @@ imp10 <- hrs_2010 %>%
   mutate(Gender = factor(Gender, levels = c(1, 2)))
 
 # Define imputation methods
-# FIX (specification): Gender and Race previously had method "" while remaining
-# in the predictor matrix, so mice never filled their missing cells and NAs were
-# fed into every imputation model. They are now imputed INSIDE the FCS but are
-# NOT carried back (imputed_vars below excludes them), so the analysis data
-# keeps its original Gender and Race, including missing values.
+# Gender and Race are imputed INSIDE the FCS so that no predictor carries NAs
+# into the imputation models. They are NOT carried back (imputed_vars below
+# excludes them), so the analysis data keeps its original Gender and Race,
+# including missing values.
 meth <- make.method(imp10)
 meth["hhidpn"]    <- ""              # ID: never imputed
 meth["age_2010"]  <- "pmm"
@@ -2037,7 +2019,6 @@ HRS_2010 <- hrs10_clean %>%
 ```
 
 
-
 ```{r}
 # HRS data 2012 (Wave 11)
 df_7 <- hrs_2022summary
@@ -2078,7 +2059,7 @@ hrs_cov_2012 <- df_7 %>%
     across(all_of(cov_actual_2012))
   ) %>%
   mutate(
-    # FIX: prefer R11AGEY_E; fall back to year - birth_year
+    # prefer R11AGEY_E; fall back to year - birth_year
     age_2012 = coalesce(
       as.numeric(R11AGEY_E),
       if_else(!is.na(birth_year), as.numeric(year - birth_year), NA_real_)
@@ -2089,7 +2070,7 @@ hrs_cov_2012 <- df_7 %>%
       TRUE ~ NA_integer_
     ),
 
-    # FIX: HS grad (3) belongs with HS tier, not college
+    # HS grad (3) belongs with HS tier, not college
     Education = case_when(
       is.na(RAEDUC)       ~ NA_integer_,
       RAEDUC == 1         ~ 0L,
@@ -2098,7 +2079,7 @@ hrs_cov_2012 <- df_7 %>%
       TRUE ~ NA_integer_
     ),
 
-    # FIX: include partnered/spouse-absent (codes 2, 3) as married/partnered
+    # include partnered/spouse-absent (codes 2, 3) as married/partnered
     Marital_status = case_when(
       R11MSTAT %in% c(1, 2, 3)       ~ 1L,
       R11MSTAT %in% c(4, 5, 6, 7, 8) ~ 0L,
@@ -2123,7 +2104,7 @@ hrs_cov_2012 <- df_7 %>%
       TRUE ~ NA_integer_
     ),
 
-    # FIX: NH White still classified when RAHISPAN missing
+    # NH White still classified when RAHISPAN missing
     Race = case_when(
       (RAHISPAN == 0 | is.na(RAHISPAN)) & RARACEM == 1 ~ 0L,
       RAHISPAN == 1 | RARACEM %in% c(2, 3)              ~ 1L,
@@ -2155,8 +2136,6 @@ lw_2012 <- hrs_LangaWeir %>%
 
 
 ```
-
-
 
 
 ```{r}
@@ -2205,7 +2184,7 @@ sensory_2012 <- fat12 %>%
       nc095 %in% c(4, 5, 6) ~ 1L,    # 6 = Legally Blind → impaired
       TRUE ~ NA_integer_
     ),
-    # FIX: legally blind (nc095==6) → impaired for far/near (skip-coded)
+    # legally blind (nc095==6) → impaired for far/near (skip-coded)
     vision_far = case_when(
       nc095 == 6            ~ 1L,
       nc096 %in% c(1, 2, 3) ~ 0L,
@@ -2218,7 +2197,7 @@ sensory_2012 <- fat12 %>%
       nc097 %in% c(4, 5)    ~ 1L,
       TRUE ~ NA_integer_
     ),
-    # FIX: skip-pattern (no diagnosis) NaN → 0
+    # skip-pattern (no diagnosis) NaN → 0
     cataract_surgery = case_when(
       nc098 == 1         ~ 1L,
       nc098 == 5         ~ 0L,
@@ -2382,7 +2361,6 @@ hrs_fi_2012_final <- hrs_fi_2012_orig %>%
 ```
 
 
-
 ```{r}
 # 6. Merge 2012 data
 hrs_2012 <- hrs_cov_2012 %>%
@@ -2426,11 +2404,10 @@ imp12 <- hrs_2012 %>%
   mutate(Gender = factor(Gender, levels = c(1, 2)))
 
 # Define imputation methods
-# FIX (specification): Gender and Race previously had method "" while remaining
-# in the predictor matrix, so mice never filled their missing cells and NAs were
-# fed into every imputation model. They are now imputed INSIDE the FCS but are
-# NOT carried back (imputed_vars below excludes them), so the analysis data
-# keeps its original Gender and Race, including missing values.
+# Gender and Race are imputed INSIDE the FCS so that no predictor carries NAs
+# into the imputation models. They are NOT carried back (imputed_vars below
+# excludes them), so the analysis data keeps its original Gender and Race,
+# including missing values.
 meth <- make.method(imp12)
 meth["hhidpn"]    <- ""              # ID: never imputed
 meth["age_2012"]  <- "pmm"
@@ -2490,8 +2467,6 @@ HRS_2012 <- hrs12_clean %>%
 ```
 
 
-
-
 ```{r}
 # HRS data 2014 (Wave 12)
 df_8 <- hrs_2022summary
@@ -2532,7 +2507,7 @@ hrs_cov_2014 <- df_8 %>%
     across(all_of(cov_actual_2014))
   ) %>%
   mutate(
-    # FIX: prefer R12AGEY_E; fall back to year - birth_year
+    # prefer R12AGEY_E; fall back to year - birth_year
     age_2014 = coalesce(
       as.numeric(R12AGEY_E),
       if_else(!is.na(birth_year), as.numeric(year - birth_year), NA_real_)
@@ -2543,7 +2518,7 @@ hrs_cov_2014 <- df_8 %>%
       TRUE ~ NA_integer_
     ),
 
-    # FIX: HS grad (3) belongs with HS tier, not college
+    # HS grad (3) belongs with HS tier, not college
     Education = case_when(
       is.na(RAEDUC)       ~ NA_integer_,
       RAEDUC == 1         ~ 0L,
@@ -2552,7 +2527,7 @@ hrs_cov_2014 <- df_8 %>%
       TRUE ~ NA_integer_
     ),
 
-    # FIX: include partnered/spouse-absent (codes 2, 3) as married/partnered
+    # include partnered/spouse-absent (codes 2, 3) as married/partnered
     Marital_status = case_when(
       R12MSTAT %in% c(1, 2, 3)       ~ 1L,
       R12MSTAT %in% c(4, 5, 6, 7, 8) ~ 0L,
@@ -2577,7 +2552,7 @@ hrs_cov_2014 <- df_8 %>%
       TRUE ~ NA_integer_
     ),
 
-    # FIX: NH White still classified when RAHISPAN missing
+    # NH White still classified when RAHISPAN missing
     Race = case_when(
       (RAHISPAN == 0 | is.na(RAHISPAN)) & RARACEM == 1 ~ 0L,
       RAHISPAN == 1 | RARACEM %in% c(2, 3)              ~ 1L,
@@ -2608,8 +2583,6 @@ lw_2014 <- hrs_LangaWeir %>%
   )
 
 ```
-
-
 
 
 ```{r}
@@ -2658,7 +2631,7 @@ sensory_2014 <- fat14 %>%
       oc095 %in% c(4, 5, 6) ~ 1L,    # 6 = Legally Blind → impaired
       TRUE ~ NA_integer_
     ),
-    # FIX: legally blind (oc095==6) → impaired for far/near (skip-coded)
+    # legally blind (oc095==6) → impaired for far/near (skip-coded)
     vision_far = case_when(
       oc095 == 6            ~ 1L,
       oc096 %in% c(1, 2, 3) ~ 0L,
@@ -2671,7 +2644,7 @@ sensory_2014 <- fat14 %>%
       oc097 %in% c(4, 5)    ~ 1L,
       TRUE ~ NA_integer_
     ),
-    # FIX: skip-pattern (no diagnosis) NaN → 0
+    # skip-pattern (no diagnosis) NaN → 0
     cataract_surgery = case_when(
       oc098 == 1         ~ 1L,
       oc098 == 5         ~ 0L,
@@ -2835,7 +2808,6 @@ hrs_fi_2014_final <- hrs_fi_2014_orig %>%
 ```
 
 
-
 ```{r}
 # 6. Merge 2014 data
 hrs_2014 <- hrs_cov_2014 %>%
@@ -2879,11 +2851,10 @@ imp14 <- hrs_2014 %>%
   mutate(Gender = factor(Gender, levels = c(1, 2)))
 
 # Define imputation methods
-# FIX (specification): Gender and Race previously had method "" while remaining
-# in the predictor matrix, so mice never filled their missing cells and NAs were
-# fed into every imputation model. They are now imputed INSIDE the FCS but are
-# NOT carried back (imputed_vars below excludes them), so the analysis data
-# keeps its original Gender and Race, including missing values.
+# Gender and Race are imputed INSIDE the FCS so that no predictor carries NAs
+# into the imputation models. They are NOT carried back (imputed_vars below
+# excludes them), so the analysis data keeps its original Gender and Race,
+# including missing values.
 meth <- make.method(imp14)
 meth["hhidpn"]    <- ""              # ID: never imputed
 meth["age_2014"]  <- "pmm"
@@ -2943,8 +2914,6 @@ HRS_2014 <- hrs14_clean %>%
 ```
 
 
-
-
 ```{r}
 # HRS data 2016 (Wave 13)
 df_9 <- hrs_2022summary
@@ -2985,7 +2954,7 @@ hrs_cov_2016 <- df_9 %>%
     across(all_of(cov_actual_2016))
   ) %>%
   mutate(
-    # FIX: prefer R13AGEY_E; fall back to year - birth_year
+    # prefer R13AGEY_E; fall back to year - birth_year
     age_2016 = coalesce(
       as.numeric(R13AGEY_E),
       if_else(!is.na(birth_year), as.numeric(year - birth_year), NA_real_)
@@ -2996,7 +2965,7 @@ hrs_cov_2016 <- df_9 %>%
       TRUE ~ NA_integer_
     ),
 
-    # FIX: HS grad (3) belongs with HS tier, not college
+    # HS grad (3) belongs with HS tier, not college
     Education = case_when(
       is.na(RAEDUC)       ~ NA_integer_,
       RAEDUC == 1         ~ 0L,
@@ -3005,7 +2974,7 @@ hrs_cov_2016 <- df_9 %>%
       TRUE ~ NA_integer_
     ),
 
-    # FIX: include partnered/spouse-absent (codes 2, 3) as married/partnered
+    # include partnered/spouse-absent (codes 2, 3) as married/partnered
     Marital_status = case_when(
       R13MSTAT %in% c(1, 2, 3)       ~ 1L,
       R13MSTAT %in% c(4, 5, 6, 7, 8) ~ 0L,
@@ -3030,7 +2999,7 @@ hrs_cov_2016 <- df_9 %>%
       TRUE ~ NA_integer_
     ),
 
-    # FIX: NH White still classified when RAHISPAN missing
+    # NH White still classified when RAHISPAN missing
     Race = case_when(
       (RAHISPAN == 0 | is.na(RAHISPAN)) & RARACEM == 1 ~ 0L,
       RAHISPAN == 1 | RARACEM %in% c(2, 3)              ~ 1L,
@@ -3061,7 +3030,6 @@ lw_2016 <- hrs_LangaWeir %>%
   )
 
 ```
-
 
 
 ```{r}
@@ -3110,7 +3078,7 @@ sensory_2016 <- fat16 %>%
       pc095 %in% c(4, 5, 6) ~ 1L,    # 6 = Legally Blind → impaired
       TRUE ~ NA_integer_
     ),
-    # FIX: legally blind (pc095==6) → impaired for far/near (skip-coded)
+    # legally blind (pc095==6) → impaired for far/near (skip-coded)
     vision_far = case_when(
       pc095 == 6            ~ 1L,
       pc096 %in% c(1, 2, 3) ~ 0L,
@@ -3123,7 +3091,7 @@ sensory_2016 <- fat16 %>%
       pc097 %in% c(4, 5)    ~ 1L,
       TRUE ~ NA_integer_
     ),
-    # FIX: skip-pattern (no diagnosis) NaN → 0
+    # skip-pattern (no diagnosis) NaN → 0
     cataract_surgery = case_when(
       pc098 == 1         ~ 1L,
       pc098 == 5         ~ 0L,
@@ -3287,8 +3255,6 @@ hrs_fi_2016_final <- hrs_fi_2016_orig %>%
 ```
 
 
-
-
 ```{r}
 # 6. Merge 2016 data
 hrs_2016 <- hrs_cov_2016 %>%
@@ -3332,11 +3298,10 @@ imp16 <- hrs_2016 %>%
   mutate(Gender = factor(Gender, levels = c(1, 2)))
 
 # Define imputation methods
-# FIX (specification): Gender and Race previously had method "" while remaining
-# in the predictor matrix, so mice never filled their missing cells and NAs were
-# fed into every imputation model. They are now imputed INSIDE the FCS but are
-# NOT carried back (imputed_vars below excludes them), so the analysis data
-# keeps its original Gender and Race, including missing values.
+# Gender and Race are imputed INSIDE the FCS so that no predictor carries NAs
+# into the imputation models. They are NOT carried back (imputed_vars below
+# excludes them), so the analysis data keeps its original Gender and Race,
+# including missing values.
 meth <- make.method(imp16)
 meth["hhidpn"]    <- ""              # ID: never imputed
 meth["age_2016"]  <- "pmm"
@@ -3394,7 +3359,6 @@ HRS_2016 <- hrs16_clean %>%
   )
     
 ```
-
 
 
 ```{r}
@@ -3509,7 +3473,6 @@ lw_2018 <- hrs_LangaWeir %>%
   )
 
 ```
-
 
 
 ```{r}
@@ -3744,8 +3707,6 @@ hrs_fi_2018_final <- hrs_fi_2018_orig %>%
 ```
 
 
-
-
 ```{r}
 # 6. Merge 2018 data
 hrs_2018 <- hrs_cov_2018 %>%
@@ -3789,11 +3750,10 @@ imp18 <- hrs_2018 %>%
   mutate(Gender = factor(Gender, levels = c(1, 2)))
 
 # Define imputation methods
-# FIX (specification): Gender and Race previously had method "" while remaining
-# in the predictor matrix, so mice never filled their missing cells and NAs were
-# fed into every imputation model. They are now imputed INSIDE the FCS but are
-# NOT carried back (imputed_vars below excludes them), so the analysis data
-# keeps its original Gender and Race, including missing values.
+# Gender and Race are imputed INSIDE the FCS so that no predictor carries NAs
+# into the imputation models. They are NOT carried back (imputed_vars below
+# excludes them), so the analysis data keeps its original Gender and Race,
+# including missing values.
 meth <- make.method(imp18)
 meth["hhidpn"]    <- ""              # ID: never imputed
 meth["age_2018"]  <- "pmm"
@@ -3853,7 +3813,6 @@ HRS_2018 <- hrs18_clean %>%
 ```
 
 
-
 ```{r}
 # HRS data 2020 (Wave 15)
 df_11 <- hrs_2022summary
@@ -3894,7 +3853,7 @@ hrs_cov_2020 <- df_11 %>%
     across(all_of(cov_actual_2020))
   ) %>%
   mutate(
-    # FIX: prefer R15AGEY_E; fall back to year - birth_year
+    # prefer R15AGEY_E; fall back to year - birth_year
     age_2020 = coalesce(
       as.numeric(R15AGEY_E),
       if_else(!is.na(birth_year), as.numeric(year - birth_year), NA_real_)
@@ -3905,7 +3864,7 @@ hrs_cov_2020 <- df_11 %>%
       TRUE ~ NA_integer_
     ),
 
-    # FIX: HS grad (3) belongs with HS tier, not college
+    # HS grad (3) belongs with HS tier, not college
     Education = case_when(
       is.na(RAEDUC)       ~ NA_integer_,
       RAEDUC == 1         ~ 0L,
@@ -3914,7 +3873,7 @@ hrs_cov_2020 <- df_11 %>%
       TRUE ~ NA_integer_
     ),
 
-    # FIX: include partnered/spouse-absent (codes 2, 3) as married/partnered
+    # include partnered/spouse-absent (codes 2, 3) as married/partnered
     Marital_status = case_when(
       R15MSTAT %in% c(1, 2, 3)       ~ 1L,
       R15MSTAT %in% c(4, 5, 6, 7, 8) ~ 0L,
@@ -3939,7 +3898,7 @@ hrs_cov_2020 <- df_11 %>%
       TRUE ~ NA_integer_
     ),
 
-    # FIX: NH White still classified when RAHISPAN missing
+    # NH White still classified when RAHISPAN missing
     Race = case_when(
       (RAHISPAN == 0 | is.na(RAHISPAN)) & RARACEM == 1 ~ 0L,
       RAHISPAN == 1 | RARACEM %in% c(2, 3)              ~ 1L,
@@ -3970,7 +3929,6 @@ lw_2020 <- hrs_LangaWeir %>%
   )
 
 ```
-
 
 
 ```{r}
@@ -4019,7 +3977,7 @@ sensory_2020 <- fat20 %>%
       rc095 %in% c(4, 5, 6) ~ 1L,    # 6 = Legally Blind → impaired
       TRUE ~ NA_integer_
     ),
-    # FIX: legally blind (rc095==6) → impaired for far/near (skip-coded)
+    # legally blind (rc095==6) → impaired for far/near (skip-coded)
     vision_far = case_when(
       rc095 == 6            ~ 1L,
       rc096 %in% c(1, 2, 3) ~ 0L,
@@ -4032,7 +3990,7 @@ sensory_2020 <- fat20 %>%
       rc097 %in% c(4, 5)    ~ 1L,
       TRUE ~ NA_integer_
     ),
-    # FIX: skip-pattern (no diagnosis) NaN → 0
+    # skip-pattern (no diagnosis) NaN → 0
     cataract_surgery = case_when(
       rc098 == 1         ~ 1L,
       rc098 == 5         ~ 0L,
@@ -4196,8 +4154,6 @@ hrs_fi_2020_final <- hrs_fi_2020_orig %>%
 ```
 
 
-
-
 ```{r}
 # 6. Merge 2020 data
 hrs_2020 <- hrs_cov_2020 %>%
@@ -4241,11 +4197,10 @@ imp20 <- hrs_2020 %>%
   mutate(Gender = factor(Gender, levels = c(1, 2)))
 
 # Define imputation methods
-# FIX (specification): Gender and Race previously had method "" while remaining
-# in the predictor matrix, so mice never filled their missing cells and NAs were
-# fed into every imputation model. They are now imputed INSIDE the FCS but are
-# NOT carried back (imputed_vars below excludes them), so the analysis data
-# keeps its original Gender and Race, including missing values.
+# Gender and Race are imputed INSIDE the FCS so that no predictor carries NAs
+# into the imputation models. They are NOT carried back (imputed_vars below
+# excludes them), so the analysis data keeps its original Gender and Race,
+# including missing values.
 meth <- make.method(imp20)
 meth["hhidpn"]    <- ""              # ID: never imputed
 meth["age_2020"]  <- "pmm"
@@ -4305,7 +4260,6 @@ HRS_2020 <- hrs20_clean %>%
 ```
 
 
-
 ```{r}
 library(purrr)
 
@@ -4335,9 +4289,8 @@ hrs_long <- hrs_long %>%
   ) %>%
   dplyr::select(-matches("^age_\\d{4}$"))
 
-# FIX E + D: write to the shared, absolute data_dir (matches HRS_analysis.Rmd)
-# and persist death_track so the analysis notebook can load it standalone
-# instead of relying on this notebook's objects lingering in the session.
+# Write the person-wave data and the mortality table to data_dir. The analysis
+# notebooks read both from disk, so each can be run in a fresh session.
 write_csv(hrs_long, file.path(data_dir, "hrs_long.csv"))
 saveRDS(death_track, file.path(data_dir, "death_track.rds"))
 cat("Wrote:\n  ", file.path(data_dir, "hrs_long.csv"),
@@ -4346,16 +4299,307 @@ cat("Wrote:\n  ", file.path(data_dir, "hrs_long.csv"),
 ```
 
 
-
+# Age in months at each interview (attained-age sensitivity analysis)
 ```{r}
+# Used by the attained-age time scale in HRS_analysis_Cox.Rmd. Written to
+# data/hrs_age_months.csv so the analysis notebook does not need the RAND file.
+AGE_WAVES <- setNames(7:15, seq(2004L, 2020L, by = 2L))   # RAND wave -> year
 
+# ==========================================================================
+# Age in months at every interview, 2004-2020
+# ==========================================================================
+# raw: one row per person with HHIDPN, RABYEAR, RABMONTH and, per wave w,
+# RwIWENDY / RwIWENDM (interview end year / month) and RwAGEM_E (RAND age in
+# months at interview end, used only where the interview date is missing).
+age_months_from_raw <- function(raw) {
+  names(raw) <- toupper(names(raw))
+  num <- function(v) if (v %in% names(raw)) as.numeric(raw[[v]]) else rep(NA_real_, nrow(raw))
+  stopifnot("HHIDPN" %in% names(raw), "RABYEAR" %in% names(raw), "RABMONTH" %in% names(raw))
+  b_ym <- num("RABYEAR") * 12 + num("RABMONTH")
+
+  out <- bind_rows(lapply(seq_along(AGE_WAVES), function(i) {
+    w <- AGE_WAVES[[i]]
+    tibble(
+      hhidpn    = sprintf("%.0f", as.numeric(raw$HHIDPN)),
+      year      = as.integer(names(AGE_WAVES)[i]),
+      age_m_iw  = num(paste0("R", w, "IWENDY")) * 12 + num(paste0("R", w, "IWENDM")) - b_ym,
+      age_m_rnd = num(paste0("R", w, "AGEM_E"))
+    )
+  })) %>%
+    mutate(age_m = coalesce(age_m_iw, age_m_rnd),
+           src   = case_when(!is.na(age_m_iw)  ~ "interview date - birth date",
+                             !is.na(age_m_rnd) ~ "RAND age in months",
+                             TRUE              ~ "missing"))
+
+  both <- out %>% filter(!is.na(age_m_iw), !is.na(age_m_rnd))
+  if (nrow(both))
+    cat("Check: interview-date age vs RAND age in months, |difference| <= 1 month in",
+        sprintf("%.1f%%", 100 * mean(abs(both$age_m_iw - both$age_m_rnd) <= 1)),
+        "of", nrow(both), "person-waves\n")
+  out %>% filter(!is.na(age_m)) %>% dplyr::select(hhidpn, year, age_m, src)
+}
+
+age_cols <- paste0("^(hhidpn|rabyear|rabmonth|r(", paste(AGE_WAVES, collapse = "|"),
+                   ")(iwendy|iwendm|agem_e))$")
+hrs_age_months <- age_months_from_raw(
+  haven::zap_labels(dplyr::select(hrs_2022summary, matches(age_cols, ignore.case = TRUE)))
+)
+write_csv(hrs_age_months, file.path(data_dir, "hrs_age_months.csv"))
+cat("Wrote", file.path(data_dir, "hrs_age_months.csv"), ":", nrow(hrs_age_months),
+    "person-waves\n")
 ```
 
 
-
+# Reduced frailty index: (I)ADL items and affective CES-D items removed
 ```{r}
+# Reduced frailty index for the sensitivity analysis of potentially prodromal
+# dementia symptoms (HRS_analysis_Cox.Rmd). Removed from the 37-item index:
+#   * 6 ADL items   DRESS BATH EAT BED TOILT WALKR
+#   * 5 IADL items  PHONE MONEY MEALS SHOP MEDS
+#   * 4 affective CES-D items  DEPRES (felt depressed), FSAD (felt sad),
+#     FLONE (felt lonely), ENLIFE (did not enjoy life)
+# Kept: mobility (8), chronic conditions (7), self-rated health,
+# underweight, pain, incontinence, and the CES-D items EFFORT and GOING
+# (the Fried exhaustion criterion) and SLEEPR (restless sleep).
+# Same rules as the main index: deficits coded exactly as in the wave chunks
+# above, at least 80% of items answered (18 of 22),
+# score = deficits / items answered, frail if score >= 0.25.
+
+# ---- Paths (as in the wave chunks above) -------------------------------------
+rand_path <- file.path(repo_root, "data/HRS/randhrs1992_2022v1_STATA/randhrs1992_2022v1.dta")
+fat_paths <- c(
+  `2004` = file.path(repo_root, "data/HRS/h04f1c_STATA/h04f1c.dta"),
+  `2006` = file.path(repo_root, "data/HRS/h06f4b_STATA/h06f4b.dta"),
+  `2008` = file.path(repo_root, "data/HRS/h08f3b_STATA/h08f3b.dta"),
+  `2010` = file.path(repo_root, "data/HRS/hd10f6b_STATA/hd10f6b.dta"),
+  `2012` = file.path(repo_root, "data/HRS/h12f3a_STATA/h12f3a.dta"),
+  `2014` = file.path(repo_root, "data/HRS/h14f2b_STATA/h14f2b.dta"),
+  `2016` = file.path(repo_root, "data/HRS/h16f2c_STATA/h16f2c.dta"),
+  `2018` = file.path(repo_root, "data/HRS/h18f2c_STATA/h18f2c.dta"),
+  `2020` = file.path(repo_root, "data/HRS/h20f1b_STATA/h20f1b.dta")
+)
+
+# RAND wave number and core-file letter for each year
+fi_waves <- tibble::tibble(
+  year   = c(2004L, 2006L, 2008L, 2010L, 2012L, 2014L, 2016L, 2018L, 2020L),
+  wave   = 7:15,
+  letter = c("j", "k", "l", "m", "n", "o", "p", "q", "r")
+)
+
+# ---- Items (fi_stems and iadl_stems copied from HRS_dataextract.Rmd) -----------
+fi_stems <- c(
+  "DRESS","BATH","EAT","BED","TOILT","WALKR",
+  "WALK1","WALKS","CLIM1","LIFT","CHAIR","STOOP","DIME","ARMS",
+  "PHONE","MONEY","MEALS","SHOP","MEDS",
+  "HIBP","DIAB","CANCR","ARTHR","LUNG","HEART","STROK",
+  "SHLT",
+  "SLEEPR","DEPRES","EFFORT","FLONE","FSAD","GOING",
+  "ENLIFE",
+  "BMI"
+)
+
+iadl_stems <- c(
+  "DRESS","BATH","EAT","BED","TOILT","WALKR",   # ADL
+  "PHONE","MONEY","MEALS","SHOP","MEDS"         # IADL
+)
+
+affective_cesd_stems <- c("DEPRES","FSAD","FLONE","ENLIFE")
+
+reduced_drop_stems <- c(iadl_stems, affective_cesd_stems)
+
+# ---- RAND file: only the columns needed ------------------------------------------
+if (!exists("hrs_2022summary") || !is.data.frame(hrs_2022summary)) {
+  rand_names <- names(read_dta(rand_path, n_max = 0))
+  rand_keep  <- rand_names[toupper(rand_names) %in%
+                             c("HHIDPN", paste0("R", rep(fi_waves$wave, each = length(fi_stems)),
+                                                fi_stems))]
+  hrs_2022summary <- read_dta(rand_path, col_select = all_of(rand_keep))
+}
+nm_fi     <- setNames(names(hrs_2022summary), toupper(names(hrs_2022summary)))
+id_var_fi <- nm_fi["HHIDPN"]
+
+# ---- Score an index: >= 80% answered, deficits / answered, frail >= 0.25 -------
+score_fi <- function(dat, items) {
+  n_answered <- rowSums(!is.na(dat[items]))
+  valid      <- n_answered >= ceiling(0.80 * length(items))
+  score      <- rowSums(dat[items], na.rm = TRUE) / n_answered
+  tibble::tibble(
+    n_answered = n_answered,
+    FI         = ifelse(valid, score, NA_real_),
+    frail      = ifelse(valid, as.integer(score >= 0.25), NA_integer_)
+  )
+}
+
+# ---- One wave: same recodes as the wave blocks in HRS_dataextract.Rmd ----------
+build_fi_wave <- function(year, wave, letter) {
+  prefix <- paste0("R", wave)
+
+  fi_vars_req    <- paste0(prefix, fi_stems)
+  fi_vars_actual <- nm_fi[fi_vars_req]
+  fi_vars_actual <- fi_vars_actual[!is.na(fi_vars_actual)]
+
+  # pain and incontinence from the core (FAT) file
+  pain_var   <- paste0(letter, "c104")
+  incont_var <- paste0(letter, "c087")
+  fat <- read_dta(fat_paths[[as.character(year)]],
+                  col_select = all_of(c("hhidpn", pain_var, incont_var)))
+  fat_pain_incont <- fat %>%
+    transmute(
+      hhidpn = as.character(hhidpn),
+      pain   = case_when(.data[[pain_var]] == 1 ~ 1,
+                         .data[[pain_var]] == 5 ~ 0,
+                         TRUE ~ NA_real_),
+      incont = case_when(.data[[incont_var]] == 1 ~ 1,
+                         .data[[incont_var]] == 5 ~ 0,
+                         TRUE ~ NA_real_)
+    )
+
+  items <- hrs_2022summary %>%
+    transmute(
+      hhidpn = .data[[id_var_fi]],
+      across(all_of(fi_vars_actual))     # named vector -> renames to uppercase keys
+    ) %>%
+    mutate(
+      # ADL/IADL/Mobility: 0 = no, 1 = yes, 2 = can't do, 7 = don't do (deficit)
+      across(any_of(paste0(prefix, c(
+        "DRESS","BATH","EAT","BED","TOILT","WALKR",
+        "WALK1","WALKS","CLIM1","LIFT","CHAIR","STOOP","DIME","ARMS",
+        "PHONE","MONEY","MEALS","SHOP","MEDS"
+      ))),
+      ~ case_when(.x == 0            ~ 0,
+                  .x %in% c(1, 2, 7) ~ 1,
+                  TRUE ~ NA_real_)),
+
+      across(any_of(paste0(prefix, c("HIBP","DIAB","CANCR","ARTHR","LUNG","HEART"))),
+             ~ case_when(.x %in% c(0, 4) ~ 0,
+                         .x %in% c(1, 3) ~ 1,
+                         TRUE ~ NA_real_)),
+
+      across(any_of(paste0(prefix, "STROK")),
+             ~ case_when(.x %in% c(0, 4)    ~ 0,
+                         .x %in% c(1, 2, 3) ~ 1,
+                         TRUE ~ NA_real_)),
+
+      across(any_of(paste0(prefix, "SHLT")),
+             ~ case_when(.x == 1 ~ 0,
+                         .x == 2 ~ 0.25,
+                         .x == 3 ~ 0.50,
+                         .x == 4 ~ 0.75,
+                         .x == 5 ~ 1,
+                         TRUE ~ NA_real_)),
+
+      across(any_of(paste0(prefix, c("SLEEPR","DEPRES","EFFORT","FLONE","FSAD","GOING"))),
+             ~ case_when(.x == 0 ~ 0,
+                         .x == 1 ~ 1,
+                         TRUE ~ NA_real_)),
+
+      across(any_of(paste0(prefix, "ENLIFE")),
+             ~ case_when(.x == 1 ~ 0,
+                         .x == 0 ~ 1,
+                         TRUE ~ NA_real_)),
+
+      underweight = if (paste0(prefix, "BMI") %in% names(.)) {
+        case_when(.data[[paste0(prefix, "BMI")]] < 18.5  ~ 1,
+                  .data[[paste0(prefix, "BMI")]] >= 18.5 ~ 0,
+                  TRUE ~ NA_real_)
+      } else NA_real_
+    ) %>%
+    dplyr::select(-any_of(paste0(prefix, "BMI"))) %>%
+    mutate(hhidpn = as.character(hhidpn)) %>%
+    left_join(fat_pain_incont, by = "hhidpn")
+
+  items_full    <- setdiff(names(items), c("hhidpn", paste0(prefix, "BMI")))
+  items_noIADL  <- setdiff(items_full, paste0(prefix, iadl_stems))
+  items_reduced <- setdiff(items_full, paste0(prefix, reduced_drop_stems))
+
+  full    <- score_fi(items, items_full)
+  noIADL  <- score_fi(items, items_noIADL)
+  reduced <- score_fi(items, items_reduced)
+
+  not_found <- setdiff(setdiff(fi_stems, "BMI"), sub(paste0("^", prefix), "", items_full))
+  n_full    <- length(items_full)
+  n_reduced <- length(items_reduced)
+  counts <- tibble::tibble(
+    year            = year,
+    items_full      = n_full,
+    cutoff_full     = ceiling(0.80 * n_full),
+    items_noIADL    = length(items_noIADL),
+    items_reduced   = n_reduced,
+    cutoff_reduced  = ceiling(0.80 * n_reduced),
+    stems_not_found = if (length(not_found)) paste(not_found, collapse = " ") else "none"
+  )
+
+  scores <- tibble::tibble(
+    hhidpn                 = items$hhidpn,
+    year                   = year,
+    FI_score_chk           = full$FI,
+    Frailty_status_chk     = full$frail,
+    FI_score_noIADL_chk    = noIADL$FI,
+    FI_score_reduced       = reduced$FI,
+    Frailty_status_reduced = reduced$frail,
+    fi_n_answered_reduced  = reduced$n_answered
+  )
+
+  list(scores = scores, counts = counts)
+}
+
+fi_built <- pmap(fi_waves, build_fi_wave)
+fi_all   <- bind_rows(map(fi_built, "scores"))
+fi_item_counts <- bind_rows(map(fi_built, "counts"))
+
+cat("\n=== Frailty index items per wave ===\n")
+print(as.data.frame(fi_item_counts), row.names = FALSE)
+
+stopifnot(
+  "a person appears twice in one wave (duplicate hhidpn in a RAND or core file)" =
+    !anyDuplicated(fi_all[c("hhidpn", "year")])
+)
+# The main index has 37 items and the reduced index 22; if a stem is missing
+# from a wave, the table above names it.
+if (any(fi_item_counts$items_full != 37) || any(fi_item_counts$items_reduced != 22))
+  warning("Item counts differ from 37 (main) / 22 (reduced) in some waves: see stems_not_found")
+
+# ---- Check: the rebuild reproduces the frailty index in hrs_long.csv -----------
+hrs_long_fi <- read_csv(
+  file.path(data_dir, "hrs_long.csv"),
+  col_types = cols_only(hhidpn = col_character(), year = col_integer(),
+                        FI_score = col_double(), Frailty_status = col_integer(),
+                        FI_score_noIADL = col_double(),
+                        Frailty_status_noIADL = col_integer())
+)
+
+fi_check <- hrs_long_fi %>%
+  left_join(fi_all, by = c("hhidpn", "year"))
+
+same_num <- function(a, b) (is.na(a) & is.na(b)) | (!is.na(a) & !is.na(b) & abs(a - b) < 1e-9)
+fi_mismatch <- c(
+  person_waves_not_rebuilt = sum(!paste(fi_check$hhidpn, fi_check$year) %in%
+                                   paste(fi_all$hhidpn, fi_all$year)),
+  FI_score              = sum(!same_num(fi_check$FI_score, fi_check$FI_score_chk)),
+  Frailty_status        = sum(!same_num(fi_check$Frailty_status, fi_check$Frailty_status_chk)),
+  FI_score_noIADL       = sum(!same_num(fi_check$FI_score_noIADL, fi_check$FI_score_noIADL_chk))
+)
+cat("\n=== Rebuild vs hrs_long.csv (person-waves that differ; all must be 0) ===\n")
+print(fi_mismatch)
+cat("Person-waves in hrs_long.csv:", nrow(fi_check), "\n")
+stopifnot("the rebuilt frailty index does not match hrs_long.csv" = all(fi_mismatch == 0))
+
+# ---- Write -----------------------------------------------------------------------
+hrs_fi_reduced <- fi_check %>%
+  dplyr::select(hhidpn, year, FI_score_reduced, Frailty_status_reduced,
+                fi_n_answered_reduced)
+
+write_csv(hrs_fi_reduced, file.path(data_dir, "hrs_fi_reduced.csv"))
+write_csv(fi_item_counts, file.path(data_dir, "hrs_fi_item_counts.csv"))
+
+cat("\nPerson-waves with a valid index (hrs_long.csv rows):\n")
+print(tibble::tibble(
+  index = c("Main (37 items)", "Reduced (22 items)"),
+  valid = c(sum(!is.na(fi_check$FI_score)), sum(!is.na(hrs_fi_reduced$FI_score_reduced))),
+  valid_on_one_only = c(sum(!is.na(fi_check$FI_score) & is.na(hrs_fi_reduced$FI_score_reduced)),
+                        sum(is.na(fi_check$FI_score) & !is.na(hrs_fi_reduced$FI_score_reduced)))
+))
+cat("Wrote:\n  ", file.path(data_dir, "hrs_fi_reduced.csv"),
+    "\n  ", file.path(data_dir, "hrs_fi_item_counts.csv"), "\n")
 
 ```
-
-
-

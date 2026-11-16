@@ -1,5 +1,5 @@
 ---
-title: "Manuscript figures (forest plots, PAF, transition heatmaps)"
+title: "Manuscript figures: Figs 3-4 and Supplementary Figs 9-17"
 output: html_notebook
 ---
 
@@ -13,8 +13,45 @@ output: html_notebook
   See README.md for setup and run order.
 -->
 
+<!--
+What this notebook draws
+  Fig. 3              Models 1-4: HR + PAF, hearing / vision / frailty, HRS and ELSA
+  Fig. 4              Model 5 (frailty context): HR + PAF, hearing / vision
+  Suppl. Fig. 9       Subgroup analyses by age and sex (forestploter)
+  Suppl. Figs 10-11   Fine-Gray competing-risk sensitivity (HRS only)
+  Suppl. Figs 12-13   Two-wave exposure lag
+  Suppl. Figs 14-15   Reduced frailty index (no (I)ADL / affective CES-D items)
+  Suppl. Figs 16-17   Attained age as the time scale
 
-```{r}
+Where the numbers come from (all identical to the Supplementary Tables)
+(all result files are read from results/, written by the analysis notebooks)
+  * Models 2-5, primary analysis  -> age_timescale_PAF_{HRS,ELSA}.csv, scale == "time_since_baseline"
+                                     (Supplementary Tables 33 and 40)
+  * Model 1, primary analysis      -> not written to a results file; typed in below
+                                     from Supplementary Table 33
+  * Attained-age time scale        -> age_timescale_PAF_{HRS,ELSA}.csv, scale == "attained_age"
+                                     (Supplementary Table 49)
+  * Two-wave lag                   -> lag2_sensitivity_{HRS,ELSA}.csv (Supplementary Tables 45-46)
+  * Reduced frailty index          -> reducedFI_sensitivity_{HRS,ELSA}.csv (Supplementary Tables 47-48)
+  * Fine-Gray (HRS)                -> not written to a results file; typed in below
+                                     from Supplementary Tables 43-44
+  * Person-time prevalence (p_pt)  -> the same CSVs (Fine-Gray and Model 1 reuse the primary p_pt,
+                                     because they use the same analytic sample)
+
+Every figure also writes the exact numbers it plots to <name>_plotted_values.csv,
+so each panel can be checked against the Supplementary Tables.
+-->
+
+```{r setup}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(readr)
+library(patchwork)
+library(scales)
+
+# ---- Paths ------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # Paths are relative to the REPOSITORY ROOT, not to code/.
 #
@@ -25,581 +62,390 @@ output: html_notebook
 # ---------------------------------------------------------------------------
 repo_root <- if (basename(getwd()) == "code") normalizePath("..") else normalizePath(".")
 cat("Repository root:", repo_root, "\n")
+results_dir <- file.path(repo_root, "results")   # written by the analysis notebooks
+out_dir     <- file.path(repo_root, "output")    # figures
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
 
-library(ggplot2)
-library(dplyr)
-library(tidyr)
-library(patchwork)
+f_hrs  <- function(x) file.path(results_dir, x)
+f_elsa <- function(x) file.path(results_dir, x)
 
-```
+# ---- Shared look ------------------------------------------------------------
+pal         <- c(HRS = "#0072B2", ELSA = "#D55E00")   # Okabe-Ito
+base_family <- "Helvetica"
+model_levels <- c("M4", "M3", "M2", "M1")              # M1 drawn on top
 
-
-
-
-```{r}
-# ============================================================================
-# FIGURE 1 — 3 x 2 composite: HR forest plots (left) + PAF lollipops (right)
-# Rows: Hearing / Vision / Frailty
-# ============================================================================
-
-# ---- 1. Hazard ratio data --------------------------------------------------
-res <- tibble::tribble(
-  ~exposure,  ~model, ~cohort, ~HR,   ~lcl,  ~ucl,
-  # Hearing
-  "Hearing",  "M1",   "HRS",   1.88,  1.75,  2.01,
-  "Hearing",  "M1",   "ELSA",  1.93,  1.63,  2.28,
-  "Hearing",  "M2",   "HRS",   1.34,  1.25,  1.44,
-  "Hearing",  "M2",   "ELSA",  1.24,  1.04,  1.47,
-  "Hearing",  "M3",   "HRS",   1.17,  1.09,  1.26,
-  "Hearing",  "M3",   "ELSA",  1.20,  1.01,  1.43,
-  "Hearing",  "M4",   "HRS",   1.10,  1.02,  1.18,
-  "Hearing",  "M4",   "ELSA",  1.08,  0.91,  1.28,
-  # Vision
-  "Vision",   "M1",   "HRS",   2.15,  2.01,  2.31,
-  "Vision",   "M1",   "ELSA",  3.13,  2.63,  3.71,
-  "Vision",   "M2",   "HRS",   1.88,  1.75,  2.01,
-  "Vision",   "M2",   "ELSA",  1.87,  1.56,  2.25,
-  "Vision",   "M3",   "HRS",   1.32,  1.23,  1.42,
-  "Vision",   "M3",   "ELSA",  1.80,  1.50,  2.16,
-  "Vision",   "M4",   "HRS",   1.21,  1.13,  1.30,
-  "Vision",   "M4",   "ELSA",  1.56,  1.30,  1.88,
-  # Frailty
-  "Frailty",  "M1",   "HRS",   2.70,  2.53,  2.88,
-  "Frailty",  "M1",   "ELSA",  4.02,  3.40,  4.76,
-  "Frailty",  "M2",   "HRS",   2.02,  1.89,  2.17,
-  "Frailty",  "M2",   "ELSA",  2.41,  2.01,  2.90,
-  "Frailty",  "M3",   "HRS",   1.50,  1.40,  1.61,
-  "Frailty",  "M3",   "ELSA",  2.29,  1.91,  2.76,
-  "Frailty",  "M4",   "HRS",   1.43,  1.33,  1.54,
-  "Frailty",  "M4",   "ELSA",  2.10,  1.74,  2.53
-)
-
-# ---- 2. PAF data -----------------------------------------------------------
-paf <- tribble(
-  ~cohort, ~exposure,  ~model, ~prev,   ~paf,  ~lo,   ~hi,
-  # HRS
-  "HRS",   "Hearing",  1, 0.2050, 15.2, 13.3, 17.2,
-  "HRS",   "Hearing",  2, 0.2050,  6.5,  4.7,  8.3,
-  "HRS",   "Hearing",  3, 0.2050,  3.4,  1.8,  5.1,
-  "HRS",   "Hearing",  4, 0.2050,  1.9,  0.3,  3.6,
-  "HRS",   "Vision",   1, 0.2220, 20.4, 18.3, 22.4,
-  "HRS",   "Vision",   2, 0.2220, 16.2, 14.2, 18.3,
-  "HRS",   "Vision",   3, 0.2220,  6.7,  4.9,  8.5,
-  "HRS",   "Vision",   4, 0.2220,  4.5,  2.8,  6.3,
-  "HRS",   "Frailty",  1, 0.2900, 33.0, 30.7, 35.3,
-  "HRS",   "Frailty",  2, 0.2900, 22.9, 20.4, 25.4,
-  "HRS",   "Frailty",  3, 0.2900, 12.7, 10.4, 15.1,
-  "HRS",   "Frailty",  4, 0.2900, 11.1,  8.7, 13.4,
-  # ELSA
-  "ELSA",  "Hearing",  1, 0.2053, 16.0, 11.4, 20.9,
-  "ELSA",  "Hearing",  2, 0.2053,  4.6,  0.8,  8.8,
-  "ELSA",  "Hearing",  3, 0.2053,  4.0,  0.2,  8.0,
-  "ELSA",  "Hearing",  4, 0.2053,  1.5, -2.1,  5.4,
-  "ELSA",  "Vision",   1, 0.1267, 21.2, 17.1, 25.5,
-  "ELSA",  "Vision",   2, 0.1267,  9.9,  6.6, 13.7,
-  "ELSA",  "Vision",   3, 0.1267,  9.2,  6.0, 12.8,
-  "ELSA",  "Vision",   4, 0.1267,  6.6,  3.6, 10.0,
-  "ELSA",  "Frailty",  1, 0.1264, 27.7, 23.3, 32.2,
-  "ELSA",  "Frailty",  2, 0.1264, 15.2, 11.3, 19.4,
-  "ELSA",  "Frailty",  3, 0.1264, 14.1, 10.4, 18.3,
-  "ELSA",  "Frailty",  4, 0.1264, 12.2,  8.5, 16.2
-)
-
-# ---- 3. Shared factor levels & colours -------------------------------------
-model_levels <- c("M4", "M3", "M2", "M1")        # M1 on top
-
-# Sensory-impairment exposures (Hearing & Vision): M4 additionally adjusts
-# for frailty status.
 model_labels_sensory <- c(
   M1 = "Model 1\nUnadjusted",
   M2 = "Model 2\n+ chronological age",
-  M3 = "Model 3\n+ sociodemographic\nfactors",
+  M3 = "Model 3\n+ sociodemographic and\nlifestyle factors",
   M4 = "Model 4\n+ frailty status"
 )
-
-# Frailty exposure: M4 additionally adjusts for sensory impairments.
 model_labels_frailty <- c(
   M1 = "Model 1\nUnadjusted",
   M2 = "Model 2\n+ chronological age",
-  M3 = "Model 3\n+ sociodemographic\nfactors",
+  M3 = "Model 3\n+ sociodemographic and\nlifestyle factors",
   M4 = "Model 4\n+ sensory impairments"
 )
+# Attained age is the time scale, so Model 2 adjusts for age through the time scale.
+model_labels_sensory_age <- replace(model_labels_sensory, "M2",
+                                    "Model 2\n+ attained age\n(time scale)")
+model_labels_frailty_age <- replace(model_labels_frailty, "M2",
+                                    "Model 2\n+ attained age\n(time scale)")
 
-# Okabe-Ito colourblind-safe palette
-pal <- c(HRS = "#0072B2", ELSA = "#D55E00")
-
-res <- res %>%
-  mutate(
-    model    = factor(model, levels = model_levels),
-    cohort   = factor(cohort, levels = c("HRS", "ELSA")),
-    exposure = factor(exposure, levels = c("Hearing", "Vision", "Frailty")),
-    label    = sprintf("%.2f (%.2f, %.2f)", HR, lcl, ucl),
-    y_num    = as.numeric(model) + ifelse(cohort == "HRS", 0.18, -0.18)
-  )
-
-paf <- paf %>%
-  mutate(
-    model    = factor(paste0("M", model), levels = model_levels),
-    cohort   = factor(cohort, levels = c("HRS", "ELSA")),
-    exposure = factor(exposure, levels = c("Hearing", "Vision", "Frailty")),
-    paf_lab  = sprintf("%.1f%% (%.1f, %.1f)", paf, lo, hi),
-    y_num    = as.numeric(model) + ifelse(cohort == "HRS", 0.18, -0.18)
-  )
-
-# ---- 4. Unified axis ranges (linear HR scale; tighter right expansion) ----
-hr_xlim     <- c(0.8, 5.0)
-hr_breaks   <- c(1, 2, 3, 4, 5)
-hr_label_x  <- 5.10                  # was 5.25 — closer to axis end
-paf_xlim    <- c(-3, 50)
-paf_breaks  <- c(0, 5, 10, 15, 20, 25, 30, 35)
-paf_label_x <- 36
-
-# ---- 5. Panel builders -----------------------------------------------------
-make_hr_panel <- function(dat, panel_letter, exposure_label,
-                          show_title   = TRUE,
-                          show_x_title = FALSE,
-                          show_y_text  = TRUE,
-                          y_labels     = model_labels_sensory) {
-
-  ggplot(dat, aes(x = HR, y = y_num, colour = cohort)) +
-    geom_vline(xintercept = 1, linetype = "dashed",
-               colour = "grey50", linewidth = 0.25) +
-    geom_errorbarh(aes(xmin = lcl, xmax = ucl),
-                   height = 0, linewidth = 0.45) +
-    geom_point(size = 1.4) +
-    geom_text(aes(x = hr_label_x, label = label),
-              colour = "black", fontface = "plain",
-              hjust = 0, size = 2.0, family = "Helvetica",
-              show.legend = FALSE) +
-    scale_colour_manual(values = pal, name = NULL) +
-    scale_x_continuous(
-      breaks = hr_breaks,
-      limits = hr_xlim,
-      expand = expansion(mult = c(0.02, 0.55)),  # was 0.85 — stretches axis
-      oob    = scales::oob_keep
-    ) +
-    scale_y_continuous(
-      breaks = seq_along(model_levels),
-      labels = if (show_y_text) y_labels[model_levels] else NULL,
-      limits = c(0.4, length(model_levels) + 0.6),
-      expand = expansion(add = 0)
-    ) +
-    guides(colour = guide_legend(
-      override.aes = list(linetype = 0, shape = 16, size = 2.0)
-    )) +
-    labs(
-      title = if (show_title) bquote(bold(.(panel_letter)) ~ ~ .(exposure_label)) else NULL,
-      x     = if (show_x_title) "Hazard ratio for incident dementia" else NULL,
-      y     = NULL
-    ) +
-    coord_cartesian(clip = "off") +
-    theme_classic(base_family = "Helvetica", base_size = 7) +
-    theme(
-      plot.title           = element_text(face = "plain", size = 8,
-                                          hjust = 0,
-                                          margin = margin(b = 4)),
-      axis.line.x          = element_line(linewidth = 0.3),
-      axis.line.y          = element_blank(),
-      axis.ticks.x         = element_line(linewidth = 0.3),
-      axis.ticks.y         = element_blank(),
-      axis.text.y          = if (show_y_text) element_text(size = 6, colour = "black",
-                                                           lineheight = 0.85)
-                             else element_blank(),
-      axis.text.x          = element_text(size = 6, colour = "black"),
-      axis.title.x         = element_text(size = 7, margin = margin(t = 3)),
-      panel.grid           = element_blank(),
-      legend.position      = "top",
-      legend.justification = "right",
-      legend.text          = element_text(size = 7),
-      legend.key.width     = unit(10, "pt"),
-      legend.key.height    = unit(8, "pt"),
-      legend.margin        = margin(0, 0, 0, 0),
-      plot.margin          = margin(4, 12, 4, 4)
-    )
-}
-
-make_paf_panel <- function(dat, panel_letter, exposure_label,
-                           show_title   = TRUE,
-                           show_x_title = FALSE,
-                           show_y_text  = FALSE,
-                           y_labels     = model_labels_sensory) {
-
-  prev_txt <- dat %>%
-    distinct(cohort, prev) %>%
-    mutate(txt = sprintf("%s %.1f%%", cohort, 100 * prev)) %>%
-    summarise(subtitle = paste0("Person-time prevalence: ",
-                                paste(txt, collapse = "  \u00b7  "))) %>%
-    pull(subtitle)
-
-  ggplot(dat, aes(y = y_num, x = paf, colour = cohort)) +
-    geom_vline(xintercept = 0, linetype = "dashed",
-               colour = "grey60", linewidth = 0.25) +
-    geom_segment(aes(x = 0, xend = paf, yend = y_num),
-                 linewidth = 0.45) +
-    geom_point(size = 1.7) +
-    geom_text(aes(x = paf_label_x, label = paf_lab),
-              colour = "black", fontface = "plain",
-              hjust = 0, size = 2.0, family = "Helvetica",
-              show.legend = FALSE) +
-    scale_colour_manual(values = pal, name = NULL, guide = "none") +
-    scale_x_continuous(
-      breaks = paf_breaks,
-      labels = function(x) paste0(x, "%"),
-      limits = paf_xlim,
-      expand = expansion(mult = c(0.02, 0.02))
-    ) +
-    scale_y_continuous(
-      breaks = seq_along(model_levels),
-      labels = if (show_y_text) y_labels[model_levels] else NULL,
-      limits = c(0.4, length(model_levels) + 0.6),
-      expand = expansion(add = 0)
-    ) +
-    labs(
-      title    = if (show_title) bquote(bold(.(panel_letter)) ~ ~ .(exposure_label)) else NULL,
-      subtitle = prev_txt,
-      x        = if (show_x_title) "Population attributable fraction for incident dementia (%)" else NULL,
-      y        = NULL
-    ) +
-    coord_cartesian(clip = "off") +
-    theme_classic(base_family = "Helvetica", base_size = 7) +
-    theme(
-      plot.title           = element_text(face = "plain", size = 8,
-                                          hjust = 0,
-                                          margin = margin(b = 1)),
-      plot.subtitle        = element_text(size = 6, colour = "grey25",
-                                          margin = margin(b = 4)),
-      axis.line.x          = element_line(linewidth = 0.3),
-      axis.line.y          = element_blank(),
-      axis.ticks.x         = element_line(linewidth = 0.3),
-      axis.ticks.y         = element_blank(),
-      axis.text.y          = if (show_y_text) element_text(size = 6, colour = "black",
-                                                           lineheight = 0.85)
-                             else element_blank(),
-      axis.text.x          = element_text(size = 6, colour = "black"),
-      axis.title.x         = element_text(size = 7, margin = margin(t = 3)),
-      panel.grid           = element_blank(),
-      legend.position      = "none",
-      plot.margin          = margin(4, 4, 4, 4)
-    )
-}
-
-# ---- 6. Build six panels ---------------------------------------------------
-# X-axis ticks/labels on every panel; X-axis title only on the bottom row.
-# Right-column (PAF) panels have no panel title.
-# Hearing & Vision get model_labels_sensory (M4 = "+ frailty status").
-# Frailty gets model_labels_frailty (M4 = "+ sensory impairments").
-pA <- make_hr_panel(filter(res, exposure == "Hearing"),
-                    "a", "Hearing impairment",
-                    show_title = TRUE, show_y_text = TRUE,
-                    y_labels   = model_labels_sensory)
-pB <- make_hr_panel(filter(res, exposure == "Vision"),
-                    "b", "Vision impairment",
-                    show_title = TRUE, show_y_text = TRUE,
-                    y_labels   = model_labels_sensory)
-pC <- make_hr_panel(filter(res, exposure == "Frailty"),
-                    "c", "Frailty",
-                    show_title = TRUE, show_y_text = TRUE,
-                    show_x_title = TRUE,
-                    y_labels   = model_labels_frailty)
-
-pD <- make_paf_panel(filter(paf, exposure == "Hearing"),
-                     "", "", show_title = FALSE)
-pE <- make_paf_panel(filter(paf, exposure == "Vision"),
-                     "", "", show_title = FALSE)
-pF <- make_paf_panel(filter(paf, exposure == "Frailty"),
-                     "", "", show_title = FALSE,
-                     show_x_title = TRUE)
-
-# ---- 7. Compose 3 x 2 layout ----------------------------------------------
-fig <- (pA | pD) /
-       (pB | pE) /
-       (pC | pF) +
-  plot_layout(heights = c(1, 1, 1), widths = c(1, 1.05),
-              guides = "collect") &
-  theme(legend.position      = "top",
-        legend.justification = "right",
-        legend.box.margin    = margin(b = -2))
-
-fig
-
-# ---- 8. Save (Nature double-column spec) -----------------------------------
-out_dir <- file.path(repo_root, "output")
-if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
-
-ggsave(file.path(out_dir, "Figure_combined_HR_PAF_HRS_vs_ELSA_nature.png"),
-       fig, width = 183, height = 215, units = "mm",
-       dpi = 600, bg = "white")
-
-ggsave(file.path(out_dir, "Figure_combined_HR_PAF_HRS_vs_ELSA_nature.pdf"),
-       fig, width = 183, height = 215, units = "mm",
-       device = cairo_pdf, bg = "white")
-
-```
-
-
-
-
-```{r table4-context-paf}
-# ============================================================================
-# FIGURE 2 — Table 4: Context-specific sensory impairment (fully adjusted)
-# 2 x 2 composite: HR forest (left) + PAF lollipop (right); rows = Hearing/Vision
-# ============================================================================
-
-# ---- 1. Table 4 hazard ratios ---------------------------------------------
-hr_t4 <- tibble::tribble(
-  ~exposure, ~pathway,    ~cohort, ~N,     ~HR,  ~lcl, ~ucl,
-  # Hearing
-  "Hearing", "Before",    "HRS",   5132,   0.88, 0.78, 0.99,
-  "Hearing", "With/subsequent to","HRS",   4859,   1.31, 1.21, 1.43,
-  "Hearing", "Before",    "ELSA",  4130,   0.91, 0.73, 1.13,
-  "Hearing", "With/subsequent to","ELSA",  1514,   1.70, 1.37, 2.10,
-  # Vision
-  "Vision",  "Before",    "HRS",   5824,   1.03, 0.91, 1.15,
-  "Vision",  "With/subsequent to","HRS",   6115,   1.44, 1.33, 1.55,
-  "Vision",  "Before",    "ELSA",  3118,   1.22, 0.95, 1.57,
-  "Vision",  "With/subsequent to","ELSA",  1762,   2.28, 1.84, 2.82
-)
-
-# ---- 2. Table 4 PAFs (including total context-PAF) -------------------------
-paf_t4 <- tibble::tribble(
-  ~exposure, ~pathway,    ~cohort, ~paf, ~lo,  ~hi,
-  # Hearing
-  "Hearing", "Before",    "HRS",   -1.1, -2.1, -0.1,
-  "Hearing", "With/subsequent to","HRS",    3.4,  2.3,  4.6,
-  "Hearing", "Total",     "HRS",    2.3,  0.7,  4.0,
-  "Hearing", "Before",    "ELSA",  -1.3, -3.9,  1.7,
-  "Hearing", "With/subsequent to","ELSA",   4.2,  2.3,  6.5,
-  "Hearing", "Total",     "ELSA",   2.9, -0.6,  6.9,
-  # Vision
-  "Vision",  "Before",    "HRS",    0.2, -0.7,  1.3,
-  "Vision",  "With/subsequent to","HRS",    5.5,  4.3,  6.9,
-  "Vision",  "Total",     "HRS",    5.8,  4.0,  7.6,
-  "Vision",  "Before",    "ELSA",   1.5, -0.4,  3.8,
-  "Vision",  "With/subsequent to","ELSA",   6.4,  4.3,  8.8,
-  "Vision",  "Total",     "ELSA",   7.9,  4.9, 11.3
-)
-
-# ---- 3. Shared factor levels and cohort palette ----------------------------
-pathway_levels <- c("Total", "With/subsequent to", "Before")
 pathway_labels <- c(
-  "Before"             = "Before frailty onset",
-  "With/subsequent to" = "With or subsequent to frailty onset",
-  "Total"              = "Total context"
+  Before = "Before frailty onset",
+  With   = "With or subsequent to\nfrailty onset",
+  Total  = "Total context"
 )
-pal <- c(HRS = "#0072B2", ELSA = "#D55E00")
+exposure_titles <- c(Hearing = "Hearing impairment",
+                     Vision  = "Vision impairment",
+                     Frailty = "Frailty")
+```
 
-hr_t4 <- hr_t4 %>%
-  mutate(
-    pathway  = factor(pathway,  levels = pathway_levels),
-    cohort   = factor(cohort,   levels = c("HRS", "ELSA")),
-    exposure = factor(exposure, levels = c("Hearing", "Vision")),
-    label    = sprintf("%.2f (%.2f, %.2f)", HR, lcl, ucl),
-    y_num    = as.numeric(pathway) + ifelse(cohort == "HRS", 0.18, -0.18)
-  )
+```{r data-helpers}
+# Every loader returns one of two standard long tables:
+#   models  : cohort, exposure, model (M1-M4), HR, lcl, ucl, prev, paf, lo, hi
+#   context : cohort, exposure, pathway (Before / With / Total), HR, lcl, ucl, paf, lo, hi
+# PAFs are on the % scale.
 
-paf_t4 <- paf_t4 %>%
-  mutate(
-    pathway  = factor(pathway,  levels = pathway_levels),
-    cohort   = factor(cohort,   levels = c("HRS", "ELSA")),
-    exposure = factor(exposure, levels = c("Hearing", "Vision")),
-    paf_lab  = sprintf("%.1f%% (%.1f, %.1f)", paf, lo, hi),
-    y_num    = as.numeric(pathway) + ifelse(cohort == "HRS", 0.18, -0.18)
-  )
+exposure_from <- function(x) case_when(
+  grepl("^Hearing", x) ~ "Hearing",
+  grepl("^Vision",  x) ~ "Vision",
+  grepl("^Frailty", x) ~ "Frailty"
+)
+pathway_from <- function(x) case_when(
+  grepl("no frailty yet",  x) ~ "Before",
+  grepl("frailty present", x) ~ "With",
+  grepl("^Total",          x) ~ "Total"
+)
 
-# ---- 4. Unified axis ranges (linear HR scale) ------------------------------
-hr_xlim_t4    <- c(0.65, 3.0)
-hr_breaks_t4  <- c(1, 1.5, 2, 2.5, 3)
-hr_label_x4   <- 3.15
-paf_xlim_t4   <- c(-6, 18)
-paf_breaks_t4 <- c(-2, 0, 2, 4, 6, 8, 10)
-paf_label_x4  <- 10.5
-
-# ---- 5. Panel builders ----------------------------------------------------
-make_hr_panel_t4 <- function(dat, panel_letter, exposure_label,
-                             show_title   = TRUE,
-                             show_x_title = FALSE,
-                             show_y_text  = TRUE) {
-
-  # Blank placeholder at the "Total" y position so the HR panel aligns
-  # vertically with the PAF panel (which has a Total row).
-  blank_total <- dat %>% distinct(cohort) %>%
-    mutate(pathway = factor("Total", levels = pathway_levels),
-           y_num   = as.numeric(pathway) +
-                     ifelse(cohort == "HRS", 0.18, -0.18))
-
-  ggplot(dat, aes(x = HR, y = y_num, colour = cohort)) +
-    geom_vline(xintercept = 1, linetype = "dashed",
-               colour = "grey50", linewidth = 0.25) +
-    geom_errorbarh(aes(xmin = lcl, xmax = ucl),
-                   height = 0, linewidth = 0.45) +
-    geom_point(size = 1.6) +
-    geom_text(aes(x = hr_label_x4, label = label),
-              colour = "black", fontface = "plain",
-              hjust = 0, size = 2.0, family = "Helvetica",
-              show.legend = FALSE) +
-    geom_blank(data = blank_total, aes(x = 1, y = y_num, colour = cohort)) +
-    scale_colour_manual(values = pal, name = NULL) +
-    scale_x_continuous(
-      breaks = hr_breaks_t4,
-      limits = hr_xlim_t4,
-      expand = expansion(mult = c(0.02, 0.65)),
-      oob    = scales::oob_keep
-    ) +
-    scale_y_continuous(
-      breaks = seq_along(pathway_levels),
-      labels = if (show_y_text) pathway_labels[pathway_levels] else NULL,
-      limits = c(0.4, length(pathway_levels) + 0.6),
-      expand = expansion(add = 0)
-    ) +
-    guides(colour = guide_legend(
-      override.aes = list(linetype = 0, shape = 16, size = 2.0)
-    )) +
-    labs(
-      title = if (show_title) bquote(bold(.(panel_letter)) ~ ~ .(exposure_label)) else NULL,
-      x     = if (show_x_title) "Hazard ratio for incident dementia" else NULL,
-      y     = NULL
-    ) +
-    coord_cartesian(clip = "off") +
-    theme_classic(base_family = "Helvetica", base_size = 7) +
-    theme(
-      plot.title           = element_text(face = "plain", size = 8,
-                                          hjust = 0,
-                                          margin = margin(b = 4)),
-      axis.line.x          = element_line(linewidth = 0.3),
-      axis.line.y          = element_blank(),
-      axis.ticks.x         = element_line(linewidth = 0.3),
-      axis.ticks.y         = element_blank(),
-      axis.text.y          = if (show_y_text) element_text(size = 6, colour = "black",
-                                                           lineheight = 0.85)
-                             else element_blank(),
-      axis.text.x          = element_text(size = 6, colour = "black"),
-      axis.title.x         = element_text(size = 7, margin = margin(t = 3)),
-      panel.grid           = element_blank(),
-      legend.position      = "top",
-      legend.justification = "right",
-      legend.text          = element_text(size = 7),
-      legend.key.width     = unit(10, "pt"),
-      legend.key.height    = unit(8, "pt"),
-      legend.margin        = margin(0, 0, 0, 0),
-      plot.margin          = margin(4, 12, 4, 4)
-    )
+# ---- age_timescale_PAF_*.csv (primary analysis and attained-age analysis) ----
+read_timescale <- function(cohort, scale_wanted) {
+  path <- if (cohort == "HRS") f_hrs("age_timescale_PAF_HRS.csv")
+          else                 f_elsa("age_timescale_PAF_ELSA.csv")
+  read_csv(path, show_col_types = FALSE) %>%
+    filter(scale == scale_wanted) %>%
+    mutate(cohort = cohort)
 }
 
-make_paf_panel_t4 <- function(dat, panel_letter, exposure_label,
-                              show_title   = TRUE,
-                              show_x_title = FALSE,
-                              show_y_text  = FALSE) {
+timescale_models <- function(cohort, scale_wanted) {
+  read_timescale(cohort, scale_wanted) %>%
+    filter(grepl("^M[234] ", model)) %>%
+    # Model 4: hearing/vision come from the hybrid frailty-adjusted model,
+    # frailty from the mutually adjusted model (as in Supplementary Table 33).
+    filter(!(grepl("^M4", model) & exposure %in% c("Hearing loss", "Vision loss") &
+               !grepl("hybrid", model)),
+           !(grepl("^M4", model) & exposure == "Frailty" &
+               !grepl("mutually", model))) %>%
+    transmute(cohort,
+              exposure = exposure_from(exposure),
+              model    = substr(model, 1, 2),
+              HR, lcl = HR_lcl, ucl = HR_ucl,
+              prev = p_pt,
+              paf = 100 * PAF, lo = 100 * PAF_lcl, hi = 100 * PAF_ucl)
+}
 
-  ggplot(dat, aes(y = y_num, x = paf, colour = cohort)) +
-    geom_vline(xintercept = 0, linetype = "dashed",
-               colour = "grey60", linewidth = 0.25) +
-    geom_segment(aes(x = 0, xend = paf, yend = y_num),
-                 linewidth = 0.45) +
-    geom_point(aes(shape = pathway == "Total"), size = 1.9) +
+timescale_context <- function(cohort, scale_wanted) {
+  read_timescale(cohort, scale_wanted) %>%
+    filter(grepl("^M5", model)) %>%
+    transmute(cohort,
+              pathway  = pathway_from(exposure),   # must come before exposure is overwritten
+              exposure = if_else(grepl("hearing", model), "Hearing", "Vision"),
+              HR, lcl = HR_lcl, ucl = HR_ucl,
+              paf = 100 * PAF, lo = 100 * PAF_lcl, hi = 100 * PAF_ucl)
+}
+
+# ---- lag2_ / reducedFI_sensitivity_*.csv ------------------------------------
+read_sens <- function(prefix, cohort) {
+  path <- if (cohort == "HRS") f_hrs(sprintf("%s_sensitivity_HRS.csv", prefix))
+          else                 f_elsa(sprintf("%s_sensitivity_ELSA.csv", prefix))
+  read_csv(path, show_col_types = FALSE) %>% mutate(cohort = cohort)
+}
+sens_models <- function(prefix) {
+  bind_rows(read_sens(prefix, "HRS"), read_sens(prefix, "ELSA")) %>%
+    filter(grepl("^Model [1-4]$", model)) %>%
+    transmute(cohort,
+              exposure = exposure_from(exposure),
+              model    = sub("Model ", "M", model),
+              HR, lcl = HR_lcl, ucl = HR_ucl,
+              prev = p_pt,
+              paf = 100 * PAF, lo = 100 * PAF_lcl, hi = 100 * PAF_ucl)
+}
+sens_context <- function(prefix) {
+  bind_rows(read_sens(prefix, "HRS"), read_sens(prefix, "ELSA")) %>%
+    filter(grepl("^Model 5", model)) %>%
+    transmute(cohort,
+              pathway  = pathway_from(exposure),   # must come before exposure is overwritten
+              exposure = if_else(grepl("hearing", model), "Hearing", "Vision"),
+              HR, lcl = HR_lcl, ucl = HR_ucl,
+              paf = 100 * PAF, lo = 100 * PAF_lcl, hi = 100 * PAF_ucl)
+}
+
+# ---- Person-time prevalence of each exposure in the primary analytic sample -
+prev_primary <- bind_rows(timescale_models("HRS",  "time_since_baseline"),
+                          timescale_models("ELSA", "time_since_baseline")) %>%
+  distinct(cohort, exposure, prev)
+
+check_complete <- function(d, n_expected, what) {
+  if (nrow(d) != n_expected || anyNA(select(d, -any_of("HR"), -any_of(c("lcl", "ucl")))))
+    stop(sprintf("%s: expected %d complete rows, got %d. Check the input files.",
+                 what, n_expected, nrow(d)))
+  invisible(d)
+}
+```
+
+```{r plot-helpers}
+nice_ceiling <- function(x, step) ceiling(x / step) * step
+nice_floor   <- function(x, step) floor(x / step) * step
+
+# Linear HR axis with room on the right for the "HR (95% CI)" labels.
+hr_axis <- function(d) {
+  lo  <- min(0.8, nice_floor(min(d$lcl, na.rm = TRUE), 0.1))
+  hi  <- nice_ceiling(max(d$ucl, na.rm = TRUE), if (max(d$ucl, na.rm = TRUE) > 2.5) 0.5 else 0.1)
+  brk <- pretty(c(lo, hi), n = 5)
+  brk <- brk[brk >= lo & brk <= hi]
+  list(xlim = c(lo, hi), breaks = brk, label_x = hi + 0.03 * (hi - lo))
+}
+# PAF axis: data range plus room on the right for the "PAF (95% CI)" labels.
+paf_axis <- function(d) {
+  lo   <- min(0, nice_floor(min(d$lo, na.rm = TRUE), 1)) - 1
+  hi   <- max(d$hi, na.rm = TRUE)
+  brk  <- pretty(c(min(0, lo), hi), n = 7)
+  brk  <- brk[brk >= lo & brk <= max(brk[brk <= hi + diff(brk)[1]])]
+  span <- max(brk) - lo
+  list(xlim = c(lo, max(brk) + 0.42 * span), breaks = brk,
+       label_x = max(brk) + 0.04 * span)
+}
+
+with_y <- function(d, level_col, levels) {
+  two <- n_distinct(d$cohort) > 1
+  d %>% mutate(
+    !!level_col := factor(.data[[level_col]], levels = levels),
+    cohort      = factor(cohort, levels = c("HRS", "ELSA")),
+    y_num       = as.numeric(.data[[level_col]]) +
+                  if (two) ifelse(cohort == "HRS", 0.18, -0.18) else 0
+  )
+}
+
+panel_theme <- function(show_y_text, legend = "none") {
+  theme_classic(base_family = base_family, base_size = 7) +
+  theme(
+    plot.title        = element_text(face = "plain", size = 8, hjust = 0,
+                                     margin = margin(b = 4)),
+    plot.subtitle     = element_text(size = 6, colour = "grey25",
+                                     margin = margin(b = 4)),
+    axis.line.x       = element_line(linewidth = 0.3),
+    axis.line.y       = element_blank(),
+    axis.ticks.x      = element_line(linewidth = 0.3),
+    axis.ticks.y      = element_blank(),
+    axis.text.y       = if (show_y_text) element_text(size = 6, colour = "black",
+                                                      lineheight = 0.85)
+                        else element_blank(),
+    axis.text.x       = element_text(size = 6, colour = "black"),
+    axis.title.x      = element_text(size = 7, margin = margin(t = 3)),
+    panel.grid        = element_blank(),
+    legend.position   = legend,
+    legend.justification = "right",
+    legend.text       = element_text(size = 7),
+    legend.key.width  = unit(10, "pt"),
+    legend.key.height = unit(8, "pt"),
+    legend.margin     = margin(0, 0, 0, 0),
+    plot.margin       = margin(4, 12, 4, 4)
+  )
+}
+
+hr_panel <- function(d, ax, y_levels, y_labels, title = NULL,
+                     show_x_title = FALSE, total_placeholder = FALSE) {
+  d <- d %>% mutate(label = sprintf("%.2f (%.2f, %.2f)", HR, lcl, ucl))
+  p <- ggplot(d, aes(x = HR, y = y_num, colour = cohort)) +
+    geom_vline(xintercept = 1, linetype = "dashed", colour = "grey50", linewidth = 0.25) +
+    geom_errorbar(aes(xmin = lcl, xmax = ucl), width = 0, orientation = "y", linewidth = 0.45) +
+    geom_point(size = 1.5) +
+    geom_text(aes(x = ax$label_x, label = label), colour = "black",
+              hjust = 0, size = 2.0, family = base_family, show.legend = FALSE) +
+    scale_colour_manual(values = pal, name = NULL, drop = TRUE) +
+    scale_x_continuous(breaks = ax$breaks, limits = ax$xlim,
+                       expand = expansion(mult = c(0.02, 0.55)),
+                       oob = scales::oob_keep) +
+    scale_y_continuous(breaks = seq_along(y_levels),
+                       labels = y_labels[y_levels],
+                       limits = c(0.4, length(y_levels) + 0.6),
+                       expand = expansion(add = 0)) +
+    guides(colour = guide_legend(override.aes = list(linetype = 0, shape = 16, size = 2))) +
+    labs(title = title,
+         x = if (show_x_title) "Hazard ratio for incident dementia" else NULL,
+         y = NULL) +
+    coord_cartesian(clip = "off") +
+    panel_theme(show_y_text = TRUE, legend = "top")
+  p
+}
+
+paf_panel <- function(d, ax, y_levels, show_x_title = FALSE, prevalence = NULL) {
+  d <- d %>% mutate(paf_lab = sprintf("%.1f%% (%.1f, %.1f)", paf, lo, hi),
+                    is_total = if ("pathway" %in% names(d)) pathway == "Total" else FALSE)
+  subtitle <- NULL
+  if (!is.null(prevalence)) {
+    subtitle <- prevalence %>%
+      mutate(cohort = factor(cohort, levels = c("HRS", "ELSA"))) %>%
+      arrange(cohort) %>%
+      mutate(txt = sprintf("%s %.1f%%", cohort, 100 * prev)) %>%
+      pull(txt) %>% paste(collapse = "  ·  ") %>%
+      paste0("Person-time prevalence: ", .)
+  }
+  ggplot(d, aes(y = y_num, x = paf, colour = cohort)) +
+    geom_vline(xintercept = 0, linetype = "dashed", colour = "grey60", linewidth = 0.25) +
+    geom_segment(aes(x = 0, xend = paf, yend = y_num), linewidth = 0.45) +
+    geom_point(aes(shape = is_total), size = 1.8) +
     scale_shape_manual(values = c(`FALSE` = 16, `TRUE` = 18), guide = "none") +
-    geom_text(aes(x = paf_label_x4, label = paf_lab),
-              colour = "black", fontface = "plain",
-              hjust = 0, size = 2.0, family = "Helvetica",
-              show.legend = FALSE) +
+    geom_text(aes(x = ax$label_x, label = paf_lab), colour = "black",
+              hjust = 0, size = 2.0, family = base_family, show.legend = FALSE) +
     scale_colour_manual(values = pal, name = NULL, guide = "none") +
-    scale_x_continuous(
-      breaks = paf_breaks_t4,
-      labels = function(x) paste0(x, "%"),
-      limits = paf_xlim_t4,
-      expand = expansion(mult = c(0.02, 0.02))
-    ) +
-    scale_y_continuous(
-      breaks = seq_along(pathway_levels),
-      labels = if (show_y_text) pathway_labels[pathway_levels] else NULL,
-      limits = c(0.4, length(pathway_levels) + 0.6),
-      expand = expansion(add = 0)
-    ) +
-    labs(
-      title = if (show_title) bquote(bold(.(panel_letter)) ~ ~ .(exposure_label)) else NULL,
-      x     = if (show_x_title) "Population attributable fraction for incident dementia (%)" else NULL,
-      y     = NULL
-    ) +
+    scale_x_continuous(breaks = ax$breaks, labels = function(x) paste0(x, "%"),
+                       limits = ax$xlim, expand = expansion(mult = c(0.02, 0.02))) +
+    scale_y_continuous(breaks = seq_along(y_levels), labels = NULL,
+                       limits = c(0.4, length(y_levels) + 0.6),
+                       expand = expansion(add = 0)) +
+    labs(subtitle = subtitle,
+         x = if (show_x_title) "Population attributable fraction for incident dementia (%)" else NULL,
+         y = NULL) +
     coord_cartesian(clip = "off") +
-    theme_classic(base_family = "Helvetica", base_size = 7) +
-    theme(
-      plot.title           = element_text(face = "plain", size = 8,
-                                          hjust = 0,
-                                          margin = margin(b = 4)),
-      axis.line.x          = element_line(linewidth = 0.3),
-      axis.line.y          = element_blank(),
-      axis.ticks.x         = element_line(linewidth = 0.3),
-      axis.ticks.y         = element_blank(),
-      axis.text.y          = if (show_y_text) element_text(size = 6, colour = "black",
-                                                           lineheight = 0.85)
-                             else element_blank(),
-      axis.text.x          = element_text(size = 6, colour = "black"),
-      axis.title.x         = element_text(size = 7, margin = margin(t = 3)),
-      panel.grid           = element_blank(),
-      legend.position      = "none",
-      plot.margin          = margin(4, 4, 4, 4)
-    )
+    panel_theme(show_y_text = FALSE) +
+    theme(plot.margin = margin(4, 4, 4, 4))
 }
 
-# ---- 6. Build four panels --------------------------------------------------
-# Letters renumbered: HR panels are a (Hearing) and b (Vision);
-# the right-column PAF panels carry no title.
-qA <- make_hr_panel_t4(filter(hr_t4,  exposure == "Hearing"),
-                       "a", "Hearing impairment",
-                       show_title = TRUE, show_y_text = TRUE)
-qB <- make_paf_panel_t4(filter(paf_t4, exposure == "Hearing"),
-                        "", "", show_title = FALSE)
-qC <- make_hr_panel_t4(filter(hr_t4,  exposure == "Vision"),
-                       "b", "Vision impairment",
-                       show_title = TRUE, show_y_text = TRUE,
-                       show_x_title = TRUE)
-qD <- make_paf_panel_t4(filter(paf_t4, exposure == "Vision"),
-                        "", "", show_title = FALSE,
-                        show_x_title = TRUE)
+compose <- function(rows, heights) {
+  wrap_plots(rows, ncol = 2, widths = c(1, 1.05), heights = heights,
+             guides = "collect") &
+    theme(legend.position = "top", legend.justification = "right",
+          legend.box.margin = margin(b = -2))
+}
 
-# ---- 7. Compose 2 x 2 layout ----------------------------------------------
-fig_t4 <- (qA | qB) /
-          (qC | qD) +
-  plot_layout(heights = c(1, 1), widths = c(1, 1.05),
-              guides = "collect") &
-  theme(legend.position      = "top",
-        legend.justification = "right",
-        legend.box.margin    = margin(b = -2))
+# ---- Figure type A: Models 1-4, rows = hearing / vision / frailty -----------
+fig_models <- function(d, sensory_labels = model_labels_sensory,
+                       frailty_labels = model_labels_frailty) {
+  levels_used <- intersect(model_levels, unique(d$model))
+  d   <- with_y(d, "model", levels_used)
+  axh <- hr_axis(d); axp <- paf_axis(d)
+  rows <- list()
+  exps <- c("Hearing", "Vision", "Frailty")
+  for (i in seq_along(exps)) {
+    e    <- exps[i]; last <- i == length(exps)
+    labs <- if (e == "Frailty") frailty_labels else sensory_labels
+    de   <- filter(d, exposure == e)
+    rows <- c(rows, list(
+      hr_panel(de, axh, levels_used, labs,
+               title = bquote(bold(.(letters[i])) ~ ~ .(exposure_titles[[e]])),
+               show_x_title = last),
+      paf_panel(de, axp, levels_used, show_x_title = last,
+                prevalence = distinct(de, cohort, prev))
+    ))
+  }
+  compose(rows, heights = rep(1, length(exps)))
+}
 
-fig_t4
+# ---- Figure type B: Model 5 context, rows = hearing / vision ----------------
+fig_context <- function(d) {
+  levels_used <- c("Total", "With", "Before")
+  if (!any(d$pathway == "Total")) levels_used <- c("With", "Before")
+  d  <- with_y(d, "pathway", levels_used)
+  dh <- filter(d, pathway != "Total")
+  axh <- hr_axis(dh); axp <- paf_axis(d)
+  rows <- list()
+  exps <- c("Hearing", "Vision")
+  for (i in seq_along(exps)) {
+    e <- exps[i]; last <- i == length(exps)
+    rows <- c(rows, list(
+      hr_panel(filter(dh, exposure == e), axh, levels_used, pathway_labels,
+               title = bquote(bold(.(letters[i])) ~ ~ .(exposure_titles[[e]])),
+               show_x_title = last),
+      paf_panel(filter(d, exposure == e), axp, levels_used, show_x_title = last)
+    ))
+  }
+  compose(rows, heights = c(1, 1))
+}
 
-# ---- 8. Save (Nature double-column spec) ----------------------------------
-out_dir <- file.path(repo_root, "output")
-if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+save_fig <- function(fig, name, height_mm, data = NULL) {
+  ggsave(file.path(out_dir, paste0(name, ".pdf")), fig,
+         width = 183, height = height_mm, units = "mm",
+         device = cairo_pdf, bg = "white")
+  if (requireNamespace("ragg", quietly = TRUE)) {
+    ggsave(file.path(out_dir, paste0(name, ".png")), fig,
+           width = 183, height = height_mm, units = "mm", dpi = 600,
+           device = ragg::agg_png, bg = "white")
+  } else {
+    ggsave(file.path(out_dir, paste0(name, ".png")), fig,
+           width = 183, height = height_mm, units = "mm", dpi = 600, bg = "white")
+  }
+  if (!is.null(data))
+    write_csv(data, file.path(out_dir, paste0(name, "_plotted_values.csv")))
+  message("saved ", name)
+}
+```
 
-ggsave(file.path(out_dir, "Figure_Table4_context_HR_PAF.png"),
-       fig_t4, width = 183, height = 140, units = "mm",
-       dpi = 600, bg = "white")
+```{r figure-3}
+# ============================================================================
+# FIGURE 3 - Models 1-4, HRS and ELSA (Supplementary Table 33)
+# ============================================================================
+# Model 1 is not stored in a results file, so it is typed in from
+# Supplementary Table 33. Prevalence is the primary person-time prevalence.
+model1_primary <- tribble(
+  ~cohort, ~exposure, ~HR,  ~lcl, ~ucl, ~paf, ~lo,  ~hi,
+  "HRS",   "Hearing", 1.95, 1.82, 2.09, 15.8, 13.9, 17.7,
+  "HRS",   "Vision",  2.19, 2.05, 2.34, 20.4, 18.5, 22.4,
+  "HRS",   "Frailty", 2.91, 2.73, 3.10, 34.2, 32.0, 36.4,
+  "ELSA",  "Hearing", 1.97, 1.68, 2.32, 16.7, 12.2, 21.5,
+  "ELSA",  "Vision",  3.18, 2.69, 3.75, 21.8, 17.8, 26.1,
+  "ELSA",  "Frailty", 3.81, 3.26, 4.45, 30.6, 26.2, 35.3
+) %>%
+  mutate(model = "M1") %>%
+  left_join(prev_primary, by = c("cohort", "exposure"))
 
-ggsave(file.path(out_dir, "Figure_Table4_context_HR_PAF.pdf"),
-       fig_t4, width = 183, height = 140, units = "mm",
-       device = cairo_pdf, bg = "white")
+fig3_data <- bind_rows(
+  model1_primary,
+  timescale_models("HRS",  "time_since_baseline"),
+  timescale_models("ELSA", "time_since_baseline")
+) %>% check_complete(24, "Figure 3")
 
+fig3 <- fig_models(fig3_data)
+fig3
+save_fig(fig3, "Figure3_HR_PAF_Models1to4_HRS_ELSA", 215, fig3_data)
+```
+
+```{r figure-4}
+# ============================================================================
+# FIGURE 4 - Model 5, sensory impairment by frailty context (Supplementary Table 40)
+# ============================================================================
+fig4_data <- bind_rows(
+  timescale_context("HRS",  "time_since_baseline"),
+  timescale_context("ELSA", "time_since_baseline")
+) %>% check_complete(12, "Figure 4")
+
+fig4 <- fig_context(fig4_data)
+fig4
+save_fig(fig4, "Figure4_context_HR_PAF_Model5_HRS_ELSA", 140, fig4_data)
 ```
 
 
+<!--
+SUPPLEMENTARY FIG. 9 - Subgroup analyses by age and sex.
+These two chunks read the subgroup_*.rds results written by the Cox notebooks.
+The first chunk draws separate HR and PAF forests, the second the combined version.
+-->
 
-
-```{r}
+```{r suppfig-09-subgroup-separate}
 library(forestploter); library(grid); library(dplyr); library(tidyr)
 library(purrr);       library(tibble); library(ggplot2)
 
 # ---- 1. Load + sanity check ----------------------------------------------
-sub_HRS  <- readRDS(file.path(repo_root, "results/subgroup_HRS.rds"))
-sub_ELSA <- readRDS(file.path(repo_root, "results/subgroup_ELSA.rds"))
+sub_HRS  <- readRDS(f_hrs("subgroup_HRS.rds"))
+sub_ELSA <- readRDS(f_elsa("subgroup_ELSA.rds"))
 
-# Compatibility shim: older saves were flat (m4_h, m4_v, ...), newer ones
-# wrap them in $cox plus $paf and $forest.
-get_cox <- function(x) if (!is.null(x$cox)) x$cox else x
-get_paf <- function(x) {
-  if (!is.null(x$paf)) return(x$paf)
-  stop("PAF data not found in this RDS. Re-save it as a list with ",
-       "$cox / $paf / $forest slots (see the PAF + forest block).")
-}
+# Each file is a list with $cox (fitted subgroup models), $paf and $forest,
+# as saved by the subgroup chunk of the *_analysis_Cox.Rmd notebooks.
+stopifnot(all(c("cox", "paf") %in% names(sub_HRS)),
+          all(c("cox", "paf") %in% names(sub_ELSA)))
+get_cox <- function(x) x$cox
+get_paf <- function(x) x$paf
 cox_HRS  <- get_cox(sub_HRS);   paf_HRS  <- get_paf(sub_HRS)
 cox_ELSA <- get_cox(sub_ELSA);  paf_ELSA <- get_paf(sub_ELSA)
 
@@ -676,13 +522,14 @@ sec_paf <- list(
 
 # ---- 3. Formatters --------------------------------------------------------
 fmt_hr  <- function(x, l, u)
-  ifelse(is.na(x), "\u2014", sprintf("%.2f (%.2f-%.2f)", x, l, u))
+  ifelse(is.na(x), "\u2014", sprintf("%.2f (%.2f, %.2f)", x, l, u))
 fmt_paf <- function(x, l, u)
   ifelse(is.na(x), "\u2014", sprintf("%.1f%% (%.1f, %.1f)", x, l, u))
 fmt_p   <- function(p)
   ifelse(is.na(p), "",
          ifelse(p < .001, "<.001",
-                sub("^0\\.", ".", sprintf("%.2f", p))))
+                # 3 decimals below .01 so e.g. .003 is not shown as ".00"
+                sub("^0\\.", ".", sprintf(ifelse(p < .01, "%.3f", "%.2f"), p))))
 
 # ---- 4. Section-chunk builders (HR and PAF) ------------------------------
 build_section_chunk <- function(res, section_title,
@@ -728,9 +575,9 @@ section_titles <- c(
   m4_v    = "Model 4: Vision impairment",
   m4_f    = "Model 4: Frailty (mutually adjusted)",
   m5_h_nf = "Model 5: Hearing impairment before frailty onset",
-  m5_h_fr = "Model 5: Hearing impairment with or after frailty onset",
+  m5_h_fr = "Model 5: Hearing impairment with or subsequent to frailty onset",
   m5_v_nf = "Model 5: Vision impairment before frailty onset",
-  m5_v_fr = "Model 5: Vision impairment with or after frailty onset"
+  m5_v_fr = "Model 5: Vision impairment with or subsequent to frailty onset"
 )
 
 combined_hr <- bind_rows(map2(
@@ -854,7 +701,7 @@ p_paf <- make_forest(
 )
 
 # ---- 7. Save -------------------------------------------------------------
-dir.create("figures", showWarnings = FALSE)
+# figures are written to out_dir (set in the setup chunk)
 save_horizontal <- function(p, pdf, path, w = 12, row_h = 0.22, pad = 1.5) {
   h <- row_h * nrow(pdf) + pad
   ggsave(paste0(path, ".pdf"), p, width = w, height = h,
@@ -863,8 +710,8 @@ save_horizontal <- function(p, pdf, path, w = 12, row_h = 0.22, pad = 1.5) {
          units = "in", dpi = 600)
   message(sprintf("saved %s (%.1f x %.1f in)", basename(path), w, h))
 }
-save_horizontal(p_hr,  combined_hr,  "figures/forest_subgroup_hr_horizontal")
-save_horizontal(p_paf, combined_paf, "figures/forest_subgroup_paf_horizontal")
+save_horizontal(p_hr,  combined_hr,  file.path(out_dir, "SuppFig09_subgroup_HR_horizontal"))
+save_horizontal(p_paf, combined_paf, file.path(out_dir, "SuppFig09_subgroup_PAF_horizontal"))
 
 print(p_hr)
 print(p_paf)
@@ -872,19 +719,14 @@ print(p_paf)
 ```
 
 
-
-
-
-
-```{r}
+```{r suppfig-09-subgroup-combined}
 library(forestploter); library(grid); library(dplyr); library(tidyr)
 library(purrr);       library(tibble); library(ggplot2)
-# Install once if missing — much sharper PNG anti-aliasing than the default device:
-# install.packages("ragg")
+# ragg (optional) gives sharper PNG anti-aliasing than the default device.
 
 # ---- 1. Load results and sanity-check cohorts ----------------------------
-sub_HRS  <- readRDS(file.path(repo_root, "results/subgroup_HRS.rds"))
-sub_ELSA <- readRDS(file.path(repo_root, "results/subgroup_ELSA.rds"))
+sub_HRS  <- readRDS(f_hrs("subgroup_HRS.rds"))
+sub_ELSA <- readRDS(f_elsa("subgroup_ELSA.rds"))
 
 get_cox <- function(x) if (!is.null(x$cox)) x$cox else x
 get_paf <- function(x) {
@@ -971,7 +813,7 @@ sec_paf <- list(
 # ---- 3. Formatters --------------------------------------------------------
 format_hazard_ratio <- function(estimate, lower, upper)
   ifelse(is.na(estimate), "\u2014",
-         sprintf("%.2f (%.2f-%.2f)", estimate, lower, upper))
+         sprintf("%.2f (%.2f, %.2f)", estimate, lower, upper))
 
 format_paf <- function(estimate, lower, upper)
   ifelse(is.na(estimate), "\u2014",
@@ -980,7 +822,8 @@ format_paf <- function(estimate, lower, upper)
 format_p_value <- function(p)
   ifelse(is.na(p), "",
          ifelse(p < .001, "<.001",
-                sub("^0\\.", ".", sprintf("%.2f", p))))
+                # 3 decimals below .01 so e.g. .003 is not shown as ".00"
+                sub("^0\\.", ".", sprintf(ifelse(p < .01, "%.3f", "%.2f"), p))))
 
 # ---- 4. Section-chunk builder (shared by HR and PAF) --------------------
 build_section_chunk <- function(res, section_title,
@@ -1019,7 +862,6 @@ build_section_chunk <- function(res, section_title,
   )
 }
 
-# CHANGED: "with or after frailty onset" -> "with or subsequent to frailty onset"
 section_titles <- c(
   m4_h    = "Model 4: Hearing impairment",
   m4_v    = "Model 4: Vision impairment",
@@ -1050,22 +892,22 @@ stopifnot(nrow(combined_hr) == nrow(combined_paf),
           identical(combined_hr$row_type, combined_paf$row_type))
 
 # ============================================================================
-# 5. Theme — UPGRADED for print-quality clarity (was tuned for 8.5-pt column)
+# 5. Theme — print-quality sizes for the wide combined figure
 # ============================================================================
 HRS_COLOR  <- "#0072B2"   # navy blue
 ELSA_COLOR <- "#D55E00"   # vermillion
 
 nc_theme <- forest_theme(
-  base_size        = 10.5,                              # was 8.5
+  base_size        = 10.5,
   base_family      = "sans",
-  refline_gp       = gpar(col = "grey40", lty = "dotted", lwd = 0.9),  # was 0.6
+  refline_gp       = gpar(col = "grey40", lty = "dotted", lwd = 0.9),
   ci_pch           = c(15, 15, 16, 16),
   ci_col           = c(HRS_COLOR, HRS_COLOR, ELSA_COLOR, ELSA_COLOR),
   ci_fill          = c(HRS_COLOR, HRS_COLOR, ELSA_COLOR, ELSA_COLOR),
-  ci_lwd           = 1.4,                               # was 0.9
+  ci_lwd           = 1.4,
   ci_Theight       = 0,
-  xaxis_gp         = gpar(cex = 0.90, lwd = 0.8, fontface = "plain"),  # was 0.72, 0.55
-  colhead          = list(fg_params = list(fontface = "bold", cex = 0.95)),  # was 0.80
+  xaxis_gp         = gpar(cex = 0.90, lwd = 0.8, fontface = "plain"),
+  colhead          = list(fg_params = list(fontface = "bold", cex = 0.95)),
   core             = list(bg_params = list(fill = "white", col = NA)),
   arrow_type       = "open",
   arrow_label_just = "end",
@@ -1086,12 +928,12 @@ make_combined_forest <- function(pdf_hr, pdf_paf,
                                  paf_breaks) {
 
   # Wider blank string → CI panel columns get more horizontal real estate,
-  # so HR / PAF distributions read more clearly.  Was 18 spaces.
+  # so HR / PAF distributions read more clearly.
   blank <- paste(rep(" ", 28), collapse = " ")
 
-  # CHANGED: each plotting column now comes BEFORE its value column, so the
-  # forest plot is drawn first and the numeric estimate sits to its right.
-  # New column positions:
+  # Each plotting column comes BEFORE its value column, so the forest plot
+  # is drawn first and the numeric estimate sits to its right.
+  # Column positions:
   #   1  Subgroup
   #   2  HRS  [Hazard ratio]   <- plot  (ci_column)
   #   3  Hazard ratio (95% CI)        <- values
@@ -1125,8 +967,8 @@ make_combined_forest <- function(pdf_hr, pdf_paf,
                       pdf_hr$lo_ELSA,  pdf_paf$lo_ELSA),
     upper      = list(pdf_hr$hi_HRS,   pdf_paf$hi_HRS,
                       pdf_hr$hi_ELSA,  pdf_paf$hi_ELSA),
-    sizes      = 0.60,                                  # was 0.45 — bigger markers
-    ci_column  = c(2, 4, 7, 9),                         # CHANGED: was c(3, 5, 8, 10)
+    sizes      = 0.60,
+    ci_column  = c(2, 4, 7, 9),
     ref_line   = c(1, 0, 1, 0),
     arrow_lab  = list(c("Lower risk",  "Higher risk"),
                       c("Protective",  "Attributable"),
@@ -1144,15 +986,15 @@ make_combined_forest <- function(pdf_hr, pdf_paf,
   section_rows <- which(pdf_hr$row_type == "section")
   for (r in section_rows)
     p <- edit_plot(p, row = r, which = "text",
-                   gp = gpar(fontface = "bold", fontsize = 10.8))   # was 8.8
+                   gp = gpar(fontface = "bold", fontsize = 10.8))
   for (r in which(pdf_hr$row_type == "group"))
     p <- edit_plot(p, row = r, which = "text",
                    gp = gpar(fontface = "bold"))
   for (r in section_rows[-1])
     p <- add_border(p, row = r, part = "body", where = "top",
-                    gp = gpar(lwd = 0.6, col = "grey65"))           # was 0.4
+                    gp = gpar(lwd = 0.6, col = "grey65"))
 
-  # CHANGED: CI-colour columns updated to the new plotting-column positions.
+  # CI colours by plotting column.
   stratum_rows <- which(pdf_hr$row_type == "stratum")
   for (r in stratum_rows) {
     p <- edit_plot(p, row = r, col = 2,  which = "ci",
@@ -1180,14 +1022,14 @@ p_combined <- make_combined_forest(
 )
 
 # ============================================================================
-# 7. Save — print-quality but not pathologically large
+# 7. Save — print quality at a moderate file size
 # ============================================================================
-dir.create("figures", showWarnings = FALSE)
+# figures are written to out_dir (set in the setup chunk)
 
 save_horizontal <- function(plot_obj, source_df, path,
-                            width_in   = 18,     # Nature-friendly; was 20
-                            row_height = 0.26,   # readable; was 0.34
-                            padding    = 1.6,    # was 2.0
+                            width_in   = 18,
+                            row_height = 0.26,
+                            padding    = 1.6,
                             dpi_png    = 600) {  # print-quality without 4x blow-up
 
   height_in <- row_height * nrow(source_df) + padding
@@ -1209,9 +1051,7 @@ save_horizontal <- function(plot_obj, source_df, path,
   }
 
   # TIFF — only if the journal asks for it; otherwise comment out.
-  # CHANGED: route through ggsave so the plot fills the canvas the same way
-  # as the PNG (previous agg_tiff + print() rendered at intrinsic gtable size,
-  # leaving a huge whitespace band and making the plot look low-res).
+  # Routed through ggsave so the plot fills the canvas the same way as the PNG.
   if (requireNamespace("ragg", quietly = TRUE)) {
     ggsave(paste0(path, ".tiff"), plot_obj,
            width  = width_in, height = height_in, units = "in",
@@ -1225,8 +1065,8 @@ save_horizontal <- function(plot_obj, source_df, path,
 }
 
 save_horizontal(p_combined, combined_hr,
-                "figures/forest_subgroup_HR_PAF_combined",
-                width_in   = 24,    # was 18 — 11 columns need it
+                file.path(out_dir, "SuppFig09_subgroup_HR_PAF_combined"),
+                width_in   = 24,    # 11 columns
                 row_height = 0.26,
                 padding    = 1.8)
 
@@ -1234,846 +1074,95 @@ print(p_combined)
 
 ```
 
+```{r suppfig-10-11-finegray}
+# ============================================================================
+# SUPPLEMENTARY FIGS 10-11 - Fine-Gray competing-risk model, HRS only
+# (Supplementary Tables 43 and 44; not stored in a results file, typed in here)
+# ============================================================================
+fg_models <- tribble(
+  ~exposure, ~model, ~HR,  ~lcl, ~ucl, ~paf, ~lo,  ~hi,
+  "Hearing", "M1",   1.79, 1.67, 1.91, 13.5, 11.7, 15.4,
+  "Hearing", "M2",   1.32, 1.22, 1.42,  5.9,  4.2,  7.6,
+  "Hearing", "M3",   1.17, 1.09, 1.26,  3.3,  1.7,  4.9,
+  "Hearing", "M4",   1.12, 1.04, 1.21,  2.3,  0.7,  3.9,
+  "Vision",  "M1",   1.98, 1.85, 2.11, 17.4, 15.5, 19.4,
+  "Vision",  "M2",   1.72, 1.60, 1.85, 13.5, 11.5, 15.5,
+  "Vision",  "M3",   1.23, 1.14, 1.32,  4.7,  3.0,  6.5,
+  "Vision",  "M4",   1.16, 1.07, 1.24,  3.2,  1.6,  5.0,
+  "Frailty", "M1",   2.40, 2.25, 2.57, 27.7, 25.4, 30.0,
+  "Frailty", "M2",   1.82, 1.70, 1.95, 18.2, 15.9, 20.6,
+  "Frailty", "M3",   1.34, 1.25, 1.44,  8.5,  6.4, 10.8,
+  "Frailty", "M4",   1.29, 1.20, 1.39,  7.3,  5.1,  9.6
+) %>%
+  mutate(cohort = "HRS") %>%
+  left_join(prev_primary, by = c("cohort", "exposure")) %>%
+  check_complete(12, "Suppl. Fig. 10")
 
+fg_context <- tribble(
+  ~exposure, ~pathway, ~HR,  ~lcl, ~ucl, ~paf, ~lo,  ~hi,
+  "Hearing", "Before", 0.94, 0.83, 1.06, -0.6, -1.6, 0.5,
+  "Hearing", "With",   1.29, 1.19, 1.41,  2.9,  1.9, 4.0,
+  "Vision",  "Before", 1.00, 0.89, 1.12,  0.0, -1.0, 1.0,
+  "Vision",  "With",   1.33, 1.23, 1.44,  4.0,  2.8, 5.3
+) %>% mutate(cohort = "HRS")
 
-
-```{r}
-
+figS10 <- fig_models(fg_models)
+figS11 <- fig_context(fg_context)
+figS10; figS11
+save_fig(figS10, "SuppFig10_FineGray_HR_PAF_Models1to4_HRS", 215, fg_models)
+save_fig(figS11, "SuppFig11_FineGray_context_HR_PAF_Model5_HRS", 120, fg_context)
 ```
 
-
-
-# SUPPLEMENTARY FIGURE S1 — Fine–Gray competing-risk sensitivity (HRS)
-# (a) Tables 18: Models 1–4, Hearing / Vision / Frailty (3 x 2 layout)
-# (b) Tables 19: Model 5 context-specific, Hearing / Vision  (2 x 2 layout)
-# NOTE: Table 18/19 show a single cohort; data below assume HRS Fine–Gray.
-#       To switch to ELSA, change cohort = "ELSA" and pal entry accordingly.
-```{r}
-# ---- 0. Shared palette ----------------------------------------------------
-library(ggplot2); library(dplyr); library(tibble)
-library(patchwork); library(scales); library(grid)
-
-pal <- c(HRS = "#0072B2", ELSA = "#D55E00")
-
+```{r suppfig-12-13-lag2}
 # ============================================================================
-# 0a. Figure 1-style builders (M1–M4 panels)
+# SUPPLEMENTARY FIGS 12-13 - Two-wave exposure lag (Supplementary Tables 45-46)
 # ============================================================================
-make_hr_panel <- function(dat, panel_letter, exposure_label,
-                          show_title   = TRUE,
-                          show_x_title = FALSE,
-                          show_y_text  = TRUE,
-                          y_labels     = model_labels_sensory) {
+lag_models  <- sens_models("lag2")  %>% check_complete(24, "Suppl. Fig. 12")
+lag_context <- sens_context("lag2") %>% check_complete(12, "Suppl. Fig. 13")
 
-  ggplot(dat, aes(x = HR, y = y_num, colour = cohort)) +
-    geom_vline(xintercept = 1, linetype = "dashed",
-               colour = "grey50", linewidth = 0.25) +
-    geom_errorbarh(aes(xmin = lcl, xmax = ucl),
-                   height = 0, linewidth = 0.45) +
-    geom_point(size = 1.4) +
-    geom_text(aes(x = hr_label_x, label = label),
-              colour = "black", fontface = "plain",
-              hjust = 0, size = 2.0, family = "Helvetica",
-              show.legend = FALSE) +
-    scale_colour_manual(values = pal, name = NULL) +
-    scale_x_continuous(
-      breaks = hr_breaks,
-      limits = hr_xlim,
-      expand = expansion(mult = c(0.02, 0.55)),
-      oob    = scales::oob_keep
-    ) +
-    scale_y_continuous(
-      breaks = seq_along(model_levels),
-      labels = if (show_y_text) y_labels[model_levels] else NULL,
-      limits = c(0.4, length(model_levels) + 0.6),
-      expand = expansion(add = 0)
-    ) +
-    guides(colour = guide_legend(
-      override.aes = list(linetype = 0, shape = 16, size = 2.0)
-    )) +
-    labs(
-      title = if (show_title) bquote(bold(.(panel_letter)) ~ ~ .(exposure_label)) else NULL,
-      x     = if (show_x_title) "Hazard ratio for incident dementia" else NULL,
-      y     = NULL
-    ) +
-    coord_cartesian(clip = "off") +
-    theme_classic(base_family = "Helvetica", base_size = 7) +
-    theme(
-      plot.title           = element_text(face = "plain", size = 8,
-                                          hjust = 0,
-                                          margin = margin(b = 4)),
-      axis.line.x          = element_line(linewidth = 0.3),
-      axis.line.y          = element_blank(),
-      axis.ticks.x         = element_line(linewidth = 0.3),
-      axis.ticks.y         = element_blank(),
-      axis.text.y          = if (show_y_text) element_text(size = 6, colour = "black",
-                                                           lineheight = 0.85)
-                             else element_blank(),
-      axis.text.x          = element_text(size = 6, colour = "black"),
-      axis.title.x         = element_text(size = 7, margin = margin(t = 3)),
-      panel.grid           = element_blank(),
-      legend.position      = "top",
-      legend.justification = "right",
-      legend.text          = element_text(size = 7),
-      legend.key.width     = unit(10, "pt"),
-      legend.key.height    = unit(8, "pt"),
-      legend.margin        = margin(0, 0, 0, 0),
-      plot.margin          = margin(4, 12, 4, 4)
-    )
-}
-
-make_paf_panel <- function(dat, panel_letter, exposure_label,
-                           show_title   = TRUE,
-                           show_x_title = FALSE,
-                           show_y_text  = FALSE,
-                           y_labels     = model_labels_sensory) {
-
-  prev_txt <- dat %>%
-    distinct(cohort, prev) %>%
-    mutate(txt = sprintf("%s %.1f%%", cohort, 100 * prev)) %>%
-    summarise(subtitle = paste0("Person-time prevalence: ",
-                                paste(txt, collapse = "  \u00b7  "))) %>%
-    pull(subtitle)
-
-  ggplot(dat, aes(y = y_num, x = paf, colour = cohort)) +
-    geom_vline(xintercept = 0, linetype = "dashed",
-               colour = "grey60", linewidth = 0.25) +
-    geom_segment(aes(x = 0, xend = paf, yend = y_num),
-                 linewidth = 0.45) +
-    geom_point(size = 1.7) +
-    geom_text(aes(x = paf_label_x, label = paf_lab),
-              colour = "black", fontface = "plain",
-              hjust = 0, size = 2.0, family = "Helvetica",
-              show.legend = FALSE) +
-    scale_colour_manual(values = pal, name = NULL, guide = "none") +
-    scale_x_continuous(
-      breaks = paf_breaks,
-      labels = function(x) paste0(x, "%"),
-      limits = paf_xlim,
-      expand = expansion(mult = c(0.02, 0.02))
-    ) +
-    scale_y_continuous(
-      breaks = seq_along(model_levels),
-      labels = if (show_y_text) y_labels[model_levels] else NULL,
-      limits = c(0.4, length(model_levels) + 0.6),
-      expand = expansion(add = 0)
-    ) +
-    labs(
-      title    = if (show_title) bquote(bold(.(panel_letter)) ~ ~ .(exposure_label)) else NULL,
-      subtitle = prev_txt,
-      x        = if (show_x_title) "Population attributable fraction for incident dementia (%)" else NULL,
-      y        = NULL
-    ) +
-    coord_cartesian(clip = "off") +
-    theme_classic(base_family = "Helvetica", base_size = 7) +
-    theme(
-      plot.title           = element_text(face = "plain", size = 8,
-                                          hjust = 0,
-                                          margin = margin(b = 1)),
-      plot.subtitle        = element_text(size = 6, colour = "grey25",
-                                          margin = margin(b = 4)),
-      axis.line.x          = element_line(linewidth = 0.3),
-      axis.line.y          = element_blank(),
-      axis.ticks.x         = element_line(linewidth = 0.3),
-      axis.ticks.y         = element_blank(),
-      axis.text.y          = if (show_y_text) element_text(size = 6, colour = "black",
-                                                           lineheight = 0.85)
-                             else element_blank(),
-      axis.text.x          = element_text(size = 6, colour = "black"),
-      axis.title.x         = element_text(size = 7, margin = margin(t = 3)),
-      panel.grid           = element_blank(),
-      legend.position      = "none",
-      plot.margin          = margin(4, 4, 4, 4)
-    )
-}
-
-# ============================================================================
-# 0b. Figure 2-style builders (context-specific / Total panels)
-# ============================================================================
-make_hr_panel_t4 <- function(dat, panel_letter, exposure_label,
-                             show_title   = TRUE,
-                             show_x_title = FALSE,
-                             show_y_text  = TRUE) {
-
-  blank_total <- dat %>% distinct(cohort) %>%
-    mutate(pathway = factor("Total", levels = pathway_levels),
-           y_num   = as.numeric(pathway) +
-                     ifelse(cohort == "HRS", 0.18, -0.18))
-
-  ggplot(dat, aes(x = HR, y = y_num, colour = cohort)) +
-    geom_vline(xintercept = 1, linetype = "dashed",
-               colour = "grey50", linewidth = 0.25) +
-    geom_errorbarh(aes(xmin = lcl, xmax = ucl),
-                   height = 0, linewidth = 0.45) +
-    geom_point(size = 1.6) +
-    geom_text(aes(x = hr_label_x4, label = label),
-              colour = "black", fontface = "plain",
-              hjust = 0, size = 2.0, family = "Helvetica",
-              show.legend = FALSE) +
-    geom_blank(data = blank_total, aes(x = 1, y = y_num, colour = cohort)) +
-    scale_colour_manual(values = pal, name = NULL) +
-    scale_x_continuous(
-      breaks = hr_breaks_t4,
-      limits = hr_xlim_t4,
-      expand = expansion(mult = c(0.02, 0.65)),
-      oob    = scales::oob_keep
-    ) +
-    scale_y_continuous(
-      breaks = seq_along(pathway_levels),
-      labels = if (show_y_text) pathway_labels[pathway_levels] else NULL,
-      limits = c(0.4, length(pathway_levels) + 0.6),
-      expand = expansion(add = 0)
-    ) +
-    guides(colour = guide_legend(
-      override.aes = list(linetype = 0, shape = 16, size = 2.0)
-    )) +
-    labs(
-      title = if (show_title) bquote(bold(.(panel_letter)) ~ ~ .(exposure_label)) else NULL,
-      x     = if (show_x_title) "Hazard ratio for incident dementia" else NULL,
-      y     = NULL
-    ) +
-    coord_cartesian(clip = "off") +
-    theme_classic(base_family = "Helvetica", base_size = 7) +
-    theme(
-      plot.title           = element_text(face = "plain", size = 8,
-                                          hjust = 0,
-                                          margin = margin(b = 4)),
-      axis.line.x          = element_line(linewidth = 0.3),
-      axis.line.y          = element_blank(),
-      axis.ticks.x         = element_line(linewidth = 0.3),
-      axis.ticks.y         = element_blank(),
-      axis.text.y          = if (show_y_text) element_text(size = 6, colour = "black",
-                                                           lineheight = 0.85)
-                             else element_blank(),
-      axis.text.x          = element_text(size = 6, colour = "black"),
-      axis.title.x         = element_text(size = 7, margin = margin(t = 3)),
-      panel.grid           = element_blank(),
-      legend.position      = "top",
-      legend.justification = "right",
-      legend.text          = element_text(size = 7),
-      legend.key.width     = unit(10, "pt"),
-      legend.key.height    = unit(8, "pt"),
-      legend.margin        = margin(0, 0, 0, 0),
-      plot.margin          = margin(4, 12, 4, 4)
-    )
-}
-
-make_paf_panel_t4 <- function(dat, panel_letter, exposure_label,
-                              show_title   = TRUE,
-                              show_x_title = FALSE,
-                              show_y_text  = FALSE) {
-
-  ggplot(dat, aes(y = y_num, x = paf, colour = cohort)) +
-    geom_vline(xintercept = 0, linetype = "dashed",
-               colour = "grey60", linewidth = 0.25) +
-    geom_segment(aes(x = 0, xend = paf, yend = y_num),
-                 linewidth = 0.45) +
-    geom_point(aes(shape = pathway == "Total"), size = 1.9) +
-    scale_shape_manual(values = c(`FALSE` = 16, `TRUE` = 18), guide = "none") +
-    geom_text(aes(x = paf_label_x4, label = paf_lab),
-              colour = "black", fontface = "plain",
-              hjust = 0, size = 2.0, family = "Helvetica",
-              show.legend = FALSE) +
-    scale_colour_manual(values = pal, name = NULL, guide = "none") +
-    scale_x_continuous(
-      breaks = paf_breaks_t4,
-      labels = function(x) paste0(x, "%"),
-      limits = paf_xlim_t4,
-      expand = expansion(mult = c(0.02, 0.02))
-    ) +
-    scale_y_continuous(
-      breaks = seq_along(pathway_levels),
-      labels = if (show_y_text) pathway_labels[pathway_levels] else NULL,
-      limits = c(0.4, length(pathway_levels) + 0.6),
-      expand = expansion(add = 0)
-    ) +
-    labs(
-      title = if (show_title) bquote(bold(.(panel_letter)) ~ ~ .(exposure_label)) else NULL,
-      x     = if (show_x_title) "Population attributable fraction for incident dementia (%)" else NULL,
-      y     = NULL
-    ) +
-    coord_cartesian(clip = "off") +
-    theme_classic(base_family = "Helvetica", base_size = 7) +
-    theme(
-      plot.title           = element_text(face = "plain", size = 8,
-                                          hjust = 0,
-                                          margin = margin(b = 4)),
-      axis.line.x          = element_line(linewidth = 0.3),
-      axis.line.y          = element_blank(),
-      axis.ticks.x         = element_line(linewidth = 0.3),
-      axis.ticks.y         = element_blank(),
-      axis.text.y          = if (show_y_text) element_text(size = 6, colour = "black",
-                                                           lineheight = 0.85)
-                             else element_blank(),
-      axis.text.x          = element_text(size = 6, colour = "black"),
-      axis.title.x         = element_text(size = 7, margin = margin(t = 3)),
-      panel.grid           = element_blank(),
-      legend.position      = "none",
-      plot.margin          = margin(4, 4, 4, 4)
-    )
-}
-
-# ============================================================================
-# 1. Supplementary Table 20 — hazard ratios and PAFs (HRS Fine–Gray)
-# ============================================================================
-res_fg <- tibble::tribble(
-  ~exposure, ~model, ~cohort, ~HR,  ~lcl, ~ucl,
-  "Hearing", "M1",   "HRS",   1.83, 1.70, 1.97,
-  "Hearing", "M2",   "HRS",   1.40, 1.29, 1.51,
-  "Hearing", "M3",   "HRS",   1.25, 1.16, 1.35,
-  "Hearing", "M4",   "HRS",   1.18, 1.09, 1.27,
-  "Vision",  "M1",   "HRS",   2.09, 1.95, 2.24,
-  "Vision",  "M2",   "HRS",   1.87, 1.74, 2.01,
-  "Vision",  "M3",   "HRS",   1.34, 1.24, 1.44,
-  "Vision",  "M4",   "HRS",   1.23, 1.14, 1.33,
-  "Frailty", "M1",   "HRS",   2.51, 2.34, 2.69,
-  "Frailty", "M2",   "HRS",   2.00, 1.86, 2.15,
-  "Frailty", "M3",   "HRS",   1.46, 1.36, 1.58,
-  "Frailty", "M4",   "HRS",   1.38, 1.28, 1.49
-)
-
-# NOTE: `prev` (person-time prevalence) is carried over from the previous
-# version -- Supplementary Table 20 does not report it. Update if it changed.
-paf_fg <- tibble::tribble(
-  ~cohort, ~exposure, ~model, ~prev,  ~paf, ~lo,  ~hi,
-  "HRS", "Hearing", 1, 0.2050, 14.8, 12.9, 16.3,
-  "HRS", "Hearing", 2, 0.2050,  9.2,  7.2, 11.5,
-  "HRS", "Hearing", 3, 0.2050,  6.5,  2.6,  8.2,
-  "HRS", "Hearing", 4, 0.2050,  4.9,  3.0,  7.6,
-  "HRS", "Vision",  1, 0.2220, 19.8, 18.7, 21.7,
-  "HRS", "Vision",  2, 0.2220, 17.7, 15.7, 19.6,
-  "HRS", "Vision",  3, 0.2220,  9.5,  7.3, 11.6,
-  "HRS", "Vision",  4, 0.2220,  7.2,  5.1,  9.6,
-  "HRS", "Frailty", 1, 0.2900, 31.1, 28.7, 33.1,
-  "HRS", "Frailty", 2, 0.2900, 25.8, 22.6, 27.6,
-  "HRS", "Frailty", 3, 0.2900, 16.3, 13.6, 19.6,
-  "HRS", "Frailty", 4, 0.2900, 14.2, 11.2, 16.9
-)
-
-# ---- 2. Factor levels, axis ranges (must exist before panels are built) ---
-model_levels <- c("M4", "M3", "M2", "M1")
-model_labels_sensory <- c(
-  M1 = "Model 1\nUnadjusted",
-  M2 = "Model 2\n+ chronological age",
-  M3 = "Model 3\n+ sociodemographic\nfactors",
-  M4 = "Model 4\n+ frailty status"
-)
-model_labels_frailty <- c(
-  M1 = "Model 1\nUnadjusted",
-  M2 = "Model 2\n+ chronological age",
-  M3 = "Model 3\n+ sociodemographic\nfactors",
-  M4 = "Model 4\n+ sensory impairments"
-)
-
-res_fg <- res_fg %>%
-  mutate(model    = factor(model, levels = model_levels),
-         cohort   = factor(cohort, levels = c("HRS", "ELSA")),
-         exposure = factor(exposure, levels = c("Hearing", "Vision", "Frailty")),
-         label    = sprintf("%.2f (%.2f, %.2f)", HR, lcl, ucl),
-         y_num    = as.numeric(model))
-
-paf_fg <- paf_fg %>%
-  mutate(model    = factor(paste0("M", model), levels = model_levels),
-         cohort   = factor(cohort, levels = c("HRS", "ELSA")),
-         exposure = factor(exposure, levels = c("Hearing", "Vision", "Frailty")),
-         paf_lab  = sprintf("%.1f%% (%.1f, %.1f)", paf, lo, hi),
-         y_num    = as.numeric(model))
-
-# Rescaled for the new maxima: HR ucl tops out at 2.69, PAF hi at 33.1
-hr_xlim     <- c(0.8, 2.8)
-hr_breaks   <- c(1, 1.5, 2, 2.5)
-hr_label_x  <- 2.85
-paf_xlim    <- c(-3, 50)
-paf_breaks  <- c(0, 5, 10, 15, 20, 25, 30, 35)
-paf_label_x <- 36
-
-# ---- 3. Build Figure S1a (Models 1–4) -------------------------------------
-pA <- make_hr_panel(filter(res_fg, exposure == "Hearing"),
-                    "a", "Hearing impairment",
-                    show_title = TRUE, show_y_text = TRUE,
-                    y_labels   = model_labels_sensory)
-pB <- make_hr_panel(filter(res_fg, exposure == "Vision"),
-                    "b", "Vision impairment",
-                    show_title = TRUE, show_y_text = TRUE,
-                    y_labels   = model_labels_sensory)
-pC <- make_hr_panel(filter(res_fg, exposure == "Frailty"),
-                    "c", "Frailty",
-                    show_title = TRUE, show_y_text = TRUE,
-                    show_x_title = TRUE,
-                    y_labels   = model_labels_frailty)
-pD <- make_paf_panel(filter(paf_fg, exposure == "Hearing"), "", "", show_title = FALSE)
-pE <- make_paf_panel(filter(paf_fg, exposure == "Vision"),  "", "", show_title = FALSE)
-pF <- make_paf_panel(filter(paf_fg, exposure == "Frailty"), "", "", show_title = FALSE,
-                     show_x_title = TRUE)
-
-fig_S1a <- (pA | pD) / (pB | pE) / (pC | pF) +
-  plot_layout(heights = c(1, 1, 1), widths = c(1, 1.05), guides = "collect") &
-  theme(legend.position = "top", legend.justification = "right",
-        legend.box.margin = margin(b = -2))
-
-fig_S1a
-
-# ============================================================================
-# 4. Supplementary Table 21 — context-specific (Model 5)
-# ============================================================================
-hr_fg_t5 <- tibble::tribble(
-  ~exposure, ~pathway,    ~cohort, ~HR,  ~lcl, ~ucl,
-  "Hearing", "Before",    "HRS",   0.93, 0.82, 1.04,
-  "Hearing", "With/after","HRS",   1.30, 1.19, 1.41,
-  "Vision",  "Before",    "HRS",   1.03, 0.92, 1.16,
-  "Vision",  "With/after","HRS",   1.41, 1.30, 1.53
-)
-
-paf_fg_t5 <- tibble::tribble(
-  ~exposure, ~pathway,    ~cohort, ~paf, ~lo,  ~hi,
-  "Hearing", "Before",    "HRS",   -0.7, -1.6,  0.0,
-  "Hearing", "With/after","HRS",    5.3,  3.9,  7.2,
-  "Vision",  "Before",    "HRS",    0.3, -0.8,  1.5,
-  "Vision",  "With/after","HRS",    8.3,  6.4, 10.6
-)
-
-pathway_levels <- c("Total", "With/after", "Before")
-pathway_labels <- c("Before"     = "Before frailty onset",
-                    "With/after" = "With or after frailty onset",
-                    "Total"      = "Total context")
-
-hr_fg_t5 <- hr_fg_t5 %>%
-  mutate(pathway  = factor(pathway,  levels = pathway_levels),
-         cohort   = factor(cohort,   levels = c("HRS", "ELSA")),
-         exposure = factor(exposure, levels = c("Hearing", "Vision")),
-         label    = sprintf("%.2f (%.2f, %.2f)", HR, lcl, ucl),
-         y_num    = as.numeric(pathway))
-
-paf_fg_t5 <- paf_fg_t5 %>%
-  mutate(pathway  = factor(pathway,  levels = pathway_levels),
-         cohort   = factor(cohort,   levels = c("HRS", "ELSA")),
-         exposure = factor(exposure, levels = c("Hearing", "Vision")),
-         paf_lab  = sprintf("%.1f%% (%.1f, %.1f)", paf, lo, hi),
-         y_num    = as.numeric(pathway))
-
-# Rescaled: HR ucl tops out at 1.53, PAF point at 8.3 (hi 10.6)
-hr_xlim_t4    <- c(0.75, 1.70)
-hr_breaks_t4  <- c(0.8, 1.0, 1.2, 1.4, 1.6)
-hr_label_x4   <- 1.72
-paf_xlim_t4   <- c(-3, 18)
-paf_breaks_t4 <- c(-2, 0, 2, 4, 6, 8)
-paf_label_x4  <- 9.2
-
-qA <- make_hr_panel_t4(filter(hr_fg_t5,  exposure == "Hearing"),
-                       "a", "Hearing impairment",
-                       show_title = TRUE, show_y_text = TRUE)
-qB <- make_paf_panel_t4(filter(paf_fg_t5, exposure == "Hearing"),
-                        "", "", show_title = FALSE)
-qC <- make_hr_panel_t4(filter(hr_fg_t5,  exposure == "Vision"),
-                       "b", "Vision impairment",
-                       show_title = TRUE, show_y_text = TRUE,
-                       show_x_title = TRUE)
-qD <- make_paf_panel_t4(filter(paf_fg_t5, exposure == "Vision"),
-                        "", "", show_title = FALSE,
-                        show_x_title = TRUE)
-
-fig_S1b <- (qA | qB) / (qC | qD) +
-  plot_layout(heights = c(1, 1), widths = c(1, 1.05), guides = "collect") &
-  theme(legend.position = "top", legend.justification = "right",
-        legend.box.margin = margin(b = -2))
-
-fig_S1b
-
-# ---- 5. Save --------------------------------------------------------------
-out_dir <- file.path(repo_root, "output")
-if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
-
-ggsave(file.path(out_dir, "FigureS1a_FineGray_HR_PAF_M1toM4.png"),
-       fig_S1a, width = 183, height = 215, units = "mm", dpi = 600, bg = "white")
-ggsave(file.path(out_dir, "FigureS1a_FineGray_HR_PAF_M1toM4.pdf"),
-       fig_S1a, width = 183, height = 215, units = "mm",
-       device = cairo_pdf, bg = "white")
-
-ggsave(file.path(out_dir, "FigureS1b_FineGray_context_HR_PAF.png"),
-       fig_S1b, width = 183, height = 140, units = "mm", dpi = 600, bg = "white")
-ggsave(file.path(out_dir, "FigureS1b_FineGray_context_HR_PAF.pdf"),
-       fig_S1b, width = 183, height = 140, units = "mm",
-       device = cairo_pdf, bg = "white")
-
+figS12 <- fig_models(lag_models)
+figS13 <- fig_context(lag_context)
+figS12; figS13
+save_fig(figS12, "SuppFig12_Lag2_HR_PAF_Models1to4_HRS_ELSA", 215, lag_models)
+save_fig(figS13, "SuppFig13_Lag2_context_HR_PAF_Model5_HRS_ELSA", 140, lag_context)
 ```
 
-
-
-
-
-```{r}
+```{r suppfig-14-15-reducedFI}
 # ============================================================================
-# SUPPLEMENTARY FIGURE S2 — Lagged 2 waves sensitivity (HRS + ELSA)
-# (a) Table 20: Models 1–4, Hearing / Vision / Frailty (3 x 2)
-# (b) Table 21: Model 5 context-specific, Hearing / Vision (2 x 2 + Total)
+# SUPPLEMENTARY FIGS 14-15 - Reduced frailty index without (I)ADL and affective
+# CES-D items (Supplementary Tables 47-48)
 # ============================================================================
-# ---- 1. Table 20 hazard ratios --------------------------------------------
-res_lag <- tibble::tribble(
-  ~exposure, ~model, ~cohort, ~HR,  ~lcl, ~ucl,
-  # Hearing
-  "Hearing","M1","HRS",  1.76, 1.61, 1.93,
-  "Hearing","M1","ELSA", 1.84, 1.52, 2.21,
-  "Hearing","M2","HRS",  1.25, 1.14, 1.37,
-  "Hearing","M2","ELSA", 1.20, 0.99, 1.45,
-  "Hearing","M3","HRS",  1.11, 1.01, 1.22,
-  "Hearing","M3","ELSA", 1.17, 0.97, 1.42,
-  "Hearing","M4","HRS",  1.05, 0.95, 1.16,
-  "Hearing","M4","ELSA", 1.05, 0.86, 1.27,
-  # Vision
-  "Vision","M1","HRS",   1.97, 1.80, 2.15,
-  "Vision","M1","ELSA",  3.04, 2.51, 3.69,
-  "Vision","M2","HRS",   1.71, 1.56, 1.87,
-  "Vision","M2","ELSA",  1.86, 1.52, 2.28,
-  "Vision","M3","HRS",   1.25, 1.14, 1.37,
-  "Vision","M3","ELSA",  1.78, 1.45, 2.18,
-  "Vision","M4","HRS",   1.17, 1.07, 1.29,
-  "Vision","M4","ELSA",  1.54, 1.26, 1.90,
-  # Frailty
-  "Frailty","M1","HRS",  2.44, 2.25, 2.66,
-  "Frailty","M1","ELSA", 3.98, 3.29, 4.81,
-  "Frailty","M2","HRS",  1.79, 1.64, 1.96,
-  "Frailty","M2","ELSA", 2.45, 2.00, 3.01,
-  "Frailty","M3","HRS",  1.38, 1.26, 1.51,
-  "Frailty","M3","ELSA", 2.31, 1.88, 2.85,
-  "Frailty","M4","HRS",  1.33, 1.22, 1.46,
-  "Frailty","M4","ELSA", 2.13, 1.72, 2.63
-)
-# ---- 2. Table 20 PAFs -----------------------------------------------------
-paf_lag <- tibble::tribble(
-  ~cohort, ~exposure, ~model, ~prev,   ~paf, ~lo,  ~hi,
-  # HRS
-  "HRS","Hearing",1, 0.2050, 13.3, 11.0, 15.8,
-  "HRS","Hearing",2, 0.2050,  4.8,  2.6,  7.0,
-  "HRS","Hearing",3, 0.2050,  2.2,  0.2,  4.3,
-  "HRS","Hearing",4, 0.2050,  1.0, -1.0,  3.0,
-  "HRS","Vision", 1, 0.2220, 17.5, 14.9, 20.0,
-  "HRS","Vision", 2, 0.2220, 13.4, 10.9, 16.0,
-  "HRS","Vision", 3, 0.2220,  5.2,  3.0,  7.5,
-  "HRS","Vision", 4, 0.2220,  3.6,  1.4,  5.9,
-  "HRS","Frailty",1, 0.2900, 29.2, 26.3, 32.2,
-  "HRS","Frailty",2, 0.2900, 18.5, 15.5, 21.6,
-  "HRS","Frailty",3, 0.2900,  9.8,  7.0, 12.8,
-  "HRS","Frailty",4, 0.2900,  8.7,  5.8, 11.6,
-  # ELSA
-  "ELSA","Hearing",1, 0.2053, 14.6,  9.6, 20.0,
-  "ELSA","Hearing",2, 0.2053,  3.9, -0.3,  8.5,
-  "ELSA","Hearing",3, 0.2053,  3.4, -0.8,  7.9,
-  "ELSA","Hearing",4, 0.2053,  1.0, -3.0,  5.3,
-  "ELSA","Vision", 1, 0.1267, 20.5, 15.9, 25.2,
-  "ELSA","Vision", 2, 0.1267,  9.8,  6.1, 14.0,
-  "ELSA","Vision", 3, 0.1267,  8.9,  5.4, 13.0,
-  "ELSA","Vision", 4, 0.1267,  6.4,  3.1, 10.2,
-  "ELSA","Frailty",1, 0.1264, 27.2, 22.3, 32.3,
-  "ELSA","Frailty",2, 0.1264, 15.4, 11.1, 20.2,
-  "ELSA","Frailty",3, 0.1264, 14.2, 10.0, 19.0,
-  "ELSA","Frailty",4, 0.1264, 12.4,  8.3, 16.9
-)
-# ---- 3. Prep --------------------------------------------------------------
-model_levels <- c("M4", "M3", "M2", "M1")
-pal <- c(HRS = "#0072B2", ELSA = "#D55E00")
-res_lag <- res_lag %>%
-  mutate(model    = factor(model, levels = model_levels),
-         cohort   = factor(cohort, levels = c("HRS", "ELSA")),
-         exposure = factor(exposure, levels = c("Hearing", "Vision", "Frailty")),
-         label    = sprintf("%.2f (%.2f, %.2f)", HR, lcl, ucl),
-         y_num    = as.numeric(model) + ifelse(cohort == "HRS", 0.18, -0.18))
-paf_lag <- paf_lag %>%
-  mutate(model    = factor(paste0("M", model), levels = model_levels),
-         cohort   = factor(cohort, levels = c("HRS", "ELSA")),
-         exposure = factor(exposure, levels = c("Hearing", "Vision", "Frailty")),
-         paf_lab  = sprintf("%.1f%% (%.1f, %.1f)", paf, lo, hi),
-         y_num    = as.numeric(model) + ifelse(cohort == "HRS", 0.18, -0.18))
-# Same axis ranges as main Figure 1 (max HR 3.98 fits in 0.8–5.0)
-hr_xlim     <- c(0.8, 5.0); hr_breaks <- c(1, 2, 3, 4, 5); hr_label_x  <- 5.10
-paf_xlim    <- c(-3, 50);   paf_breaks <- c(0, 5, 10, 15, 20, 25, 30, 35); paf_label_x <- 36
-pA <- make_hr_panel(filter(res_lag, exposure == "Hearing"),
-                    "a", "Hearing impairment",
-                    show_title = TRUE, show_y_text = TRUE,
-                    y_labels   = model_labels_sensory)
-pB <- make_hr_panel(filter(res_lag, exposure == "Vision"),
-                    "b", "Vision impairment",
-                    show_title = TRUE, show_y_text = TRUE,
-                    y_labels   = model_labels_sensory)
-pC <- make_hr_panel(filter(res_lag, exposure == "Frailty"),
-                    "c", "Frailty",
-                    show_title = TRUE, show_y_text = TRUE,
-                    show_x_title = TRUE,
-                    y_labels   = model_labels_frailty)
-pD <- make_paf_panel(filter(paf_lag, exposure == "Hearing"), "", "", show_title = FALSE)
-pE <- make_paf_panel(filter(paf_lag, exposure == "Vision"),  "", "", show_title = FALSE)
-pF <- make_paf_panel(filter(paf_lag, exposure == "Frailty"), "", "", show_title = FALSE,
-                     show_x_title = TRUE)
-fig_S2a <- (pA | pD) / (pB | pE) / (pC | pF) +
-  plot_layout(heights = c(1, 1, 1), widths = c(1, 1.05), guides = "collect") &
-  theme(legend.position = "top", legend.justification = "right",
-        legend.box.margin = margin(b = -2))
-fig_S2a
-# ---- 4. Table 21 context-specific (Model 5) -------------------------------
-hr_lag_t5 <- tibble::tribble(
-  ~exposure, ~pathway,    ~cohort, ~HR,  ~lcl, ~ucl,
-  "Hearing", "Before",    "HRS",   0.83, 0.71, 0.97,
-  "Hearing", "With/after","HRS",   1.22, 1.10, 1.35,
-  "Hearing", "Before",    "ELSA",  0.89, 0.70, 1.13,
-  "Hearing", "With/after","ELSA",  1.65, 1.30, 2.10,
-  "Vision",  "Before",    "HRS",   0.94, 0.79, 1.10,
-  "Vision",  "With/after","HRS",   1.35, 1.22, 1.49,
-  "Vision",  "Before",    "ELSA",  1.18, 0.89, 1.57,
-  "Vision",  "With/after","ELSA",  2.20, 1.73, 2.80
-)
-paf_lag_t5 <- tibble::tribble(
-  ~exposure, ~pathway,    ~cohort, ~paf, ~lo,  ~hi,
-  "Hearing","Before",    "HRS",   -1.6, -2.8, -0.2,
-  "Hearing","With/after","HRS",    2.4,  1.1,  3.8,
-  "Hearing","Total",     "HRS",    0.8, -1.2,  2.9,
-  "Hearing","Before",    "ELSA",  -1.6, -4.4,  1.8,
-  "Hearing","With/after","ELSA",   3.9,  1.8,  6.4,
-  "Hearing","Total",     "ELSA",   2.3, -1.5,  6.8,
-  "Vision", "Before",    "HRS",   -0.5, -1.8,  0.8,
-  "Vision", "With/after","HRS",    4.4,  2.8,  6.1,
-  "Vision", "Total",     "HRS",    3.8,  1.7,  6.1,
-  "Vision", "Before",    "ELSA",   1.2, -0.8,  3.8,
-  "Vision", "With/after","ELSA",   6.0,  3.7,  8.6,
-  "Vision", "Total",     "ELSA",   7.2,  3.9, 11.0
-)
-pathway_levels <- c("Total", "With/after", "Before")
-pathway_labels <- c("Before" = "Before frailty onset",
-                    "With/after" = "With or after frailty onset",
-                    "Total" = "Total context")
-hr_lag_t5 <- hr_lag_t5 %>%
-  mutate(pathway  = factor(pathway,  levels = pathway_levels),
-         cohort   = factor(cohort,   levels = c("HRS", "ELSA")),
-         exposure = factor(exposure, levels = c("Hearing", "Vision")),
-         label    = sprintf("%.2f (%.2f, %.2f)", HR, lcl, ucl),
-         y_num    = as.numeric(pathway) + ifelse(cohort == "HRS", 0.18, -0.18))
-paf_lag_t5 <- paf_lag_t5 %>%
-  mutate(pathway  = factor(pathway,  levels = pathway_levels),
-         cohort   = factor(cohort,   levels = c("HRS", "ELSA")),
-         exposure = factor(exposure, levels = c("Hearing", "Vision")),
-         paf_lab  = sprintf("%.1f%% (%.1f, %.1f)", paf, lo, hi),
-         y_num    = as.numeric(pathway) + ifelse(cohort == "HRS", 0.18, -0.18))
-hr_xlim_t4    <- c(0.65, 3.0);  hr_breaks_t4  <- c(1, 1.5, 2, 2.5, 3);  hr_label_x4 <- 3.15
-paf_xlim_t4   <- c(-6, 18);     paf_breaks_t4 <- c(-4, -2, 0, 2, 4, 6, 8, 10); paf_label_x4 <- 10.5
-qA <- make_hr_panel_t4(filter(hr_lag_t5,  exposure == "Hearing"),
-                       "a", "Hearing impairment",
-                       show_title = TRUE, show_y_text = TRUE)
-qB <- make_paf_panel_t4(filter(paf_lag_t5, exposure == "Hearing"),
-                        "", "", show_title = FALSE)
-qC <- make_hr_panel_t4(filter(hr_lag_t5,  exposure == "Vision"),
-                       "b", "Vision impairment",
-                       show_title = TRUE, show_y_text = TRUE,
-                       show_x_title = TRUE)
-qD <- make_paf_panel_t4(filter(paf_lag_t5, exposure == "Vision"),
-                        "", "", show_title = FALSE,
-                        show_x_title = TRUE)
-fig_S2b <- (qA | qB) / (qC | qD) +
-  plot_layout(heights = c(1, 1), widths = c(1, 1.05), guides = "collect") &
-  theme(legend.position = "top", legend.justification = "right",
-        legend.box.margin = margin(b = -2))
-fig_S2b
-# ---- Save ------------------------------------------------------------------
-out_dir <- file.path(repo_root, "output")
-if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
-ggsave(file.path(out_dir, "FigureS2a_Lagged2w_HR_PAF_M1toM4.png"),
-       fig_S2a, width = 183, height = 215, units = "mm", dpi = 600, bg = "white")
-ggsave(file.path(out_dir, "FigureS2a_Lagged2w_HR_PAF_M1toM4.pdf"),
-       fig_S2a, width = 183, height = 215, units = "mm",
-       device = cairo_pdf, bg = "white")
-ggsave(file.path(out_dir, "FigureS2b_Lagged2w_context_HR_PAF.png"),
-       fig_S2b, width = 183, height = 140, units = "mm", dpi = 600, bg = "white")
-ggsave(file.path(out_dir, "FigureS2b_Lagged2w_context_HR_PAF.pdf"),
-       fig_S2b, width = 183, height = 140, units = "mm",
-       device = cairo_pdf, bg = "white")
+rfi_models  <- sens_models("reducedFI")  %>% check_complete(24, "Suppl. Fig. 14")
+rfi_context <- sens_context("reducedFI") %>% check_complete(12, "Suppl. Fig. 15")
 
+figS14 <- fig_models(rfi_models)
+figS15 <- fig_context(rfi_context)
+figS14; figS15
+save_fig(figS14, "SuppFig14_ReducedFI_HR_PAF_Models1to4_HRS_ELSA", 215, rfi_models)
+save_fig(figS15, "SuppFig15_ReducedFI_context_HR_PAF_Model5_HRS_ELSA", 140, rfi_context)
 ```
 
-
-
-
-
-```{r}
+```{r suppfig-16-17-attained-age}
 # ============================================================================
-# SUPPLEMENTARY FIGURE S3 — Frailty index with ADL items removed (HRS + ELSA)
-# (a) Table 22: Models 1–4, Hearing / Vision / Frailty (3 x 2)
-# (b) Table 23: Model 5 context-specific, Hearing / Vision (2 x 2 + Total)
+# SUPPLEMENTARY FIGS 16-17 - Attained age as the time scale
+# (Supplementary Table 49). Model 1 is not part of this analysis: with attained
+# age as the time scale every model is already age-adjusted.
 # ============================================================================
-# ---- 1. Table 22 hazard ratios --------------------------------------------
-res_nadl <- tibble::tribble(
-  ~exposure, ~model, ~cohort, ~HR,  ~lcl, ~ucl,
-  # Hearing
-  "Hearing","M1","HRS",  1.82, 1.69, 1.96,
-  "Hearing","M1","ELSA", 1.92, 1.62, 2.28,
-  "Hearing","M2","HRS",  1.32, 1.22, 1.42,
-  "Hearing","M2","ELSA", 1.24, 1.04, 1.47,
-  "Hearing","M3","HRS",  1.16, 1.08, 1.25,
-  "Hearing","M3","ELSA", 1.20, 1.01, 1.43,
-  "Hearing","M4","HRS",  1.12, 1.04, 1.21,
-  "Hearing","M4","ELSA", 1.10, 0.93, 1.31,
-  # Vision
-  "Vision","M1","HRS",   2.12, 1.98, 2.28,
-  "Vision","M1","ELSA",  3.07, 2.58, 3.65,
-  "Vision","M2","HRS",   1.85, 1.73, 1.99,
-  "Vision","M2","ELSA",  1.84, 1.53, 2.22,
-  "Vision","M3","HRS",   1.31, 1.22, 1.41,
-  "Vision","M3","ELSA",  1.77, 1.48, 2.13,
-  "Vision","M4","HRS",   1.26, 1.17, 1.36,
-  "Vision","M4","ELSA",  1.59, 1.33, 1.92,
-  # Frailty
-  "Frailty","M1","HRS",  2.27, 2.12, 2.43,
-  "Frailty","M1","ELSA", 3.09, 2.62, 3.64,
-  "Frailty","M2","HRS",  1.69, 1.57, 1.81,
-  "Frailty","M2","ELSA", 1.94, 1.63, 2.32,
-  "Frailty","M3","HRS",  1.26, 1.17, 1.35,
-  "Frailty","M3","ELSA", 1.84, 1.54, 2.19,
-  "Frailty","M4","HRS",  1.19, 1.11, 1.29,
-  "Frailty","M4","ELSA", 1.68, 1.41, 2.01
-)
-# ---- 2. Table 22 PAFs -----------------------------------------------------
-paf_nadl <- tibble::tribble(
-  ~cohort, ~exposure, ~model, ~prev,   ~paf, ~lo,  ~hi,
-  # HRS
-  "HRS","Hearing",1, 0.2050, 14.3, 12.3, 16.3,
-  "HRS","Hearing",2, 0.2050,  6.0,  4.2,  7.9,
-  "HRS","Hearing",3, 0.2050,  3.2,  1.5,  4.9,
-  "HRS","Hearing",4, 0.2050,  2.5,  0.8,  4.2,
-  "HRS","Vision", 1, 0.2220, 19.9, 17.8, 22.0,
-  "HRS","Vision", 2, 0.2220, 15.9, 13.8, 18.0,
-  "HRS","Vision", 3, 0.2220,  6.4,  4.6,  8.3,
-  "HRS","Vision", 4, 0.2220,  5.5,  3.7,  7.4,
-  "HRS","Frailty",1, 0.2900, 34.8, 31.9, 37.7,
-  "HRS","Frailty",2, 0.2900, 22.4, 19.2, 25.5,
-  "HRS","Frailty",3, 0.2900,  9.7,  6.6, 12.9,
-  "HRS","Frailty",4, 0.2900,  7.5,  4.3, 10.8,
-  # ELSA
-  "ELSA","Hearing",1, 0.2053, 15.9, 11.3, 20.8,
-  "ELSA","Hearing",2, 0.2053,  4.6,  0.8,  8.9,
-  "ELSA","Hearing",3, 0.2053,  4.0,  0.2,  8.1,
-  "ELSA","Hearing",4, 0.2053,  2.1, -1.6,  6.0,
-  "ELSA","Vision", 1, 0.1267, 20.7, 16.6, 25.0,
-  "ELSA","Vision", 2, 0.1267,  9.6,  6.3, 13.4,
-  "ELSA","Vision", 3, 0.1267,  8.9,  5.7, 12.4,
-  "ELSA","Vision", 4, 0.1267,  7.0,  4.0, 10.4,
-  "ELSA","Frailty",1, 0.1264, 28.6, 23.7, 33.6,
-  "ELSA","Frailty",2, 0.1264, 15.3, 10.7, 20.3,
-  "ELSA","Frailty",3, 0.1264, 13.9,  9.5, 18.8,
-  "ELSA","Frailty",4, 0.1264, 11.6,  7.3, 16.2
-)
-# ---- 3. Prep --------------------------------------------------------------
-model_levels <- c("M4", "M3", "M2", "M1")
-pal <- c(HRS = "#0072B2", ELSA = "#D55E00")
-res_nadl <- res_nadl %>%
-  mutate(model    = factor(model, levels = model_levels),
-         cohort   = factor(cohort, levels = c("HRS", "ELSA")),
-         exposure = factor(exposure, levels = c("Hearing", "Vision", "Frailty")),
-         label    = sprintf("%.2f (%.2f, %.2f)", HR, lcl, ucl),
-         y_num    = as.numeric(model) + ifelse(cohort == "HRS", 0.18, -0.18))
-paf_nadl <- paf_nadl %>%
-  mutate(model    = factor(paste0("M", model), levels = model_levels),
-         cohort   = factor(cohort, levels = c("HRS", "ELSA")),
-         exposure = factor(exposure, levels = c("Hearing", "Vision", "Frailty")),
-         paf_lab  = sprintf("%.1f%% (%.1f, %.1f)", paf, lo, hi),
-         y_num    = as.numeric(model) + ifelse(cohort == "HRS", 0.18, -0.18))
-# Max HR ~3.09: use a slightly tighter HR window than main Figure 1
-hr_xlim     <- c(0.8, 4.0); hr_breaks <- c(1, 1.5, 2, 2.5, 3, 3.5); hr_label_x  <- 4.05
-paf_xlim    <- c(-3, 50);   paf_breaks <- c(0, 5, 10, 15, 20, 25, 30, 35); paf_label_x <- 36
-pA <- make_hr_panel(filter(res_nadl, exposure == "Hearing"),
-                    "a", "Hearing impairment",
-                    show_title = TRUE, show_y_text = TRUE,
-                    y_labels   = model_labels_sensory)
-pB <- make_hr_panel(filter(res_nadl, exposure == "Vision"),
-                    "b", "Vision impairment",
-                    show_title = TRUE, show_y_text = TRUE,
-                    y_labels   = model_labels_sensory)
-pC <- make_hr_panel(filter(res_nadl, exposure == "Frailty"),
-                    "c", "Frailty",
-                    show_title = TRUE, show_y_text = TRUE,
-                    show_x_title = TRUE,
-                    y_labels   = model_labels_frailty)
-pD <- make_paf_panel(filter(paf_nadl, exposure == "Hearing"), "", "", show_title = FALSE)
-pE <- make_paf_panel(filter(paf_nadl, exposure == "Vision"),  "", "", show_title = FALSE)
-pF <- make_paf_panel(filter(paf_nadl, exposure == "Frailty"), "", "", show_title = FALSE,
-                     show_x_title = TRUE)
-fig_S3a <- (pA | pD) / (pB | pE) / (pC | pF) +
-  plot_layout(heights = c(1, 1, 1), widths = c(1, 1.05), guides = "collect") &
-  theme(legend.position = "top", legend.justification = "right",
-        legend.box.margin = margin(b = -2))
-fig_S3a
-# ---- 4. Table 23 context-specific (Model 5) -------------------------------
-hr_nadl_t5 <- tibble::tribble(
-  ~exposure, ~pathway,    ~cohort, ~HR,  ~lcl, ~ucl,
-  "Hearing", "Before",    "HRS",   1.06, 0.93, 1.20,
-  "Hearing", "With/after","HRS",   1.18, 1.09, 1.28,
-  "Hearing", "Before",    "ELSA",  0.93, 0.73, 1.18,
-  "Hearing", "With/after","ELSA",  1.50, 1.23, 1.82,
-  "Vision",  "Before",    "HRS",   1.24, 1.09, 1.41,
-  "Vision",  "With/after","HRS",   1.30, 1.21, 1.41,
-  "Vision",  "Before",    "ELSA",  1.28, 0.97, 1.69,
-  "Vision",  "With/after","ELSA",  2.03, 1.66, 2.49
-)
-paf_nadl_t5 <- tibble::tribble(
-  ~exposure, ~pathway,    ~cohort, ~paf, ~lo,  ~hi,
-  "Hearing","Before",    "HRS",    0.4, -0.5,  1.3,
-  "Hearing","With/after","HRS",    2.4,  1.2,  3.7,
-  "Hearing","Total",     "HRS",    2.8,  1.2,  4.5,
-  "Hearing","Before",    "ELSA",  -0.8, -3.2,  2.0,
-  "Hearing","With/after","ELSA",   4.1,  1.9,  6.7,
-  "Hearing","Total",     "ELSA",   3.3, -0.3,  7.3,
-  "Vision", "Before",    "HRS",    1.4,  0.5,  2.3,
-  "Vision", "With/after","HRS",    4.6,  3.2,  6.0,
-  "Vision", "Total",     "HRS",    6.0,  4.2,  7.8,
-  "Vision", "Before",    "ELSA",   1.5, -0.2,  3.6,
-  "Vision", "With/after","ELSA",   6.6,  4.4,  9.3,
-  "Vision", "Total",     "ELSA",   8.1,  5.1, 11.6
-)
-pathway_levels <- c("Total", "With/after", "Before")
-pathway_labels <- c("Before" = "Before frailty onset",
-                    "With/after" = "With or after frailty onset",
-                    "Total" = "Total context")
-hr_nadl_t5 <- hr_nadl_t5 %>%
-  mutate(pathway  = factor(pathway,  levels = pathway_levels),
-         cohort   = factor(cohort,   levels = c("HRS", "ELSA")),
-         exposure = factor(exposure, levels = c("Hearing", "Vision")),
-         label    = sprintf("%.2f (%.2f, %.2f)", HR, lcl, ucl),
-         y_num    = as.numeric(pathway) + ifelse(cohort == "HRS", 0.18, -0.18))
-paf_nadl_t5 <- paf_nadl_t5 %>%
-  mutate(pathway  = factor(pathway,  levels = pathway_levels),
-         cohort   = factor(cohort,   levels = c("HRS", "ELSA")),
-         exposure = factor(exposure, levels = c("Hearing", "Vision")),
-         paf_lab  = sprintf("%.1f%% (%.1f, %.1f)", paf, lo, hi),
-         y_num    = as.numeric(pathway) + ifelse(cohort == "HRS", 0.18, -0.18))
-hr_xlim_t4    <- c(0.65, 3.0);  hr_breaks_t4  <- c(1, 1.5, 2, 2.5, 3);  hr_label_x4 <- 3.15
-paf_xlim_t4   <- c(-6, 18);     paf_breaks_t4 <- c(-2, 0, 2, 4, 6, 8, 10, 12); paf_label_x4 <- 12.5
-qA <- make_hr_panel_t4(filter(hr_nadl_t5,  exposure == "Hearing"),
-                       "a", "Hearing impairment",
-                       show_title = TRUE, show_y_text = TRUE)
-qB <- make_paf_panel_t4(filter(paf_nadl_t5, exposure == "Hearing"),
-                        "", "", show_title = FALSE)
-qC <- make_hr_panel_t4(filter(hr_nadl_t5,  exposure == "Vision"),
-                       "b", "Vision impairment",
-                       show_title = TRUE, show_y_text = TRUE,
-                       show_x_title = TRUE)
-qD <- make_paf_panel_t4(filter(paf_nadl_t5, exposure == "Vision"),
-                        "", "", show_title = FALSE,
-                        show_x_title = TRUE)
-fig_S3b <- (qA | qB) / (qC | qD) +
-  plot_layout(heights = c(1, 1), widths = c(1, 1.05), guides = "collect") &
-  theme(legend.position = "top", legend.justification = "right",
-        legend.box.margin = margin(b = -2))
-fig_S3b
-# ---- Save ------------------------------------------------------------------
-out_dir <- file.path(repo_root, "output")
-if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
-ggsave(file.path(out_dir, "FigureS3a_FInoADL_HR_PAF_M1toM4.png"),
-       fig_S3a, width = 183, height = 215, units = "mm", dpi = 600, bg = "white")
-ggsave(file.path(out_dir, "FigureS3a_FInoADL_HR_PAF_M1toM4.pdf"),
-       fig_S3a, width = 183, height = 215, units = "mm",
-       device = cairo_pdf, bg = "white")
-ggsave(file.path(out_dir, "FigureS3b_FInoADL_context_HR_PAF.png"),
-       fig_S3b, width = 183, height = 140, units = "mm", dpi = 600, bg = "white")
-ggsave(file.path(out_dir, "FigureS3b_FInoADL_context_HR_PAF.pdf"),
-       fig_S3b, width = 183, height = 140, units = "mm",
-       device = cairo_pdf, bg = "white")
+age_models <- bind_rows(
+  timescale_models("HRS",  "attained_age"),
+  timescale_models("ELSA", "attained_age")
+) %>% check_complete(18, "Suppl. Fig. 16")
 
+age_context <- bind_rows(
+  timescale_context("HRS",  "attained_age"),
+  timescale_context("ELSA", "attained_age")
+) %>% check_complete(12, "Suppl. Fig. 17")
+
+figS16 <- fig_models(age_models,
+                     sensory_labels = model_labels_sensory_age,
+                     frailty_labels = model_labels_frailty_age)
+figS17 <- fig_context(age_context)
+figS16; figS17
+save_fig(figS16, "SuppFig16_AttainedAge_HR_PAF_Models2to4_HRS_ELSA", 175, age_models)
+save_fig(figS17, "SuppFig17_AttainedAge_context_HR_PAF_Model5_HRS_ELSA", 140, age_context)
 ```
-
-
-
-
