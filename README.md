@@ -305,16 +305,18 @@ g-formula bootstrap replicates on 3 parallel workers:
 | Step | Time |
 |------|------|
 | `demo/simulate_demo_data.R` | ~1 second |
-| `code/HRS_analysis_MSM.Rmd` | over 30 minutes (being measured) |
+| `code/HRS_analysis_MSM.Rmd` | ~70 minutes |
 | `code/HRS_analysis_Cox.Rmd` | ~9 minutes |
 | `code/ELSA_analysis_MSM.Rmd` | ~15 minutes |
 | `code/ELSA_analysis_Cox.Rmd` | ~10 minutes |
 | `code/Plot.Rmd` | ~30 seconds |
 
-Most of the time goes to the g-formula bootstrap in the Cox notebooks and to the
-backward-transition multi-state models. For a quick check, set `B = 0L` in the
-`GF <- list(...)` settings chunk of each Cox notebook to compute g-formula point
-estimates only; this skips the bootstrap confidence intervals.
+Most of the time goes to the backward-transition multi-state models and to the
+g-formula bootstrap in the Cox notebooks. With msm ≥ 1.9, the HRS notebook saves
+the unadjusted backward-transition fits and reuses them when it is re-run on the
+same data. For a quick check, set `B = 0L` in the `GF <- list(...)` settings
+chunk of each Cox notebook to compute g-formula point estimates only; this skips
+the bootstrap confidence intervals.
 
 ## 4. Instructions for use
 
@@ -371,8 +373,8 @@ table. Any cohort reshaped into that schema — the schema
 On the full HRS (n = 22,756) and ELSA (n = 12,921) cohorts, the extraction
 notebooks take the order of tens of minutes each: they read the RAND HRS
 longitudinal file and the nine ELSA wave files from disk and fit nine waves ×
-20 multiply-imputed datasets. The multi-state notebooks take from minutes to
-about an hour, mostly for the backward-transition models. The g-formula
+20 multiply-imputed datasets. The multi-state notebooks take longer than on the
+demo data, mostly in the backward-transition models. The g-formula
 bootstrap in the Cox notebooks (12 models × 201 fits) can take several hours.
 Its results are cached in `results/gf_cache_*`, so an interrupted run resumes
 where it stopped. Actual times scale with the number of cores, disk speed and
