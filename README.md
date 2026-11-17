@@ -370,7 +370,7 @@ table. Any cohort reshaped into that schema — the schema
 
 ### Run time on the real data
 
-On the full HRS (n = 22,756) and ELSA (n = 12,921) cohorts, the extraction
+On the full HRS (n = 22,756) and ELSA (n = 12,920) cohorts, the extraction
 notebooks take the order of tens of minutes each: they read the RAND HRS
 longitudinal file and the nine ELSA wave files from disk and fit nine waves ×
 20 multiply-imputed datasets. The multi-state notebooks take longer than on the
