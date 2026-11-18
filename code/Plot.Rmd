@@ -27,15 +27,13 @@ Where the numbers come from (all identical to the Supplementary Tables)
 (all result files are read from results/, written by the analysis notebooks)
   * Models 2-5, primary analysis  -> age_timescale_PAF_{HRS,ELSA}.csv, scale == "time_since_baseline"
                                      (Supplementary Tables 33 and 40)
-  * Model 1, primary analysis      -> not written to a results file; typed in below
-                                     from Supplementary Table 33
+  * Model 1, primary analysis      -> PAF_Models1to5_{HRS,ELSA}.csv (Supplementary Table 33)
   * Attained-age time scale        -> age_timescale_PAF_{HRS,ELSA}.csv, scale == "attained_age"
                                      (Supplementary Table 49)
   * Two-wave lag                   -> lag2_sensitivity_{HRS,ELSA}.csv (Supplementary Tables 45-46)
   * Reduced frailty index          -> reducedFI_sensitivity_{HRS,ELSA}.csv (Supplementary Tables 47-48)
-  * Fine-Gray (HRS)                -> not written to a results file; typed in below
-                                     from Supplementary Tables 43-44
-  * Person-time prevalence (p_pt)  -> the same CSVs (Fine-Gray and Model 1 reuse the primary p_pt,
+  * Fine-Gray (HRS)                -> finegray_PAF_HRS.csv (Supplementary Tables 43-44)
+  * Person-time prevalence (p_pt)  -> the same CSVs (Fine-Gray and Model 1 use the primary p_pt,
                                      because they use the same analytic sample)
 
 Every figure also writes the exact numbers it plots to <name>_plotted_values.csv,
@@ -386,19 +384,19 @@ save_fig <- function(fig, name, height_mm, data = NULL) {
 # ============================================================================
 # FIGURE 3 - Models 1-4, HRS and ELSA (Supplementary Table 33)
 # ============================================================================
-# Model 1 is not stored in a results file, so it is typed in from
-# Supplementary Table 33. Prevalence is the primary person-time prevalence.
-model1_primary <- tribble(
-  ~cohort, ~exposure, ~HR,  ~lcl, ~ucl, ~paf, ~lo,  ~hi,
-  "HRS",   "Hearing", 1.95, 1.82, 2.09, 15.8, 13.9, 17.7,
-  "HRS",   "Vision",  2.19, 2.05, 2.34, 20.4, 18.5, 22.4,
-  "HRS",   "Frailty", 2.91, 2.73, 3.10, 34.2, 32.0, 36.4,
-  "ELSA",  "Hearing", 1.97, 1.68, 2.32, 16.7, 12.2, 21.5,
-  "ELSA",  "Vision",  3.18, 2.69, 3.75, 21.8, 17.8, 26.1,
-  "ELSA",  "Frailty", 3.81, 3.26, 4.45, 30.6, 26.2, 35.3
+# Model 1 is read from PAF_Models1to5_*.csv; Models 2-4 from the
+# time-since-baseline rows of age_timescale_PAF_*.csv.
+model1_primary <- bind_rows(
+  read_csv(f_hrs("PAF_Models1to5_HRS.csv"),   show_col_types = FALSE) %>% mutate(cohort = "HRS"),
+  read_csv(f_elsa("PAF_Models1to5_ELSA.csv"), show_col_types = FALSE) %>% mutate(cohort = "ELSA")
 ) %>%
-  mutate(model = "M1") %>%
-  left_join(prev_primary, by = c("cohort", "exposure"))
+  filter(grepl("^M1 ", model)) %>%
+  transmute(cohort,
+            exposure = exposure_from(exposure),
+            model    = "M1",
+            HR, lcl = HR_lcl, ucl = HR_ucl,
+            prev = p_pt,
+            paf = 100 * PAF, lo = 100 * PAF_lcl, hi = 100 * PAF_ucl)
 
 fig3_data <- bind_rows(
   model1_primary,
@@ -1077,34 +1075,28 @@ print(p_combined)
 ```{r suppfig-10-11-finegray}
 # ============================================================================
 # SUPPLEMENTARY FIGS 10-11 - Fine-Gray competing-risk model, HRS only
-# (Supplementary Tables 43 and 44; not stored in a results file, typed in here)
+# (Supplementary Tables 43 and 44; read from finegray_PAF_HRS.csv)
 # ============================================================================
-fg_models <- tribble(
-  ~exposure, ~model, ~HR,  ~lcl, ~ucl, ~paf, ~lo,  ~hi,
-  "Hearing", "M1",   1.79, 1.67, 1.91, 13.5, 11.7, 15.4,
-  "Hearing", "M2",   1.32, 1.22, 1.42,  5.9,  4.2,  7.6,
-  "Hearing", "M3",   1.17, 1.09, 1.26,  3.3,  1.7,  4.9,
-  "Hearing", "M4",   1.12, 1.04, 1.21,  2.3,  0.7,  3.9,
-  "Vision",  "M1",   1.98, 1.85, 2.11, 17.4, 15.5, 19.4,
-  "Vision",  "M2",   1.72, 1.60, 1.85, 13.5, 11.5, 15.5,
-  "Vision",  "M3",   1.23, 1.14, 1.32,  4.7,  3.0,  6.5,
-  "Vision",  "M4",   1.16, 1.07, 1.24,  3.2,  1.6,  5.0,
-  "Frailty", "M1",   2.40, 2.25, 2.57, 27.7, 25.4, 30.0,
-  "Frailty", "M2",   1.82, 1.70, 1.95, 18.2, 15.9, 20.6,
-  "Frailty", "M3",   1.34, 1.25, 1.44,  8.5,  6.4, 10.8,
-  "Frailty", "M4",   1.29, 1.20, 1.39,  7.3,  5.1,  9.6
-) %>%
-  mutate(cohort = "HRS") %>%
-  left_join(prev_primary, by = c("cohort", "exposure")) %>%
+fg_all <- read_csv(f_hrs("finegray_PAF_HRS.csv"), show_col_types = FALSE)
+
+fg_models <- fg_all %>%
+  filter(grepl("^FG-M[1-4]", model)) %>%
+  transmute(cohort   = "HRS",
+            exposure = exposure_from(exposure),
+            model    = sub("^FG-(M[1-4]).*", "\\1", model),
+            HR = sHR, lcl = sHR_lcl, ucl = sHR_ucl,
+            prev = p_pt,
+            paf = 100 * PAF, lo = 100 * PAF_lcl, hi = 100 * PAF_ucl) %>%
   check_complete(12, "Suppl. Fig. 10")
 
-fg_context <- tribble(
-  ~exposure, ~pathway, ~HR,  ~lcl, ~ucl, ~paf, ~lo,  ~hi,
-  "Hearing", "Before", 0.94, 0.83, 1.06, -0.6, -1.6, 0.5,
-  "Hearing", "With",   1.29, 1.19, 1.41,  2.9,  1.9, 4.0,
-  "Vision",  "Before", 1.00, 0.89, 1.12,  0.0, -1.0, 1.0,
-  "Vision",  "With",   1.33, 1.23, 1.44,  4.0,  2.8, 5.3
-) %>% mutate(cohort = "HRS")
+fg_context <- fg_all %>%
+  filter(grepl("^FG-M5", model), !grepl("^Total", exposure)) %>%
+  transmute(cohort   = "HRS",
+            pathway  = pathway_from(exposure),   # must come before exposure is overwritten
+            exposure = if_else(grepl("hearing", model), "Hearing", "Vision"),
+            HR = sHR, lcl = sHR_lcl, ucl = sHR_ucl,
+            paf = 100 * PAF, lo = 100 * PAF_lcl, hi = 100 * PAF_ucl)
+stopifnot(nrow(fg_context) == 4, !anyNA(fg_context$pathway))
 
 figS10 <- fig_models(fg_models)
 figS11 <- fig_context(fg_context)

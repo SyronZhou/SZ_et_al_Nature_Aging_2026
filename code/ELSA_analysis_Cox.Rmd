@@ -1267,6 +1267,9 @@ paf_all <- bind_rows(paf_models_1_4, paf_m5_hearing, paf_m5_vision) %>%
 cat("\n=== PAF (Levin formula) - Models 1-5 ===\n")
 print_df(paf_all %>% dplyr::select(model, exposure, p_pt, HR_CI, PAF_CI))
 
+# HRs and PAFs for Models 1-5 (Supplementary Tables 33 and 40); read by Plot.Rmd
+write.csv(paf_all, file.path(results_dir, "PAF_Models1to5_ELSA.csv"), row.names = FALSE)
+
 
 ```
 
@@ -1627,7 +1630,11 @@ boot_gf <- function(spec, dat, B = GF$B, cores = GF$cores) {
     bd   <- dat[rows, ]
     bd$idauniq <- rep(seq_along(pick), lengths(idx[pick]))
     out <- tryCatch(est_gf(spec, bd, seed = GF$seed + b)$est,
-                    error = function(e) NULL)
+                    error = function(e) {
+                      message(sprintf("  bootstrap replicate %d failed: %s",
+                                      b, conditionMessage(e)))
+                      NULL
+                    })
     if (!is.null(out)) out$b <- b
     rm(bd); invisible(gc(verbose = FALSE))
     out
@@ -1645,13 +1652,19 @@ boot_gf <- function(spec, dat, B = GF$B, cores = GF$cores) {
                             envir = globalenv())
     res <- parallel::parLapply(cl, seq_len(B), one)
   }
-  bind_rows(res)
+  # A failed replicate (or a crashed worker) returns no table; run_gf()
+  # counts the replicates that remain and reports any shortfall.
+  bind_rows(Filter(is.data.frame, res))
 }
 
 run_gf <- function(spec, dat, B = GF$B) {
   t0  <- Sys.time()
   pe  <- est_gf(spec, dat)
   bs  <- boot_gf(spec, dat, B)
+  n_ok <- if (is.null(bs) || !nrow(bs)) 0L else n_distinct(bs$b)
+  if (B > 0 && n_ok < B)
+    warning(sprintf("%s %s: %d of %d bootstrap replicates failed and are not in the CI",
+                    spec$model, spec$exposure, B - n_ok, B), call. = FALSE)
   out <- pe$est %>% mutate(model = spec$model, exposure = spec$exposure, .before = 1)
   if (!is.null(bs) && nrow(bs)) {
     ci <- bs %>% group_by(horizon_k) %>%
@@ -1659,8 +1672,9 @@ run_gf <- function(spec, dat, B = GF$B) {
                 n_boot = n(), .groups = "drop")
     out <- out %>% left_join(ci, by = "horizon_k")
   } else out <- out %>% mutate(PAF_lcl = NA_real_, PAF_ucl = NA_real_, n_boot = 0L)
-  cat(sprintf("  %-12s done in %.1f min\n", paste(spec$model, spec$exposure),
-              as.numeric(difftime(Sys.time(), t0, units = "mins"))))
+  cat(sprintf("  %-12s done in %.1f min (%d of %d bootstrap replicates)\n",
+              paste(spec$model, spec$exposure),
+              as.numeric(difftime(Sys.time(), t0, units = "mins")), n_ok, B))
   list(table = out, nc = pe$nc)
 }
 
