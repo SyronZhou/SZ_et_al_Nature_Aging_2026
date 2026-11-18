@@ -2,17 +2,18 @@
 
 # Temporal sequencing of sensory impairments and frailty reveals vulnerability-dependent dementia risk
 
-### A two-cohort multi-state analysis in HRS (United States) and ELSA (England)
+### A two-cohort analysis in HRS (United States) and ELSA (England)
 
-Reproducible `R` code accompanying the manuscript. The analysis traces how
-**hearing and vision impairment** and **frailty** accumulate — and in **what order** —
-on the path to **incident dementia** in two large longitudinal studies of older
-adults.
+Reproducible `R` code accompanying the manuscript. The analysis tests whether the
+associations of **hearing and vision impairment** with **incident dementia**
+reflect sensory-specific pathways or broader ageing-related vulnerability, indexed
+by **frailty**, and whether they depend on **when** sensory impairment arises
+relative to frailty onset.
 
 <br>
 
 ![R](https://img.shields.io/badge/R-%E2%89%A5%204.2-276DC3?logo=r&logoColor=white)
-![Methods](https://img.shields.io/badge/methods-multi--state%20%C2%B7%20Cox%20%C2%B7%20PAF-4292C6)
+![Methods](https://img.shields.io/badge/methods-multi--state%20%C2%B7%20Cox%20%C2%B7%20PAF%20%C2%B7%20g--formula-4292C6)
 ![Cohorts](https://img.shields.io/badge/cohorts-HRS%20%C2%B7%20ELSA-08519C)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Data](https://img.shields.io/badge/participant%20data-not%20included-lightgrey)
@@ -22,23 +23,76 @@ adults.
 
 ---
 
+**Contents:**
+[Overview](#overview) ·
+[Study framework](#study-framework) ·
+[Analyses](#analyses) ·
+[Repository structure](#repository-structure) ·
+[1. System requirements](#1-system-requirements) ·
+[2. Installation](#2-installation-guide) ·
+[3. Demo](#3-demo) ·
+[4. Instructions for use](#4-instructions-for-use) ·
+[5. Reproduction](#5-reproduction-instructions) ·
+[Data availability](#data-availability)
+
 ## Overview
 
-Older adults rarely acquire a single deficit in isolation. Sensory impairment
-and frailty often co-occur, and the **sequence** in which they arise may carry
-different risk for dementia. This repository builds harmonised cohorts from two
-independent studies and models the transitions between health states over up to
-~16 years of follow-up.
+Sensory impairments are considered modifiable dementia risk factors, but with
+ageing they accrue alongside frailty and other health conditions. Their
+associations with dementia may therefore reflect a direct contribution of
+sensory impairment, confounding by the ageing-related vulnerability that frailty
+indexes, or both.
 
-Two exposures (**hearing impairment**, **vision impairment**) are each analysed against
-frailty and dementia, in each cohort, using an identical modelling template so
-that findings can be compared across studies.
+This repository builds harmonised cohorts from the Health and Retirement Study
+(HRS; n = 22,756) and the English Longitudinal Study of Ageing (ELSA;
+n = 12,920) and follows participants for up to ~16 years. Each of the two
+sensory exposures (**hearing impairment**, **vision impairment**) is analysed
+against frailty and dementia in each cohort with an identical modelling
+template, so that findings can be compared across studies.
 
-## The multi-state model at a glance
+## Study framework
+
+<p align="center">
+  <img src="docs/sensory_frailty_dementia_framework.png" width="100%"
+       alt="Conceptual framework linking ageing-related vulnerability, sensory impairment, frailty and incident dementia across waves, with each path mapped to the analysis that addresses it">
+</p>
+
+**a**, Conceptual model across successive waves. Ageing-related vulnerability
+(U, latent and indexed imperfectly by frailty) acts on sensory impairment (S)
+and frailty (F) at every wave; measured covariates (C) act on S, F and incident
+dementia (D); preclinical dementia (P) may raise frailty before diagnosis; and
+death competes with dementia in HRS. Exposures are lagged by one wave, so S and
+F are measured at the start of each interval to dementia. **b**, The analyses
+that inform each numbered path, with the main finding.
+
+Each path corresponds to a set of analyses in the code:
+
+| Path | Question | Analysis | Notebook |
+|------|----------|----------|----------|
+| ① Confounding by ageing-related vulnerability | Do sensory–dementia associations persist once frailty is accounted for? | Cox Models 1–4; parametric g-formula | `*_analysis_Cox.Rmd` |
+| ② Effect modification by frailty | Does the association differ by frailty status? | Sensory × frailty interaction on Model 4 (ratio of HRs, RERI) | `*_analysis_Cox.Rmd` |
+| ③ Temporal context with frailty onset | Does risk differ for sensory impairment before or without subsequent frailty versus with or subsequent to frailty onset? | Cox Model 5, also re-estimated in the sensitivity analyses | `*_analysis_Cox.Rmd` |
+| ④ Order of onset | Do dementia transition rates from co-occurrence depend on which condition came first? | Multi-state Markov models | `*_analysis_MSM.Rmd` |
+| ⑤ Pathway through subsequent frailty | How much sensory-associated burden is carried by frailty that develops later? | Levin-based PAFs (Cox Models 1–4) compared with g-formula PAFs | `*_analysis_Cox.Rmd` |
+| ⑥ Reverse causation | Could preclinical dementia raise frailty before diagnosis? | Two-wave lag; reduced frailty index without (I)ADL and affective CES-D items | `*_analysis_Cox.Rmd` |
+| ⑦ Competing risk and dementia ascertainment | Are the findings robust to death as a competing event and to how dementia was ascertained? | Multi-state models with death (HRS); Fine–Gray models (HRS); replication across cohorts | `*_analysis_MSM.Rmd`, `HRS_analysis_Cox.Rmd` |
+
+## Analyses
+
+Two complementary modelling frameworks are applied to the same harmonised
+person-wave data. **Multi-state models** describe how participants move between
+sensory, frailty and dementia states, and in which order. **Time-varying Cox
+models** estimate the association of each exposure with incident dementia under
+progressive adjustment and by temporal context with frailty onset. Population
+attributable fractions translate these associations into dementia burden, and
+sensitivity analyses address reverse causation, competing risk and the choice
+of time scale.
+
+### Multi-state model
 
 Each person occupies one of eight mutually exclusive states. Dementia and death
 are absorbing. Co-occurrence of sensory impairment and frailty is split by
-**which condition was reached first** — the question at the heart of the paper.
+**which condition was reached first** (path ④).
 
 > **Note:** linked mortality data were not available in ELSA over the analysis
 > window, so the ELSA model has seven states with dementia as the sole absorbing state. The
@@ -84,8 +138,22 @@ which the two conditions were first observed:
 | `Dementia` | Incident dementia (absorbing) |
 | `Death` | Death from any cause (absorbing; HRS only) |
 
+### Time-varying Cox models
 
-## Methods implemented
+A pre-specified series of nested models is fitted for hearing impairment, vision
+impairment and frailty, each lagged by one wave, on a common complete-case
+sample so that hazard ratios are comparable across specifications (paths ①, ②,
+③ and ⑤):
+
+| Model | Exposure | Adjustment |
+|-------|----------|------------|
+| Model 1 | Binary hearing impairment, vision impairment or frailty | None |
+| Model 2 | As Model 1 | Baseline age |
+| Model 3 | As Model 1 | Model 2 plus sex, race/ethnicity, education, marital status, and lagged employment, smoking status and alcohol consumption |
+| Model 4 (primary, fully adjusted) | As Model 1 | Model 3 plus lagged frailty status; for frailty, a mutually adjusted model including hearing impairment, vision impairment and frailty |
+| Model 5 (temporal context) | Three-level sensory exposure: none; before or without subsequent frailty; with or subsequent to frailty onset | Model 3 covariates |
+
+### Methods implemented
 
 | Step | What the code does |
 |------|--------------------|
@@ -117,6 +185,8 @@ which the two conditions were first observed:
 │   ├── elsa_long.csv          # Pre-generated simulated ELSA panel (600 people)
 │   ├── death_track.rds        # Pre-generated simulated mortality table
 │   └── *_fi_*.csv, hrs_age_months.csv  # Pre-generated simulated inputs for the sensitivity analyses
+├── docs/
+│   └── sensory_frailty_dementia_framework.png   # Study framework figure (above)
 ├── DATA_AVAILABILITY.md       # How to obtain HRS and ELSA data
 ├── LICENSE                    # MIT
 └── README.md

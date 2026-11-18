@@ -40,6 +40,8 @@ Thumbs.db
 *.tiff
 *.png
 *.pdf
+# EXCEPTION: the study framework figure shown in the README.
+!docs/*.png
 *_baseline.csv
 *_panel.csv
 Rplots.pdf
